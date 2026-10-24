@@ -88,6 +88,10 @@ typedef struct {
     int is_new;                     // stage 2: the row was added by us
     uint64_t donor_hash;            // stage 2: the archive file whose data rows the new row shares
     uint64_t name_hash;             // B3: hash40 of the file NAME when the folder file is named "0x<name hash>.<ext>", else 0
+    long long mtime;                // the folder file's last write time when it was last read (audio hot reload, loose_host.c)
+    uint32_t served_size;           // bytes written into the game's buffer at the last serve
+    volatile uint64_t hot_src;      // audio hot reload: the game's buffer the engine's bank was built from, 0 = no swap
+    uint64_t hot_buf; uint32_t hot_size, hot_cap;  // ... and our buffer holding the newer file, its file size and allocation
 } LooseFile;
 typedef struct { char name[32], donor[32]; int files, new_files, renamed, private_rows, shared_rows; long served, donor_bytes_files; unsigned long long bytes; } LooseOwner;
 typedef struct { uint64_t hash, parent_hash, name_hash, donor_hash; int owner, exists; uint32_t fpos, ipos; } LooseFolder;
@@ -284,6 +288,7 @@ static void lf_scan(const char *dir, const char *rel, int owner) {
         f->hash = ((uint64_t)(n & 0xff) << 32) | lf_crc32(r);
         { const char *bn = strrchr(r, '/'); f->name_hash = bn ? lf_hex_name(bn + 1) : 0; if (f->name_hash) f->hash = lf_path_hash(r); }   /* B3 */
         f->size = fd.nFileSizeLow; f->path_index = -1; f->owner = owner;
+        f->mtime = ((long long)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
         if (owner >= 0) {
             char dp[MAX_PATH * 2];
             lf_donor_path(r, g_lf_owner[owner].name, g_lf_owner[owner].donor, dp, sizeof dp);
@@ -1344,7 +1349,8 @@ static void lf_serve(uint64_t fsinfo, uint32_t info_index, int raw) {
         if (!fp) { lf_logf("[loose] %s: cannot open %s", f->arc_path, f->disk_path); return; }
         size_t got = fread((void *)(uintptr_t)buf, 1, f->size, fp);
         fclose(fp);
-        f->served++;
+        f->served++; f->served_size = (uint32_t)got;
+        f->hot_src = 0;             /* the buffer holds the folder's current file: a hot-reload swap of an older buffer no longer applies */
         {   /* N10: (1) a texture file ends with a fixed footer that its reader takes from the END of the buffer: when the
              * folder's texture is SMALLER than the buffer (the size in the file-data row: the donor file's), the footer
              * is copied to the buffer's end too (what reference\ARCropolis does in handle_file_replace: 0xb0 bytes).
