@@ -39,6 +39,25 @@ static HRec *rec_get(void) {
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_rec[i].h, 0, FALSE, DUPLICATE_SAME_ACCESS);
     return t_rec = &g_rec[i];
 }
+/* Linux: where a blocked thread sleeps in the kernel, read from /proc (own threads only, no root): the kernel function it
+ * waits in (wchan, e.g. futex_wait_queue, rwsem_down_read_slowpath = the memory-map lock, folio_wait_bit = a page being
+ * read in) and the system call number. Empty elsewhere. */
+static const char *kernel_wait(DWORD tid) {
+#ifdef __linux__
+    static char out[80];
+    char path[64], wchan[48] = "", sc[24] = "";
+    FILE *f;
+    snprintf(path, sizeof path, "/proc/self/task/%lu/wchan", (unsigned long)tid);
+    if ((f = fopen(path, "r"))) { if (!fgets(wchan, sizeof wchan, f)) wchan[0] = 0; fclose(f); }
+    snprintf(path, sizeof path, "/proc/self/task/%lu/syscall", (unsigned long)tid);
+    if ((f = fopen(path, "r"))) { if (fscanf(f, "%23s", sc) != 1) sc[0] = 0; fclose(f); }
+    if (!wchan[0] && !sc[0]) return "";
+    snprintf(out, sizeof out, ", kernel: %s syscall %s", wchan[0] && strcmp(wchan, "0") ? wchan : "-", sc[0] ? sc : "-");
+    return out;
+#else
+    (void)tid; return "";
+#endif
+}
 /* The register context now running on this host thread (thread start, fiber switches). */
 void hitch_cur_ctx(Ctx *c) { if (g_hitch_ms) { HRec *r = rec_get(); if (r) r->ctx = c; } }
 void hitch_set_main(Ctx *c) { if (g_hitch_ms) { HRec *r = rec_get(); if (r) { r->ctx = c; g_main_rec = r; } } }
@@ -138,9 +157,10 @@ static DWORD WINAPI watchdog(LPVOID arg) {
             else snprintf(key, sizeof key, "render: %s%s", s, rt_running ? "" : " (render thread not on a CPU: waiting for the driver or preempted)");
         } else if (imp) {
             if (running) snprintf(key, sizeof key, "main: %s: %s|%s", import_class(imp), imp, m->note);
-            else snprintf(key, sizeof key, "main: %s: %s (blocked)|%s called from %llx", import_class(imp), imp, m->note, (unsigned long long)c->import_from);
+            else snprintf(key, sizeof key, "main: %s: %s (blocked%s)|%s called from %llx", import_class(imp), imp, kernel_wait(m->tid), m->note, (unsigned long long)c->import_from);
             blocked_scan = !running;
-        } else snprintf(key, sizeof key, "main: lifted code%s|f_%llx", running ? "" : " (not on a CPU: preempted or page fault)", (unsigned long long)c->fn);
+        } else if (running) snprintf(key, sizeof key, "main: lifted code|f_%llx", (unsigned long long)c->fn);
+        else snprintf(key, sizeof key, "main: lifted code (not on a CPU: preempted or page fault%s)|f_%llx", kernel_wait(m->tid), (unsigned long long)c->fn);
         AcquireSRWLockExclusive(&g_lock);
         bucket_add(key, dt);
         if (blocked_scan && (strstr(imp, "mutex") || strstr(imp, "Mutex"))) {      /* round 3: who owns the mutex, and what is the owner inside? */

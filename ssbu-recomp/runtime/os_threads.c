@@ -220,10 +220,14 @@ uint64_t os_main_thread_type(void) { return (uint64_t)(uintptr_t)g_main_thread; 
 uint64_t g_main_stack_base, g_main_stack_size;        /* set by boot.c */
 static volatile LONG g_thread_count;
 
-static Ctx *new_ctx(uint64_t stack_top) {
+static Ctx *new_ctx_bare(uint64_t stack_top) {
     Ctx *c = _aligned_malloc(sizeof *c, 16);
     memset(c, 0, sizeof *c);
     c->x[31] = stack_top & ~15ull;
+    return c;
+}
+static Ctx *new_ctx(uint64_t stack_top) {
+    Ctx *c = new_ctx_bare(stack_top);
     c->tpidr = (uint64_t)VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     return c;
 }
@@ -706,9 +710,11 @@ static void mw_trywaitany(Ctx *c) { RET(mw_poll(obj(A0))); }
 void (*g_r1_fiber_born)(void *fiber);                 /* r1_state.c (R3 hs13): a new host fiber's stack is left out of the guest windows' state */
 static void CALLBACK fiber_main(void *arg) {
     Obj *o = arg;
-    Ctx *c = new_ctx(o->stack + o->stack_size);
+    /* A fiber has no thread block of its own: it uses the one of the thread running it (c->tpidr is set below). Made
+     * without one, not made and released: that was an mmap and an munmap on the thread starting the fiber, often the
+     * main thread, and each takes the process's memory-map lock (Linux: stalls of 60-160 ms in a fight, hitch log). */
+    Ctx *c = new_ctx_bare(o->stack + o->stack_size);
     o->fctx = c;
-    VirtualFree((void *)(uintptr_t)c->tpidr, 0, MEM_RELEASE);   /* a fiber has no thread block of its own: it uses the one of the thread running it */
     for (;;) {
         c->tpidr = o->tp;
         c->x[0] = o->arg;

@@ -746,6 +746,43 @@ typedef struct { FiberRegs uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *sta
 typedef struct { ucontext_t uc; LPFIBER_START_ROUTINE fn; LPVOID param; void *stack; size_t stack_size; int is_thread; } Fiber;
 #endif
 static __thread Fiber *t_fiber;
+/* SSBU_FIBERTIME=1 (diagnosis): a fiber creation or deletion that takes over 2 ms is printed with its parts (the stack's
+ * mmap / munmap, the context set-up) and the page faults of the calling thread during it. */
+static int fiber_time_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_FIBERTIME"); on = e && e[0] && e[0] != '0'; } return on; }
+static void fiber_time_report(const char *what, int64_t t0, int64_t t1, int64_t t2) {
+    static __thread long minflt, majflt;
+    struct rusage ru; getrusage(RUSAGE_THREAD, &ru);
+    long dmin = ru.ru_minflt - minflt, dmaj = ru.ru_majflt - majflt;
+    minflt = ru.ru_minflt; majflt = ru.ru_majflt;
+    int64_t total = (t2 ? t2 : t1) - t0;
+    if (total < 2000000) return;
+    printf("fibertime: %s %.2f ms (%s %.2f ms, context %.2f ms), thread %ld, page faults since its last report %ld minor %ld major\n", what, total / 1e6,
+           t2 ? "mmap" : "munmap", (t1 - t0) / 1e6, t2 ? (t2 - t1) / 1e6 : 0.0, (long)syscall(SYS_gettid), dmin, dmaj);
+    fflush(stdout);
+}
+/* Stacks of deleted fibers are kept for the next fiber instead of unmapped. The game makes and finalises job fibers during
+ * a fight, and mmap / munmap take the process's memory-map lock: measured on Linux (SSBU_FIBERTIME), one munmap of a
+ * 256 MB stack reservation waited 108 ms and an mmap 5 ms on the main thread, a visible stall each (hitch log: main in
+ * FinalizeFiber / InitializeFiber, blocked, the process nearly idle). A reused stack keeps the pages it touched. */
+#define FIBER_POOL 64
+static struct { void *stack; size_t size; } g_fiber_pool[FIBER_POOL];
+static int g_fiber_pool_n;
+static pthread_mutex_t g_fiber_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *fiber_stack_take(size_t size) {
+    void *p = NULL;
+    pthread_mutex_lock(&g_fiber_pool_lock);
+    for (int i = g_fiber_pool_n - 1; i >= 0; i--)
+        if (g_fiber_pool[i].size == size) { p = g_fiber_pool[i].stack; g_fiber_pool[i] = g_fiber_pool[--g_fiber_pool_n]; break; }
+    pthread_mutex_unlock(&g_fiber_pool_lock);
+    return p;
+}
+static int fiber_stack_give(void *stack, size_t size) {
+    int kept = 0;
+    pthread_mutex_lock(&g_fiber_pool_lock);
+    if (g_fiber_pool_n < FIBER_POOL) { g_fiber_pool[g_fiber_pool_n].stack = stack; g_fiber_pool[g_fiber_pool_n].size = size; g_fiber_pool_n++; kept = 1; }
+    pthread_mutex_unlock(&g_fiber_pool_lock);
+    return kept;
+}
 LPVOID ConvertThreadToFiber(LPVOID param) {
     if (t_fiber) return t_fiber;
     Fiber *f = calloc(1, sizeof *f);
@@ -761,7 +798,10 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
     Fiber *f = calloc(1, sizeof *f);
     f->fn = fn; f->param = param;
     f->stack_size = reserve ? reserve : (SIZE_T)1 << 20;
-    f->stack = mmap(NULL, f->stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
+    int64_t ft0 = fiber_time_on() ? mono_ns() : 0;
+    f->stack = fiber_stack_take(f->stack_size);
+    if (!f->stack) f->stack = mmap(NULL, f->stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
+    int64_t ft1 = ft0 ? mono_ns() : 0;
     if (f->stack == MAP_FAILED) { free(f); return NULL; }
 #if defined(__APPLE__) && defined(__aarch64__)
     memset(&f->uc, 0, sizeof f->uc);
@@ -779,6 +819,7 @@ LPVOID CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LPFIBER_START_R
     f->uc.uc_stack.ss_sp = f->stack; f->uc.uc_stack.ss_size = f->stack_size; f->uc.uc_link = NULL;
     makecontext(&f->uc, fiber_entry, 0);
 #endif
+    if (ft0) fiber_time_report("create", ft0, ft1, mono_ns());
     return f;
 }
 void SwitchToFiber(LPVOID fiber) {
@@ -796,7 +837,9 @@ void DeleteFiber(LPVOID fiber) {
     Fiber *f = fiber;
     if (!f) return;
     if (f == t_fiber) { fprintf(stderr, "plat: DeleteFiber of the running fiber\n"); ExitProcess(3); }
-    if (f->stack) munmap(f->stack, f->stack_size);
+    int64_t ft0 = fiber_time_on() ? mono_ns() : 0;
+    if (f->stack && !fiber_stack_give(f->stack, f->stack_size)) munmap(f->stack, f->stack_size);
+    if (ft0) fiber_time_report("delete", ft0, mono_ns(), 0);
     free(f);
 }
 LPVOID GetCurrentFiber(void) { return t_fiber; }
