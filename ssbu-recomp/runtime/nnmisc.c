@@ -236,7 +236,11 @@ static LARGE_INTEGER g_start;
  * The watcher below also suspends guest threads in the suspending modes (0, 2, 3). A window that has never
  * been in the foreground (the automated tests keep theirs off screen) is treated as in focus.
  * Closing the window is the exit request: see oe_exit_request below.
- * SSBU_FOCUS_NOTIFY=0 turns the focus tracking off. */
+ * SSBU_FOCUS_NOTIFY=0 turns the focus tracking off.
+ * A PC window that is visible but not the foreground window counts as in focus (2026-10-24): a player who clicks another
+ * window expects the game to go on, and the console rule (NotInFocus, and in handling mode 2 the game waits in its message
+ * loop f_7103754940 for the next focus message) looked like a hang: bugs 2e7e733 / 7cf4d99, half the boots with the long
+ * shader hold. Only a minimised window changes the state now. SSBU_PAUSE_UNFOCUSED=1: the console rule as before. */
 #define OE_MSG_FOCUS_STATE_CHANGED 15u
 static uint8_t g_oe_event[0x40];
 static uint32_t g_oe_queue[16];
@@ -290,6 +294,7 @@ static int oe_observe_foreground(void) {
     return 1;
 }
 static void oe_track_focus(void);
+static int oe_pause_unfocused(void) { static int on = -1; if (on < 0) { const char *e = getenv("SSBU_PAUSE_UNFOCUSED"); on = e && e[0] && e[0] != '0'; } return on; }
 static DWORD WINAPI oe_watch(LPVOID unused) {
     const char *test = getenv("SSBU_FREEZE_TEST");
     double t_start = 0, t_len = 0;
@@ -325,6 +330,7 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
         int ours = oe_observe_foreground();
         if (!g_oe_was_foreground) { LeaveCriticalSection(&g_oe_lock); continue; }
         int minimised = g_oe_window && IsIconic(g_oe_window);
+        if (!minimised && !oe_pause_unfocused()) ours = 1;                     /* visible: in focus (see the comment at OE_MSG_FOCUS_STATE_CHANGED) */
         int runnable = ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
@@ -366,6 +372,7 @@ static void oe_track_focus(void) {
      * The handling mode is what [sdk 0x32c3d0, table 0xa7ff70] sends for the oe mode: 0 = (notify 0, suspend 1), 1 = (notify 1,
      * suspend 0) NoSuspend, 2 = (notify 1, suspend 1), 3 = (notify 0, suspend 1) + SetOutOfFocusSuspendingEnabled(1) AlwaysSuspend. */
     int minimised = g_oe_window && IsIconic(g_oe_window);
+    if (!minimised && !oe_pause_unfocused()) ours = 1;                         /* visible: in focus (see the comment at OE_MSG_FOCUS_STATE_CHANGED) */
     int state = ours ? 1                                                    /* InFocus */
               : g_oe_focus_mode == 3 ? 1                                    /* AlwaysSuspend: the application never learns it */
               : !minimised ? 2                                              /* obscured: NotInFocus in the other three modes */
