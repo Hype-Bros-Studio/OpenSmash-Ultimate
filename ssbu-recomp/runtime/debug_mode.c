@@ -733,7 +733,82 @@ static void attach_check_hook(Ctx *c, void *user) {
     }
     g_orig_attach(c);
 }
+/* ---- SSBU_SNDTRACE=1 (13.0.4): who builds which sound bank, and why one is refused. The fighter sound
+ * module's set-up 0x71006e6b70(M) builds the fighter's banks once: per bank kind 0x71017e88d0 finds the files (types
+ * 0x16..0x18 se, 0x19..0x1b vc), then the bank table's create 0x7103739b90 (&handle, table, &bank fp, &audio fp,
+ * &tonelabel fp) or 0x7103739900 (no .nus3audio) needs each file loaded (data row +0xd == 3) and calls the engine's
+ * LoadBank 0x710395fe70 (bank data, size, slot, audio data); size 0 is refused with 0x80000017. A Skyline plugin can
+ * hook LoadBank and pass its own size (The CSK Collection does, for vc_narration_characall): the LoadBank line names
+ * the caller when it is not the game. Files: fs = *0x7105331f20, +8 loaded paths {data index, in use}, +0x10 loaded
+ * datas 0x18 bytes {buffer, users, in use, state}. M+0x814 / +0x818 = the se / vc bank id after the set-up (-1 = none). */
+static ImportFn g_st_orig_setup, g_st_orig_create, g_st_orig_create2, g_st_orig_loadbank, g_st_orig_find;
+static __thread int g_st_in_setup;
+static void st_file(char *out, size_t n, uint32_t fp) {
+    uint64_t fs = sr64(GA(0x7105331f20ULL));
+    if (fp == 0xffffff || !fs) { snprintf(out, n, "none"); return; }
+    uint32_t nfp = 0, nd = 0, di = 0xffffff; uint8_t used = 0;
+    safe_read(fs + 0x18, &nfp, 4); safe_read(fs + 0x1c, &nd, 4);
+    if (fp < nfp) { uint64_t e = sr64(fs + 8) + 8ull * fp; safe_read(e, &di, 4); safe_read(e + 4, &used, 1); }
+    if (di == 0xffffff || di >= nd) { snprintf(out, n, "fp %#x: not loaded (path row used %u)", fp, used); return; }
+    uint64_t d = sr64(fs + 0x10) + 0x18ull * di; uint32_t users = 0; uint8_t st[2] = {0, 0};
+    safe_read(d + 8, &users, 4); safe_read(d + 0xc, st, 2);
+    snprintf(out, n, "fp %#x: data %#x buffer %llx users %u in use %u state %u", fp, di, (unsigned long long)sr64(d), users, st[0], st[1]);
+}
+static void st_setup(Ctx *c, void *user) {
+    (void)user;
+    uint64_t m = c->x[0]; uint32_t kind = 0, entry = 0, se = 0, vc = 0;
+    safe_read(m + 0x10, &kind, 4); safe_read(m + 0x14, &entry, 4);
+    uint8_t on = 0; safe_read(sr64(GA(0x710593a438ULL)) + 1, &on, 1);
+    printf("sndtrace: set-up M %llx: fighter kind %u, entry %u, sound system byte %u\n", (unsigned long long)m, kind, entry, on);
+    g_st_in_setup++;
+    g_st_orig_setup(c);
+    g_st_in_setup--;
+    safe_read(m + 0x814, &se, 4); safe_read(m + 0x818, &vc, 4);
+    printf("sndtrace: set-up M %llx done: se bank id %#x, vc bank id %#x\n", (unsigned long long)m, se, vc);
+    fflush(stdout);
+}
+static void st_find(Ctx *c, void *user) {
+    (void)user;
+    uint64_t out = c->x[0]; uint32_t kind = (uint32_t)c->x[2], type = (uint32_t)c->x[3], v = 0xffffff;
+    g_st_orig_find(c);
+    if (!g_st_in_setup || type < 0x16 || type > 0x1b) return;
+    safe_read(out, &v, 4);
+    printf("sndtrace:   files of kind %u type %#x: search path index %#x\n", kind, type, v);
+}
+static void st_create_common(Ctx *c, int with_audio, ImportFn orig) {
+    uint64_t h = c->x[0]; uint32_t fb = 0xffffff, fa = 0xffffff, ft = 0xffffff;
+    safe_read(c->x[2], &fb, 4);
+    if (with_audio) { safe_read(c->x[3], &fa, 4); safe_read(c->x[4], &ft, 4); } else safe_read(c->x[3], &ft, 4);
+    char sb[160], sa[160], stl[160]; st_file(sb, sizeof sb, fb); st_file(sa, sizeof sa, fa); st_file(stl, sizeof stl, ft);
+    printf("sndtrace:   create%s: bank %s | audio %s | tonelabel %s\n", with_audio ? "" : " (no audio)", sb, sa, stl);
+    orig(c);
+    uint64_t e = sr64(h); uint32_t gen = 0xffffffff; safe_read(h + 8, &gen, 4);
+    uint32_t id = 0xffffffff; if (e) safe_read(sr64(e + 0x10) + 0x10, &id, 4);
+    printf("sndtrace:   create -> handle {%llx, %#x}%s, bank id %#x\n", (unsigned long long)e, gen, e ? "" : " (NO BANK)", id);
+    fflush(stdout);
+}
+static void st_create(Ctx *c, void *user) { (void)user; st_create_common(c, 1, g_st_orig_create); }
+static void st_create2(Ctx *c, void *user) { (void)user; st_create_common(c, 0, g_st_orig_create2); }
+static void st_loadbank(Ctx *c, void *user) {
+    (void)user;
+    uint64_t buf = c->x[0], size = c->x[1], audio = c->x[3], lr = c->x[30]; char magic[5] = {0};
+    safe_read(buf, magic, 4);
+    g_st_orig_loadbank(c);
+    int plugin = lr < GUEST_BASE || lr >= GUEST_BASE + 0x7500000ULL;     /* outside the game's image (hostrt.c IMAGE_SIZE) */
+    printf("sndtrace:     LoadBank(bank %llx '%s' size %#llx, audio %llx) -> %#x", (unsigned long long)buf, magic, (unsigned long long)size,
+           (unsigned long long)audio, (uint32_t)c->x[0]);
+    if (plugin) printf(" [called by a plugin's LoadBank hook at %llx: the size is the plugin's]", (unsigned long long)lr);
+    printf("\n");
+}
+static void sound_trace_init(void) {
+    if (!getenv("SSBU_SNDTRACE") || g_game_build != GAME_13_0_4) return;
+    printf("sndtrace: hooks: set-up %d, files %d, create %d, create without audio %d, LoadBank %d\n",
+           hook_install(0x71006e6b70ULL, st_setup, NULL, &g_st_orig_setup), hook_install(0x71017e88d0ULL, st_find, NULL, &g_st_orig_find),
+           hook_install(0x7103739b90ULL, st_create, NULL, &g_st_orig_create), hook_install(0x7103739900ULL, st_create2, NULL, &g_st_orig_create2),
+           hook_install(0x710395fe70ULL, st_loadbank, NULL, &g_st_orig_loadbank));
+}
 void debug_mode_init(void) {
+    sound_trace_init();
     if (getenv("SSBU_DEBUG_ATTACHCHECK") && g_game_build == GAME_13_0_4)
         printf("debug attach: hook on the joint-attachment update 710360a9d0: id %d\n", hook_install(0x710360a9d0ULL, attach_check_hook, NULL, &g_orig_attach));
     if (getenv("SSBU_DEBUG_PANELS")) CreateThread(NULL, 0, panel_thread, NULL, 0, NULL);
