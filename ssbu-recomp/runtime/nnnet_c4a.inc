@@ -182,6 +182,7 @@ typedef struct { SOCKET s; LONG refs; int type; int bound_any; } SoObj;
 static struct { SoObj *o; int flags; } g_so_fd[SO_MAX_FD];
 static SRWLOCK g_so_lock = SRWLOCK_INIT;
 static int g_so_init, g_so_wsa;
+static int g_so_plugins;      /* started early for Skyline plugins: the game's own Initialize afterwards is taken as done */
 static __declspec(thread) int t_so_herrno;
 
 static int *so_errno_ptr(Ctx *c) {
@@ -194,6 +195,16 @@ static int *so_errno_ptr(Ctx *c) {
 static void so_set_errno(Ctx *c, int e) { if (g_so_init) *so_errno_ptr(c) = e; }
 static void so_fail(Ctx *c, int e) { so_set_errno(c, e); RETI(-1); }
 static void so_need_init(Ctx *c, const char *what) {
+    /* A Skyline plugin (lifted at 0x7280000000 .. 0x7300000000, tools/nro/plugin_map.py) may open a socket before the game
+     * starts nn::socket (an effect viewer plugin: its TCP server, at plugin start): on a console its own
+     * nn::socket set-up or skyline's would have run. The library is started here as Initialize would, and the game's
+     * Initialize later is answered as done, (the editor patch did this for SSBU_EDITOR only). */
+    if (!g_so_init && c->x[30] >= 0x7280000000ull && c->x[30] < 0x7300000000ull) {
+        if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+        g_so_init = 1; g_so_plugins = 1;
+        printf("nn::socket: %s from a plugin (%llx) before Initialize: started for the plugins\n", what, (unsigned long long)c->x[30]); fflush(stdout);
+        return;
+    }
     if (!g_so_init) {
         printf("\n%s called before nn::socket::Initialize: the SDK aborts here.\n", what);
         guest_trap("nn::socket call before Initialize (SDK abort)", c->x[30] - 4);
@@ -299,6 +310,7 @@ static uint32_t so_addr_out(uint64_t p, uint32_t cap, const struct sockaddr_in *
 static void socket_Initialize(Ctx *c) {                   /* (void *pool, size_t poolSize, size_t allocatorPoolSize, int concurrency) -> Result */
     uint64_t pool = A0, size = A1, alloc = A2;
     int conc = (int)A3;
+    if (g_so_init && g_so_plugins) { g_so_plugins = 0; RET(0); return; }      /* already started for the plugins (so_need_init) */
     if (g_so_init || !pool || (unsigned)(conc - 1) >= 14 || size <= alloc || (pool & 0xfff) || (size & 0xfff) || (alloc & 0xfff) || alloc <= 0xfff)
         guest_trap("nn::socket::Initialize: [sdk 0x36f89c] abort (already initialised or bad arguments)", c->x[30] - 4);
     if (size < 0xa0000) { RET(0x21bu); return; }

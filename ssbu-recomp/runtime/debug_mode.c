@@ -59,8 +59,9 @@ static void scan_copies(uint64_t rec) {
 /* SSBU_DEBUG_WATCH=1: hardware write watchpoints (debug registers of every thread) on a few fields of the first two
  * records; each write prints the guest functions on the stack of the writer (finds the code that fills the record). */
 #include <tlhelp32.h>
-/* SSBU_DEBUG_MATCH="p1=<fighter>,p2=<fighter>,stage=<name>,form=omega,cpu=<level>,items=off|on,time=<min>|stock=<n>" */
+/* SSBU_DEBUG_MATCH="p1=<fighter>,p2=<fighter>,stage=<name>,form=omega,cpu=<level>,items=off|on,time=<min>|stock=<n>,c1=<slot>" */
 static struct { int p[4]; char stage[48]; int omega, cpu, items, time, stock; char text[256]; } g_dm = {{-1, -1, -1, -1}, "", 0, -1, -1, -1, -1, ""};
+static int g_dm_costume[4] = {-1, -1, -1, -1};        /* c1= .. c4=: the players' costume slots (a mod's own slot such as c88); -1: one per player */
 static char g_dm_name[4][32];                          /* track V session 14: p3 / p4 (CPU players added to the panel states the screens left empty) */
 static uint8_t g_dm_state1[0x230]; static int g_dm_state1_ok;      /* player 2's panel state as the game's function saw it: the template for p3 / p4 */
 static int g_dm_p2type = -1, g_dm_applied, g_dm_fight, g_dm_form = -1, g_dm_hazards = -1;
@@ -158,6 +159,7 @@ static void parse_match(const char *s) {
         else if (!strcmp(k, "cpu")) g_dm.cpu = atoi(v);
         else if (!strcmp(k, "items")) g_dm.items = !strcmp(v, "on");
         else if (!strcmp(k, "time")) g_dm.time = atoi(v);
+        else if (k[0] == 'c' && k[1] >= '1' && k[1] <= '4' && !k[2]) g_dm_costume[k[1] - '1'] = atoi(v);
         else if (!strcmp(k, "stock")) g_dm.stock = atoi(v);
     }
     printf("debug match: requested %s -> p1 kind %d, p2 kind %d, stage %s%s\n", s, g_dm.p[0], g_dm.p[1], g_dm.stage, g_dm.omega ? " (omega)" : "");
@@ -502,6 +504,7 @@ static void match_player_hook(Ctx *c, void *user) {
         }
         wr64(st + 0x88, 0xc100000000000000ull | ui_chara_hash(g_dm_name[idx]));
         wr8(st + 0x90, (uint8_t)idx);                      /* colour: one per player */
+        if (g_dm_costume[idx] >= 0) wr8(st + 0x90, (uint8_t)g_dm_costume[idx]);
         if (g_dm.stock > 0 && rd8(st + 5) == 1) wr8(st + 0xa, (uint8_t)g_dm.stock);
         if (g_dm.cpu > 0) { wr8(st + 0x91, (uint8_t)g_dm.cpu); wr32(st + 0x224, 0xffffffffu); }
         g_dm_applied |= 1 << idx;
@@ -512,6 +515,7 @@ static void match_player_hook(Ctx *c, void *user) {
     }
     if (idx >= 0 && idx < 2 && g_dm_name[idx][0] && type_was != 3 && !(getenv("SSBU_DEBUG_KEEP") && (atoi(getenv("SSBU_DEBUG_KEEP")) >> idx & 1))) {   /* SSBU_DEBUG_KEEP=<mask>: keep the screens' own choice for these players (S20t) */
         wr64(st + 0x88, 0xc100000000000000ull | ui_chara_hash(g_dm_name[idx]));
+        if (g_dm_costume[idx] >= 0) wr8(st + 0x90, (uint8_t)g_dm_costume[idx]);      /* colour = costume slot (state + 0x90 -> record + 0x19) */
         if (idx == 1 && g_dm_p2type >= 0) wr32(st + 0x78, (uint32_t)g_dm_p2type);
         if (g_dm.cpu > 0 && rd32(st + 0x78) == 1) { wr8(st + 0x91, (uint8_t)g_dm.cpu); wr32(st + 0x224, 0xffffffffu); }   /* level 1..9; the game maps it to the power in record + 0x79 (0, 15, 21, 31, 42, 48, 60, 75, 100) */
         g_dm_applied |= 1 << idx;
@@ -704,7 +708,34 @@ static DWORD WINAPI panel_thread(LPVOID arg) {
     }
     return 0;
 }
+/* SSBU_DEBUG_ATTACHCHECK=1 (a modded fighter's costume): f_710360a9d0 (13.0.4) walks [x1, x2) in 0xb0-byte entries
+ * and, for an entry whose pointer list (+0x78 .. +0x80) is not empty, positions the list's first object from the joint
+ * matrices of x0 (+0x18, 0x40 each). A null first pointer crashes it (reading +0xb8). This logs every such entry (address,
+ * index, the list, the entry's bytes, the caller), at most 16 times; =2 also empties that entry's list so the game skips it. */
+static ImportFn g_orig_attach;
+static void attach_check_hook(Ctx *c, void *user) {
+    static volatile LONG shown;
+    static int mode = -1;
+    (void)user;
+    if (mode < 0) mode = atoi(getenv("SSBU_DEBUG_ATTACHCHECK"));
+    uint64_t owner = c->x[0], b = c->x[1], e = c->x[2];
+    for (uint64_t p = b, i = 0; p < e && i < 4096; p += 0xb0, i++) {
+        uint64_t v0 = sr64(p + 0x78), v1 = sr64(p + 0x80);
+        if (v0 == v1 || sr64(v0)) continue;
+        if (InterlockedIncrement(&shown) <= 16) {
+            printf("debug attach: entry %llx (index %llu of [%llx, %llx), owner %llx, called from %llx): list %llx .. %llx (%llu pointers), first null; the next: %llx %llx\n",
+                   (unsigned long long)p, (unsigned long long)i, (unsigned long long)b, (unsigned long long)e, (unsigned long long)owner, (unsigned long long)c->x[30],
+                   (unsigned long long)v0, (unsigned long long)v1, (unsigned long long)((v1 - v0) / 8), (unsigned long long)sr64(v0 + 8), (unsigned long long)sr64(v0 + 16));
+            hex_lines("debug attach:   entry", p, 0xb0);
+            fflush(stdout);
+        }
+        if (mode == 2) wr64(p + 0x80, v0);           /* list emptied: this entry is skipped (the game's own test) */
+    }
+    g_orig_attach(c);
+}
 void debug_mode_init(void) {
+    if (getenv("SSBU_DEBUG_ATTACHCHECK") && g_game_build == GAME_13_0_4)
+        printf("debug attach: hook on the joint-attachment update 710360a9d0: id %d\n", hook_install(0x710360a9d0ULL, attach_check_hook, NULL, &g_orig_attach));
     if (getenv("SSBU_DEBUG_PANELS")) CreateThread(NULL, 0, panel_thread, NULL, 0, NULL);
     const char *end = getenv("SSBU_DEBUG_END"), *list = getenv("SSBU_DEBUG_MATCH_LIST");
     if (end && atof(end) > 0) { g_end_limit = (LONG64)(strchr(end, 's') ? atof(end) * 60.0 : atof(end)); printf("debug end: the run ends after %lld fight frames\n", (long long)g_end_limit); }
