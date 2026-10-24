@@ -271,6 +271,20 @@ static uint64_t hash40(const char *s) {
     for (size_t i = 0; i < n; i++) { crc ^= (uint8_t)s[i]; for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1))); }
     return ((uint64_t)n << 32) | (uint32_t)~crc;
 }
+/* The ui_chara id of a debug-match name: hash40("ui_chara_<name>"), except for Pyra / Mythra. The select
+ * screen's panel ui_chara_element has fighter_kind 0 in ui_chara_db (the game then takes Mario), and the two playable rows
+ * (name_id eflame_first / elight_first, read from ui/param/database/ui_chara_db.prc) have ids that are not
+ * "ui_chara_<name_id>": their hashes are given here. Pyra is player 1 with Mythra as the partner, and the reverse. */
+static uint64_t ui_chara_hash(const char *name) {
+    static const struct { const char *name; uint64_t hash; } alias[] = {
+        {"element", 0x143829f67eull}, {"eflame", 0x143829f67eull}, {"eflame_first", 0x143829f67eull}, {"pyra", 0x143829f67eull},
+        {"elight", 0x14c6fc852aull}, {"elight_first", 0x14c6fc852aull}, {"mythra", 0x14c6fc852aull},
+    };
+    for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++)
+        if (!strcmp(name, alias[i].name)) return alias[i].hash;
+    char nm[64]; snprintf(nm, sizeof nm, "ui_chara_%s", name);
+    return hash40(nm);
+}
 /* ---- R3 online rollback (SSBU_RB_NET=net, rb_net.c): the match handshake. At player 1's record each game sends its own
  * player-1 choice (the panel state as the screens and SSBU_DEBUG_MATCH left it); the host adds its stage / items / stocks
  * and a seed; both then write the agreed match into the panel states of players 1 and 2 (type human: port 2 = the other
@@ -486,8 +500,7 @@ static void match_player_hook(Ctx *c, void *user) {
             else { wr8(st + 5, g_dm_state1[5]); wr8(st + 0xa, g_dm_state1[0xa]); }
             wr32(st + 0x78, 1);
         }
-        char nm[64]; snprintf(nm, sizeof nm, "ui_chara_%s", g_dm_name[idx]);
-        wr64(st + 0x88, 0xc100000000000000ull | hash40(nm));
+        wr64(st + 0x88, 0xc100000000000000ull | ui_chara_hash(g_dm_name[idx]));
         wr8(st + 0x90, (uint8_t)idx);                      /* colour: one per player */
         if (g_dm.stock > 0 && rd8(st + 5) == 1) wr8(st + 0xa, (uint8_t)g_dm.stock);
         if (g_dm.cpu > 0) { wr8(st + 0x91, (uint8_t)g_dm.cpu); wr32(st + 0x224, 0xffffffffu); }
@@ -498,8 +511,7 @@ static void match_player_hook(Ctx *c, void *user) {
         char tag[48]; snprintf(tag, sizeof tag, "debug state: p%d ", idx); hex_lines(tag, st, 0x480); fflush(stdout);
     }
     if (idx >= 0 && idx < 2 && g_dm_name[idx][0] && type_was != 3 && !(getenv("SSBU_DEBUG_KEEP") && (atoi(getenv("SSBU_DEBUG_KEEP")) >> idx & 1))) {   /* SSBU_DEBUG_KEEP=<mask>: keep the screens' own choice for these players (S20t) */
-        char nm[64]; snprintf(nm, sizeof nm, "ui_chara_%s", g_dm_name[idx]);
-        wr64(st + 0x88, 0xc100000000000000ull | hash40(nm));
+        wr64(st + 0x88, 0xc100000000000000ull | ui_chara_hash(g_dm_name[idx]));
         if (idx == 1 && g_dm_p2type >= 0) wr32(st + 0x78, (uint32_t)g_dm_p2type);
         if (g_dm.cpu > 0 && rd32(st + 0x78) == 1) { wr8(st + 0x91, (uint8_t)g_dm.cpu); wr32(st + 0x224, 0xffffffffu); }   /* level 1..9; the game maps it to the power in record + 0x79 (0, 15, 21, 31, 42, 48, 60, 75, 100) */
         g_dm_applied |= 1 << idx;
