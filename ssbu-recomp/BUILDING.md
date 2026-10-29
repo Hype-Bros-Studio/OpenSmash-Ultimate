@@ -284,7 +284,8 @@ A settings menu drawn over the game's picture (Dear ImGui, Vulkan renderer only)
   key, button, trigger or stick direction you want (6 s; Esc, Home or B for a key cancels), **Clear** or **Default**.
   A controller's changes are saved either for every controller of its kind (Xbox, PlayStation, Switch, GameCube, other)
   or for that one controller, in `config\controllers.ini`, and used at once. Also: which player each controller and the
-  keyboard are, stick dead zone / outer zone, trigger threshold, and a live test of what the game would get.
+  keyboard are, rumble on / off (off stops the motor at once), stick dead zone / outer zone, trigger threshold, and a
+  live test of what the game would get.
 - **F2** shows a small stats overlay (fps, frame time, online state, run-ahead), menu open or not.
 
 It is built only when Dear ImGui v1.91.9b is found: `scripts/install.py` downloads it into `deps\imgui` and checks its

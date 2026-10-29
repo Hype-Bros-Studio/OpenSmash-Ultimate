@@ -850,6 +850,12 @@ static void sec_controls(void) {
         char rl[96];
         snprintf(rl, sizeof rl, "Reset %s to the default", g_ctl_scope ? "the profile" : "this controller");
         if (ImGui::Button(rl)) nnpad_profile_reset(dv->index, g_ctl_scope);
+        ImGui::SameLine();
+        bool rumble = nnpad_rumble_get(dv->index) == 1;
+        if (ImGui::Checkbox("Rumble (vibration)", &rumble)) {
+            nnpad_rumble_set(dv->index, g_ctl_scope, rumble);
+            printf("menu: rumble %s for %s (%s)\n", rumble ? "on" : "off", dv->name, g_ctl_scope ? "its type profile" : "this controller only"); fflush(stdout);
+        }
         float tv[3];
         nnpad_tune_get(dv->index, tv);
         static const char *const tn[3] = {"Stick dead zone", "Stick outer zone (lower = more sensitive)", "Trigger threshold (ZL / ZR)"};

@@ -1409,6 +1409,18 @@ int nnpad_selftest(const NnHidHooks *h) {
             vj_clear(j, SDL_GAMEPAD_BUTTON_COUNT, 6); SDL_SetJoystickVirtualAxis(j, SDL_GAMEPAD_AXIS_RIGHTX, 13000); settle(); h->state(0, &btn, st, &attr);
             int rx_dz = st[2];
             check(rx_dz == 0, "controls: dead zone 0.5 in the profile: a stick at 0.4 gives nothing");
+            h->vibrate(0, 1.0f, 1.0f);
+            int r_on = g_vj[k].lo;
+            nnpad_rumble_set(ix, 0, 0);                                  /* rumble off for this controller only */
+            int r_stop = g_vj[k].lo, r_get = nnpad_rumble_get(ix);
+            h->vibrate(0, 1.0f, 1.0f);
+            int r_off = g_vj[k].lo;
+            nnpad_rumble_set(ix, 0, 1);
+            h->vibrate(0, 1.0f, 1.0f);
+            { char *f = read_file(path, NULL); ok = f && strstr(f, "rumble = on"); free(f); }
+            check(r_on > 0 && r_stop == 0 && r_get == 0 && r_off == 0 && g_vj[k].lo > 0 && nnpad_rumble_get(ix) == 1 && ok,
+                  "controls: rumble off stops the motor at once and keeps it still; on again lets the game's rumble through (written)");
+            h->vibrate(0, 0, 0);
             nnpad_profile_reset(ix, 0); nnpad_profile_reset(ix, 1);
             vj_clear(j, SDL_GAMEPAD_BUTTON_COUNT, 6); SDL_SetJoystickVirtualButton(j, SDL_GAMEPAD_BUTTON_EAST, true); settle(); h->state(0, &btn, st, &attr);
             from = nnpad_target_text(ix, 0, t, sizeof t);
@@ -1677,6 +1689,29 @@ void nnpad_tune_set(int index, int scope, int which, float value) {     /* which
         if (which == 0) c->dz = value; else if (which == 1) c->outer = value; else c->trig = value;
         if (!scope && !c->name[0]) snprintf(c->name, sizeof c->name, "%s", d->name);
         section_write(d, scope);
+    }
+    unlock();
+}
+int nnpad_rumble_get(int index) {                         /* rumble in use now: 1 on, 0 off, -1 no device */
+    int r = -1;
+    lock();
+    const Dev *d = dev_at(index);
+    if (d) r = eff_rumble(d) != 0;
+    unlock();
+    return r;
+}
+void nnpad_rumble_set(int index, int scope, int on) {     /* rumble = on / off at that scope; off stops the motor now */
+    lock();
+    Dev *d = dev_at(index);
+    DevCfg *c = d ? scope_cfg(d, scope, 1) : NULL;
+    if (c) {
+        c->rumble = on ? 1 : 0;
+        if (!scope && !c->name[0]) snprintf(c->name, sizeof c->name, "%s", d->name);
+        section_write(d, scope);
+        if (!eff_rumble(d) && (d->rl || d->rh)) {       /* the game may not send a new value for a while */
+            if (d->gp) SDL_RumbleGamepad(d->gp, 0, 0, 0); else if (d->js) SDL_RumbleJoystick(d->js, 0, 0, 0);
+            d->rl = d->rh = 0;
+        }
     }
     unlock();
 }

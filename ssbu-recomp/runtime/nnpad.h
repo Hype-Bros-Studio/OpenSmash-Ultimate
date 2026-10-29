@@ -46,6 +46,8 @@ void nnpad_target_set(int index, int scope, int target, const char *srcs);   /* 
 void nnpad_profile_reset(int index, int scope);
 void nnpad_tune_get(int index, float v[3]);      /* dead zone, outer zone, trigger threshold in use */
 void nnpad_tune_set(int index, int scope, int which, float value);
+int  nnpad_rumble_get(int index);                /* rumble in use now: 1 on, 0 off, -1 no device */
+void nnpad_rumble_set(int index, int scope, int on);   /* controllers.ini rumble = on / off; used at once (off stops the motor) */
 void nnpad_capture_begin(int index);
 int  nnpad_capture_poll(char *out, int n);       /* 0 waiting, 1 got a source, 2 cancelled (Home / Capture), -1 device gone */
 void nnpad_capture_end(void);
