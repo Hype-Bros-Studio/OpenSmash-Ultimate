@@ -1764,6 +1764,8 @@ static int applied_mods(const char *js, char (*out)[256], int max) {
     }
     return n;
 }
+int hostmods_on(void);                                    /* (hle_hostmods.c) */
+int hostmods_mods(char (*names)[256], u32 *hashes, int max);
 typedef struct ModSum { char name[MOD_NAME + 1]; u32 hash; } ModSum;
 static int modsum_cmp(const void *a, const void *b) { return _stricmp(((const ModSum *)a)->name, ((const ModSum *)b)->name); }
 /* mod_set from the last apply's mods, once (a game started before an apply keeps the set it started with) */
@@ -1790,6 +1792,11 @@ static void mod_set_make(void) {
         if ((f = fopen(path, "rb"))) { cfg[fread(cfg, 1, sizeof cfg - 1, f)] = 0; fclose(f); }
         if (strstr(cfg, "romfs_mods.layers") || strstr(js, "\"arcropolis\": true")) count = applied_mods(js, names, 4096);
     }
+    /* host mods (hle_hostmods.c): the host's mods, by the names and hashes its own game took of them -
+     * this game's own applied mods aren't the ones it reads */
+    static u32 host_hashes[4096];
+    int host = hostmods_on();
+    if (host) count = hostmods_mods(names, host_hashes, 4096);
     /* ARCropolis' code patches, on (rt_code_patches_on): an entry of their own, so a game with them and
      * one without are parted, and the room browser says so (mod_diff.h) */
     ModSum *m = count + code ? calloc((size_t)(count + code), sizeof *m) : NULL;
@@ -1804,11 +1811,15 @@ static void mod_set_make(void) {
     for (int i = 0; i < applied; i++) {
         char dir[1024];
         int files = 0;
-        snprintf(dir, sizeof dir, "%s/../../mods/%s", data, names[i]);
-        u64 h = mod_tree_hash(dir, "", 0, &files);
         size_t k = 0;
         for (const char *s = names[i]; *s && k < MOD_NAME; s++) m[i].name[k++] = (u8)*s >= 0x20 && *s != ',' ? *s : ' ';
         m[i].name[k] = 0;
+        if (host) {
+            m[i].hash = host_hashes[i];
+            continue;
+        }
+        snprintf(dir, sizeof dir, "%s/../../mods/%s", data, names[i]);
+        u64 h = mod_tree_hash(dir, "", 0, &files);
         m[i].hash = (u32)(h ^ h >> 32);
     }
     qsort(m, (size_t)count, sizeof *m, modsum_cmp);
@@ -1838,7 +1849,7 @@ static void mod_set_make(void) {
         w += 5 + l;
     }
     mod_set_len = (int)(w - mod_set);
-    fprintf(stderr, "[online] mods: %d applied (dump/mods/applied.json)%s: a mod set of %d entr%s\n", applied, code ? ", code patches on" : "",
+    fprintf(stderr, "[online] mods: %d applied (%s)%s: a mod set of %d entr%s\n", applied, host ? "the host's, SSBU_HOST_MODS" : "dump/mods/applied.json", code ? ", code patches on" : "",
            mod_set[0], mod_set[0] == 1 ? "y" : "ies");
     free(m);
 }

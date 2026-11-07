@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ssbu_relay as relay   # noqa: E402
 from nex.prudp import lite_size   # noqa: E402
 from nex.server import NAT_CHECK_SECOND_IP, make_server   # noqa: E402
+from hostmods_depot import MAGIC as PACK_MAGIC, PackDepot   # noqa: E402
 
 GATEWAY = 0x0A0D0001
 NAT_CHECK_SECOND = struct.unpack(">I", socket.inet_aton(NAT_CHECK_SECOND_IP))[0]   # nncs2
@@ -92,6 +93,7 @@ class OnlineLobby(relay.Lobby):
         self.nex.part_of = self.part_of
         self.streams = {}        # virtual address -> the player's open NEX streams (writers)
         self.handshakes = collections.Counter()   # address -> its TCP connections not known yet
+        self.depot = PackDepot(log=self.say)        # host-only mods' sealed packs (docs/HOST_MODS.md)
 
     def part_of(self, ip):
         c = self.by_ip.get(ip_int(ip))
@@ -172,6 +174,10 @@ class OnlineLobby(relay.Lobby):
                     del self.handshakes[peer[0]]
         try:
             head = await asyncio.wait_for(reader.readexactly(16), HANDSHAKE_TIME)
+            if head[:8] == PACK_MAGIC:   # (not a NEX stream: a host's mod pack, up or down)
+                shaken()
+                await self.depot.serve(head, reader, writer, peer[0])
+                return
             if head[:8] != PREFACE:
                 return
             vip, vport, port = struct.unpack(">IHH", head[8:])

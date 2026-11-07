@@ -52,6 +52,8 @@ static struct {
     HANDLE file;
     u64 base;           /* plain: where the RomFS image starts in the NCA */
     HANDLE sources[ROM_SOURCES];   /* layered: the files the layers come from */
+    const u8 *mem[ROM_SOURCES];    /* layered: a source in memory instead (host mods' overlay: hle_hostmods.c) */
+    u64 mem_size[ROM_SOURCES];
     RomLayer *layers;
     u32 nlayers;
     u64 size;           /* layered: the image's size */
@@ -93,7 +95,12 @@ static int rom_read(u64 at, void *buf, u64 size) {
         u64 end = k + 1 < rom.nlayers ? rom.layers[k + 1].at : rom.size;
         u64 n = end - at < size ? end - at : size;
         if (l->src == LAYER_ZERO) memset(p, 0, n);
-        else if (!pread_all(rom.sources[l->src], l->off + (at - l->at), p, n)) return 0;
+        else if (rom.mem[l->src]) {
+            u64 from = l->off + (at - l->at);
+            if (from > rom.mem_size[l->src] || n > rom.mem_size[l->src] - from) return 0;
+            rb_guest_writing(p, n);
+            memcpy(p, rom.mem[l->src] + from, n);
+        } else if (!pread_all(rom.sources[l->src], l->off + (at - l->at), p, n)) return 0;
         p += n; at += n; size -= n;
     }
     return 1;
@@ -106,11 +113,26 @@ static HANDLE rom_file_open(const char *path) {
 }
 
 /* romfs.cfg: "<file>\n<byte offset>\n" (the image in place in one file), or "layered\n<layer
- * map>\n<source 0>\n<source 1>...\n" (tools/update.py). */
+ * map>\n<source 0>\n<source 1>...\n" (tools/update.py).
+ *
+ * With host mods (SSBU_HOST_MODS, hle_hostmods.c) the game's own data (romfs_vanilla.cfg, else
+ * romfs.cfg) is read through the host's modded layer map, its overlay a source in memory. */
+int hostmods_on(void);
+void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n, const u8 **map, u64 *map_len,
+                    const u8 **overlay, u64 *overlay_len);
 static void rom_open(void) {
     char cfg[1024], path[1024];
-    snprintf(cfg, sizeof cfg, "%s/romfs.cfg", rt_data_dir);
-    FILE *f = fopen(cfg, "r");
+    static char source_paths[ROM_SOURCES][1024];
+    int host = hostmods_on();
+    FILE *f = NULL;
+    if (host) {
+        snprintf(cfg, sizeof cfg, "%s/romfs_vanilla.cfg", rt_data_dir);
+        f = fopen(cfg, "r");
+    }
+    if (!f) {
+        snprintf(cfg, sizeof cfg, "%s/romfs.cfg", rt_data_dir);
+        f = fopen(cfg, "r");
+    }
     if (!f || !fgets(path, sizeof path, f)) rt_fatal("cannot read %s", cfg);
     path[strcspn(path, "\r\n")] = 0;
     if (!strcmp(path, "layered")) {
@@ -120,21 +142,44 @@ static void rom_open(void) {
         u32 n = 0;
         while (n < ROM_SOURCES && fgets(path, sizeof path, f)) {
             path[strcspn(path, "\r\n")] = 0;
-            if (path[0]) rom.sources[n++] = rom_file_open(path);
+            if (path[0]) {
+                snprintf(source_paths[n], sizeof source_paths[n], "%s", path);
+                rom.sources[n++] = rom_file_open(path);
+            }
         }
-        HANDLE m = rom_file_open(map);
         u8 head[24];
-        if (!pread_all(m, 0, head, sizeof head) || memcmp(head, "SSBUROM1", 8)) rt_fatal("%s: not a layer map", map);
-        memcpy(&rom.size, head + 8, 8);
-        memcpy(&rom.nlayers, head + 16, 4);
-        rom.layers = malloc(sizeof *rom.layers * rom.nlayers);
-        if (!rom.nlayers || !pread_all(m, sizeof head, rom.layers, sizeof *rom.layers * rom.nlayers))
-            rt_fatal("%s: cannot read its %u layers", map, rom.nlayers);
-        CloseHandle(m);
+        if (host) {   /* the host's layer map, over this game's sources and the overlay (in memory) */
+            const u8 *hmap, *overlay;
+            u64 hmap_len, overlay_len;
+            if (n >= ROM_SOURCES) rt_fatal("%s: %u sources, and host mods need one more", cfg, n);
+            hostmods_romfs(map, (const char (*)[1024])source_paths, n, &hmap, &hmap_len, &overlay, &overlay_len);
+            rom.mem[n] = overlay;
+            rom.mem_size[n] = overlay_len;
+            n++;
+            if (hmap_len < sizeof head || memcmp(hmap, "SSBUROM1", 8)) rt_fatal("host mods: the host's layer map isn't one");
+            memcpy(head, hmap, sizeof head);
+            memcpy(&rom.size, head + 8, 8);
+            memcpy(&rom.nlayers, head + 16, 4);
+            if (!rom.nlayers || hmap_len != sizeof head + sizeof *rom.layers * (u64)rom.nlayers)
+                rt_fatal("host mods: the host's layer map is cut short");
+            rom.layers = malloc(sizeof *rom.layers * rom.nlayers);
+            memcpy(rom.layers, hmap + sizeof head, sizeof *rom.layers * rom.nlayers);
+            snprintf(map, sizeof map, "the host's layer map");
+        } else {
+            HANDLE m = rom_file_open(map);
+            if (!pread_all(m, 0, head, sizeof head) || memcmp(head, "SSBUROM1", 8)) rt_fatal("%s: not a layer map", map);
+            memcpy(&rom.size, head + 8, 8);
+            memcpy(&rom.nlayers, head + 16, 4);
+            rom.layers = malloc(sizeof *rom.layers * rom.nlayers);
+            if (!rom.nlayers || !pread_all(m, sizeof head, rom.layers, sizeof *rom.layers * rom.nlayers))
+                rt_fatal("%s: cannot read its %u layers", map, rom.nlayers);
+            CloseHandle(m);
+        }
         for (u32 k = 0; k < rom.nlayers; k++)
             if (rom.layers[k].src != LAYER_ZERO && rom.layers[k].src >= n) rt_fatal("%s: layer %u names source %u of %u", map, k, rom.layers[k].src, n);
         fprintf(stderr, "[fs] RomFS: %llu bytes in %u layers from %u files (%s)\n", rom.size, rom.nlayers, n, cfg);
     } else {
+        if (host) rt_fatal("host mods: this game's data isn't read through a layer map (%s): run the installer again", cfg);
         if (fscanf(f, "%llu", &rom.base) != 1) rt_fatal("cannot read %s", cfg);
         rom.file = rom_file_open(path);
     }

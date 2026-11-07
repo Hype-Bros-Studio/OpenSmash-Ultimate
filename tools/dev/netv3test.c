@@ -44,6 +44,8 @@
 static char build_text[BUILD_LEN + 1];
 const char *rt_data_dir = ".";
 int rt_code_patches_on(void) { const char *e = getenv("SSBU_CODE_PATCHES"); return e && *e == '1'; }   /* (hle_mod_switch.c: SSBU_CODE_PATCHES here) */
+int hostmods_on(void) { return 0; }   /* (hle_hostmods.c: no host mods here) */
+int hostmods_mods(char (*names)[256], unsigned *hashes, int max) { (void)names; (void)hashes; (void)max; return 0; }
 const RtModule rt_module_main = {.build_id = build_text};
 int settings_online(void) { return 0; }   /* (no --online: the files are not read) */
 int settings_line_read(const char *path, char *out, int size) { (void)path; (void)out; (void)size; return 0; }

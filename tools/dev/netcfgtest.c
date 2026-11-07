@@ -22,6 +22,8 @@
 /* (what net_relay.c reaches outside itself; never called here) */
 const char *rt_data_dir = ".";
 int rt_code_patches_on(void) { const char *e = getenv("SSBU_CODE_PATCHES"); return e && *e == '1'; }   /* (hle_mod_switch.c: SSBU_CODE_PATCHES here) */
+int hostmods_on(void) { return 0; }   /* (hle_hostmods.c: no host mods here) */
+int hostmods_mods(char (*names)[256], unsigned *hashes, int max) { (void)names; (void)hashes; (void)max; return 0; }
 const RtModule rt_module_main;
 void vsock_deliver(u32 src_ip, u16 src_port, u32 dst_ip, u16 dst_port, const void *data, u32 len) {}
 int ldn_in_network(u32 ip) { return 0; }
