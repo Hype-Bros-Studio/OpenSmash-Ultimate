@@ -89,9 +89,9 @@ and can't open a pack. The formats are in `tools/hostmods.py`'s docstring.
 ## Not checked
 
 - Plugins, end to end:
-  - `hle_memdll.c` hasn't been compiled yet: the machine it was written on has no compiler.
-  - `tools/dev/memdlltest.c` builds a plugin-shaped DLL the way `tools/skyline.py` builds one and loads it from memory twice, the second copy relocated. It covers the C runtime, a bound function, and an SEH exception raised and caught inside the DLL. It hasn't been run yet.
-  - No real moveset has been loaded from a pack.
+  - `tools/dev/memdlltest.c` passes on Windows (tests/test_hostmods.py PluginFromMemory). It builds a plugin-shaped DLL the way `tools/skyline.py` builds one and loads it from memory twice, the second copy relocated. It covers the C runtime, a bound function, and an SEH exception raised and caught inside the DLL.
+  - The changed runtime files compile with the game's flags.
+- No real moveset has been loaded from a pack.
 
 - A real game. The runtime with the real game hasn't been run with `SSBU_HOST_MODS`, so a real match on host mods is unverified.
 - Windows builds. `hle_hostmods.c` has its Windows paths (`VirtualAlloc`, `_stat64`, Winsock) but was only compiled on Linux, where the modified runtime files compile cleanly with the Linux build's flags.
