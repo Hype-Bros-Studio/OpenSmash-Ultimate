@@ -604,7 +604,7 @@ class Matchmaking:
 
     # SSBU's own method 58 (u32) -> u32 (reply parser main+0x253f30), the first call of Quickplay's
     # "TaskMatchmake" once a fighter is ready (seen: 1). Meaning unknown yet: 0 lets it go on.
-    MME_58 = 0
+    MME_58 = int(os.environ.get("SSBU_NEX_MME58", "0"))   # (research: what the game makes of other answers)
 
     def mme_58(self, conn, s):
         arg = s.u32()

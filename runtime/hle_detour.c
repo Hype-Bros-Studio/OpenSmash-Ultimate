@@ -25,10 +25,30 @@ typedef int64_t i64;
 #include "host.h"
 #endif
 
-/* Windows only: the patch is x86-64 code written over code pages, and Linux's and macOS's
- * VirtualProtect hand back no real old protection (and Apple silicon runs no x86-64 code).
- * Elsewhere no function is patched: the dispatch-table hook still stands, direct calls do not. */
-#if defined(_WIN32) || defined(DETOUR_TEST)
+/* Windows, and x86-64 Linux when SSBU_LINUX_DETOURS=1 (research: SSBU_TRACE_FN on direct
+ * calls). The patch is x86-64 code written over code pages. Linux's VirtualProtect hands back
+ * no real old protection, so there the code pages go back to read + execute. macOS (Apple
+ * silicon runs no x86-64 code) patches nothing: the dispatch-table hook still stands, direct
+ * calls do not. */
+#if defined(_WIN32) || defined(DETOUR_TEST) || (defined(__linux__) && defined(__x86_64__))
+#ifdef _WIN32
+#define CODE_PROT(old) (old)
+#define DETOURS_ON() 1
+#elif defined(DETOUR_TEST)
+#define CODE_PROT(old) (old)
+#define DETOURS_ON() 1
+#else
+#include <stdlib.h>
+#define CODE_PROT(old) ((void)(old), PAGE_EXECUTE_READ)
+#define FlushInstructionCache(p, a, n) ((void)(a), (void)(n))   /* (x86-64: coherent) */
+#define HeapAlloc(h, f, n) calloc(1, (n))
+#define HeapFree(h, f, p) free(p)
+static int DETOURS_ON(void) {
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("SSBU_LINUX_DETOURS"); on = v && *v == '1'; }
+    return on;
+}
+#endif
 #include "hde/hde64.inc"   /* (.inc: compiled only here, not on its own: the builds take sources from runtime/ top) */
 
 #define PATCH_LEN 5
@@ -223,7 +243,7 @@ static int write_near(void *fn, u32 stolen, u8 *stub) {
     if (stolen > 5) memset(patch + 5, 0x90, stolen - 5);
     VirtualProtect(fn, stolen, PAGE_EXECUTE_READWRITE, &old);
     memcpy(fn, patch, stolen);
-    VirtualProtect(fn, stolen, old, &old);
+    VirtualProtect(fn, stolen, CODE_PROT(old), &old);
     FlushInstructionCache(GetCurrentProcess(), fn, stolen);
     return 1;
 }
@@ -259,7 +279,7 @@ static int detour_tiny(u8 *body, GuestFn *hook, u32 room, GuestFn **tramp_out) {
     write_stub(body + 2, hook);
     body[0] = 0xEB;
     body[1] = 0;
-    VirtualProtect(body, 16, old, &old);
+    VirtualProtect(body, 16, CODE_PROT(old), &old);
     FlushInstructionCache(GetCurrentProcess(), body, 16);
     *tramp_out = (GuestFn *)mem;
     return 1;
@@ -270,7 +290,7 @@ GuestFn *rt_detour_entry(GuestFn *body, GuestFn *hook, int allow_new, u32 room) 
     u32 stolen = 0, len = 0;
     u8 *mem, *stub;
     GuestFn *tiny_tramp = NULL;
-    if (!body || !hook || body == hook) return NULL;
+    if (!body || !hook || body == hook || !DETOURS_ON()) return NULL;
     for (d = detours; d; d = d->next) {
         if (d->current == body || d->body == body) {
             GuestFn *prev = d->current;
