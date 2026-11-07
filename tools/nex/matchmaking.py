@@ -8,6 +8,7 @@ exchange game traffic through the lobby (NexServer.talk_rules).
 Clients are not trusted: only a gathering's participants may act on it, only its owner (or host)
 may change it, a player joins only gatherings of its own game build and lobby code that are open
 and have room, and nobody brings other players in with them."""
+import os
 import secrets
 import time
 
@@ -240,7 +241,10 @@ class Matchmaking:
         r(109, 37, self.clear_system_password)
         r(109, 41, self.find_by_gid)
         r(109, 49, self.find_by_gid)
+        r(109, 48, self.find_by_gids)
         r(109, 44, self.update_part)
+        r(109, 55, self.arena_id)
+        r(109, 56, self.arena_by_id)
         r(109, 58, self.mme_58)
         r(21, 41, self.get_session_urls)
         r(21, 42, self.update_session_host)
@@ -323,6 +327,8 @@ class Matchmaking:
         ms.owner = ms.host = conn.pid
         ms.participants = []
         ms.session_key = secrets.token_bytes(32)
+        if os.environ.get("SSBU_LOBBY_PAIR_LOG") == "1":   # (debugging: to read the players' Pia packets)
+            self.info(f"gathering {ms.gid} session key {ms.session_key.hex()}")
         ms.started = datetime_now()
         ms.created = time.monotonic()
         ms.part = conn.user.get("part")
@@ -526,6 +532,16 @@ class Matchmaking:
         ms = self.session(s.u32())
         return self.encode_session(ms, conn.pid in ms.participants)
 
+    def find_by_gids(self, conn, s):
+        """FindMatchmakeSessionByGatheringId: List<u32> -> List<MatchmakeSession> (unknown ids left out)."""
+        found = [self.sessions[g] for g in s.list(StreamIn.u32) if g in self.sessions]
+        out = StreamOut()
+        out.u32(len(found))
+        now = datetime_now()
+        for ms in found:
+            ms.encode(out, now, conn.pid in ms.participants)
+        return out.get()
+
     def update_part(self, conn, s):
         _v, raw = s.struct()
         p = StreamIn(raw)
@@ -544,6 +560,47 @@ class Matchmaking:
             ms.progress = progress
         self.info(f"UpdateMatchmakeSessionPart {ms.gid} flags {flags:#x}")
         return b""
+
+    # SSBU's own method 55 (u32 gathering id) -> structure {String, u64} (reply parser
+    # main+0x253d50, its reader main+0x256c20, 13.0.5; the u64 read as a DateTime): a Battle
+    # Arena's ID, which its owner asks for right after creating it and shows in the arena's corner.
+    ARENA_ALPHABET = "0123456789ABCDEFGHJKLMNPQRSTUVWX"   # (32 letters: no I, O, Y, Z)
+
+    def arena_code(self, gid):
+        """The 5-letter arena ID of a gathering: its id, mixed so that consecutive ones look apart."""
+        v = gid & 0x1FFFFFF
+        for _ in range(3):   # (an invertible mix of 25 bits)
+            v = (v * 0x2F1B3C5) & 0x1FFFFFF
+            v ^= v >> 13
+        return "".join(self.ARENA_ALPHABET[(v >> (5 * i)) & 31] for i in range(4, -1, -1))
+
+    def arena_gid(self, code):
+        """The gathering of an arena ID, or None."""
+        code = code.strip().upper()
+        for gid in self.sessions:
+            if self.arena_code(gid) == code:
+                return gid
+        return None
+
+    def arena_id(self, conn, s):
+        gid = s.u32()
+        code = self.arena_code(gid)
+        self.info(f"{self.nex.name(conn)}: arena ID of gathering {gid}: {code}")
+        out = StreamOut()
+        out.struct(lambda o: (o.string(code), o.u64(datetime_now())))
+        return out.get()
+
+    # SSBU's own method 56 (structure {String, u64}, the same as 55's answer) -> u32 gathering id
+    # (reply parser main+0x253e90, 13.0.5): Join Arena -> Enter Arena ID.
+    def arena_by_id(self, conn, s):
+        _, (code, _) = s.struct(lambda i: (i.string(), i.u64()))
+        gid = self.arena_gid(code)
+        self.info(f"{self.nex.name(conn)}: arena ID {code!r} -> gathering {gid}")
+        if gid is None:
+            raise rmc.NexError(rmc.RENDEZVOUS_SESSION_VOID, f"no arena {code!r}")
+        out = StreamOut()
+        out.u32(gid)
+        return out.get()
 
     # SSBU's own method 58 (u32) -> u32 (reply parser main+0x253f30), the first call of Quickplay's
     # "TaskMatchmake" once a fighter is ready (seen: 1). Meaning unknown yet: 0 lets it go on.

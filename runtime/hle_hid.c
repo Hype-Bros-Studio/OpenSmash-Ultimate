@@ -139,7 +139,7 @@ u32 rb_slot_phys(u32 id);
  * a scripted run. */
 static int pad_connected(u32 id) {
     static int scripted = -1;
-    if (scripted < 0) scripted = getenv("SSBU_INPUT") != NULL || input_seq_on();
+    if (scripted < 0) scripted = getenv("SSBU_INPUT") != NULL || getenv("SSBU_INPUT_LIVE") != NULL || input_seq_on();
     if (id >= PAD_SLOTS) return 0;
     if (bench_on() && !bench_pads()) return id == NPAD_NO1;
     PadState p;
@@ -189,6 +189,71 @@ static u64 scripted_buttons(i32 *lx, i32 *ly) {
     }
     double now = rt_now_ns() / 1e9;
     u64 buttons = 0;
+    /* SSBU_INPUT_LIVE=<file>: presses appended to that file while the game runs, one per line,
+     * "[<n>*]<button>[/<hold seconds>]" (n times), pressed one after another as they come (for
+     * driving a test run from outside). */
+    static const char *live_path;
+    static int live_init;
+    static long live_off;
+    static double live_next, live_check;
+    static struct { double at, hold; int button; } live[64];
+    static int live_n;
+    if (!live_init) { live_init = 1; live_path = getenv("SSBU_INPUT_LIVE"); }
+    if (live_path && now >= live_check) {
+        live_check = now + 0.05;
+        FILE *f = fopen(live_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long size = ftell(f);
+            if (size < live_off) live_off = 0;
+            if (size > live_off) {
+                fseek(f, live_off, SEEK_SET);
+                char line[64];
+                while (fgets(line, sizeof line, f)) {
+                    size_t len = strlen(line);
+                    if (!len || line[len - 1] != '\n') break;   /* (a line still being written) */
+                    live_off += (long)len;
+                    char name[16] = {0};
+                    double hold = 0.15;
+                    int times = 1, n = 0;
+                    const char *s = line;
+                    if (sscanf(s, "%d*%n", &times, &n) == 1 && n) s += n; else times = 1;
+                    n = 0;
+                    if (sscanf(s, "%15[A-Z]%n", name, &n) < 1) continue;
+                    s += n;
+                    if (*s == '/') sscanf(s + 1, "%lf", &hold);
+                    int button = -1;
+                    for (int b = 0; b < (int)(sizeof BUTTON_NAMES / sizeof *BUTTON_NAMES); b++)
+                        if (!strcmp(name, BUTTON_NAMES[b])) button = b;
+                    for (int k = 0; k < 4; k++)
+                        if (!strcmp(name, STICK[k])) button = 100 + k;
+                    if (button < 0) continue;
+                    for (int t = 0; t < times && t < 16; t++) {
+                        if (live_n == 64) {   /* (forget the presses already over) */
+                            int keep = 0;
+                            for (int i = 0; i < live_n; i++) if (live[i].at + live[i].hold > now) live[keep++] = live[i];
+                            live_n = keep;
+                            if (live_n == 64) break;
+                        }
+                        double at = live_next > now ? live_next : now;
+                        live[live_n].at = at; live[live_n].hold = hold; live[live_n++].button = button;
+                        live_next = at + (hold > 0.3 ? hold : 0.3) + 0.03;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+    for (int i = 0; i < live_n; i++) {
+        if (now < live[i].at || now >= live[i].at + live[i].hold) continue;
+        switch (live[i].button) {
+        case 100: *lx = -32767; break;
+        case 101: *ly = 32767; break;
+        case 102: *lx = 32767; break;
+        case 103: *ly = -32767; break;
+        default: buttons |= 1ull << live[i].button;
+        }
+    }
     for (int i = 0; i < count; i++) {
         if (now < presses[i].at || now >= presses[i].at + presses[i].hold) continue;
         switch (presses[i].button) {

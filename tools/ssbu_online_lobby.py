@@ -45,6 +45,7 @@ HANDSHAKES_PER_HOST = 8          # ...and from one address
 DRAIN_TIME = 30                  # seconds a stream's game may take to read what it has been sent
 WS_CONTROL = 125                 # largest WebSocket control frame (ping, pong, close: RFC 6455)
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+PAIR_LOG = os.environ.get("SSBU_LOBBY_PAIR_LOG") == "1"   # (debugging: log the players' traffic to each other)
 
 
 def ip_int(text):
@@ -92,6 +93,7 @@ class OnlineLobby(relay.Lobby):
         self.nex.part_of = self.part_of
         self.streams = {}        # virtual address -> the player's open NEX streams (writers)
         self.handshakes = collections.Counter()   # address -> its TCP connections not known yet
+        self.pairs = {}          # (PAIR_LOG) (from, to, from port, to port) -> packets
 
     def part_of(self, ip):
         c = self.by_ip.get(ip_int(ip))
@@ -121,6 +123,15 @@ class OnlineLobby(relay.Lobby):
             m = self.by_ip.get(dst)
             if m is not None and m is not c and m.wire is not self.su and self.nex.may_talk(relay.ip_text(c.ip), relay.ip_text(dst)):
                 self.to(m, p)
+                self.counts["game relayed"] += 1
+                if PAIR_LOG:   # (debugging: how much each pair of players sends the other)
+                    key = (c.ip, dst, *struct.unpack_from(">HH", p, 12))
+                    n = self.pairs[key] = self.pairs.get(key, 0) + 1
+                    if n <= 80 or n % 200 < 4:
+                        with open("pairs.hex", "a") as f:
+                            f.write(f"{time.time():.3f} {relay.ip_text(c.ip)}:{key[2]} {relay.ip_text(dst)}:{key[3]} {p[16:].hex()}\n")
+                    if n in (1, 10) or n % 200 == 0:
+                        self.say(f"game {relay.ip_text(c.ip)}:{key[2]} -> {relay.ip_text(dst)}:{key[3]}: {n} packets, last {len(p) - 16} B")
                 return
         super().on_game(c, p, dst)
 

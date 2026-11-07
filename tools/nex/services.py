@@ -36,6 +36,7 @@ class Services:
         r(115, 61, self.datastore_61)
         r(115, 60, self.datastore_60)
         r(115, 84, self.datastore_84)
+        r(115, 95, self.datastore_95)
         for protocol, methods in NO_REPLY.items():
             for method in methods:
                 r(protocol, method, self.no_reply(protocol, method))
@@ -112,4 +113,12 @@ class Services:
         out = StreamOut()
         out.u32(0)
         out.struct(lambda o: (o.u32(0), o.u32(0), o.u32(0), o.u64(0)))
+        return out.get()
+
+    # DataStore method 95 (SSBU's own; no parameters) -> structure {bool} (parser main+0x28f390,
+    # body main+0x1d0670; 13.0.5), asked right after logging in. Meaning unknown: false.
+    def datastore_95(self, conn, s):
+        self.nex.info(f"{self.nex.name(conn)}: DataStore 95 -> false")
+        out = StreamOut()
+        out.struct(lambda o: o.u8(0))
         return out.get()
