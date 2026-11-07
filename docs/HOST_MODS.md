@@ -37,6 +37,36 @@ unmodded data (`romfs_vanilla.cfg`, else `romfs.cfg`) through the host's layer m
 | `runtime/hle_fs.c` | A layer map source can be in memory. With host mods, the RomFS is this game's own sources plus the overlay in memory, read through the host's map. |
 | `runtime/net_relay.c` | With host mods, the online mod set is the pack's names and hashes, not this game's `applied.json`. |
 | `runtime/hle_ro.c` | A modded NRO from the host's pack that isn't recompiled is not saved to `nro/` (the "harvest"). |
+| `runtime/host.c` | With host mods, the plugin libraries are the pack's, not this tree's `plugin_dlls.txt`. Each one's image (`<module>.reloc.bin`) is mapped from the pack too. |
+| `runtime/hle_memdll.c` | Loads a plugin DLL from memory (Windows x64): sections, relocations, imports, protections, unwind tables, entry point. The plugin never exists as a file on the player's disk. |
+| `runtime/hle_skyline.c` | With host mods, the plugin list is the host's `plugins.txt` from the pack. |
+
+### Plugins (pack version 2)
+
+A moveset's `.nro` can't be streamed and run as-is: this port runs plugins as native code translated ahead of time.
+So the pack carries what the host's game already built:
+
+- the translated library, `build/plugins/<module>.dll`, from `tools/skyline.py cache_mod_plugins`;
+- its image, `dump/modules/<module>.reloc.bin`;
+- the host's `plugins.txt`.
+
+`hostmods.py serve` takes every plugin that `dump/skyline/plugin_dlls.txt` lists and `plugins.txt` names.
+`--no-plugins` leaves them out, and players then use their own.
+
+Each plugin is tagged with the system it was built for:
+
+| Tag | System |
+|---|---|
+| 1 | Windows x64 |
+| 2 | Linux x64 |
+| 3 | macOS arm64 |
+
+A player loads only the plugins tagged with their own system. If the host's plugins are all for other systems, the player's game stops and says so; it doesn't run the match without them.
+
+Requirements:
+
+- **Same HypeSmash build.** Host and players need the same build: a plugin library is linked against the runtime's `module.h` interface.
+- **Standard plugins on the player's side.** Plugins the game links in, such as Smashline, come from the player's own build. If the host's list names one the player's build lacks, it is left out.
 
 The lobby never sees the code. It only sees the pack id, `sha256("HypeSmash host mods id\0" + code)[:10]`,
 and can't open a pack. The formats are in `tools/hostmods.py`'s docstring.
@@ -58,13 +88,23 @@ and can't open a pack. The formats are in `tools/hostmods.py`'s docstring.
 
 ## Not checked
 
+- Plugins, end to end:
+  - `hle_memdll.c` hasn't been compiled yet: the machine it was written on has no compiler.
+  - `tools/dev/memdlltest.c` builds a plugin-shaped DLL the way `tools/skyline.py` builds one and loads it from memory twice, the second copy relocated. It covers the C runtime, a bound function, and an SEH exception raised and caught inside the DLL. It hasn't been run yet.
+  - No real moveset has been loaded from a pack.
+
 - A real game. The runtime with the real game hasn't been run with `SSBU_HOST_MODS`, so a real match on host mods is unverified.
 - Windows builds. `hle_hostmods.c` has its Windows paths (`VirtualAlloc`, `_stat64`, Winsock) but was only compiled on Linux, where the modified runtime files compile cleanly with the Linux build's flags.
 - Matching hashes. The Python mod hash matching the C one on a real mod folder isn't checked. Non-ASCII file names may differ on Windows: the runtime hashes them as `FindFirstFileA` sees them.
 
 ## Limits
 
-- **Data mods only.** Skyline plugins (`.nro` code mods) are not in the pack. On this port they are recompiled to native code ahead of time, so they can't simply be streamed in. For movesets this matters a lot: a moveset that needs its plugin still needs every player to have that plugin installed. ARCropolis-mode trees (`"arcropolis": true`) are refused.
+- **Plugins: Windows players only, for now.** Only Windows builds translate a mod's plugin into its own library, so a host can only send Windows plugins:
+  - A Linux or macOS player of a pack with plugins gets a clear stop.
+  - Linux would need a per-plugin `.so` build and a memfd + `dlopen` loader. macOS would need a `.dylib` build.
+  - A plugin library with thread-local data is refused, since only the system's loader can give it a TLS slot. Plugins built by `tools/skyline.py` have none.
+- **The plugin is native code in the player's memory.** That makes it harder to reuse than the `.nro`, but it can still be dumped, like the rest of the pack.
+- ARCropolis-mode trees (`"arcropolis": true`) are refused.
 - **Same game data.** The player's unmodded data has to match the host's: the vanilla layer map's sha256 and each source's size. Otherwise the game stops with a clear message.
 - **Code patches.** The ARCropolis code-patches setting still has to match between players (it is its own mod-set entry).
 - **Leaks still possible:**

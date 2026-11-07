@@ -54,5 +54,13 @@ int main(int argc, char **argv) {
     u32 hashes[64];
     int n = hostmods_on() ? hostmods_mods(names, hashes, 64) : 0;
     for (int i = 0; i < n; i++) printf("%08x %s\n", hashes[i], names[i]);
+    /* this system's plugins from the pack, and the host's plugin list */
+    const u8 *lib, *image;
+    u64 lib_len, image_len;
+    const char *name;
+    for (u32 i = 0; hostmods_on() && (name = hostmods_plugin(i, &lib, &lib_len, &image, &image_len)); i++)
+        printf("plugin %s %.*s %.*s\n", name, (int)lib_len, (const char *)lib, (int)image_len, (const char *)image);
+    const char *list = hostmods_on() ? hostmods_plugin_list() : NULL;
+    if (list) printf("list %s", list);
     return 0;
 }

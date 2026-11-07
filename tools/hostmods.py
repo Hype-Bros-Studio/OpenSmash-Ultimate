@@ -8,8 +8,9 @@ players, whose games read them from memory and never write them to disk (docs/HO
         long as this runs; players start their game with SSBU_HOST_MODS=CODE
 
 This is a deterrent, not protection: a player's game holds the key and the plain mods in its
-memory while it runs, and anyone who can read that memory can take them. Data mods only (what
-tools/mods.py apply puts in the layer map); plugins (.nro) and other code are left out.
+memory while it runs, and anyone who can read that memory can take them. The pack has the data mods (what
+tools/mods.py apply puts in the layer map) and the turned-on mods' Skyline plugins as this host's game
+translated them (tools/skyline.py: build/plugins/<module>.dll, Windows), which players load from memory.
 
 The formats (runtime/hle_hostmods.c reads them):
   invite code   20 base32 letters, shown in groups of five; case, spaces and '-' don't count
@@ -19,11 +20,14 @@ The formats (runtime/hle_hostmods.c reads them):
                 with key sha256("HypeSmash host mods v1\\0" + salt + code), nonce 4 zero bytes
                 and the chunk's index (u64), additional data the 40-byte head and a byte that
                 is 1 for the last chunk, 0 before; each chunk's 16-byte tag after it
-  plain pack    "SSBUHMP1", u32 1; u32 mod count, then each mod's u32 hash (the runtime's
+  plain pack    "SSBUHMP1", u32 version (2; 1 has no plugins); u32 mod count, then each mod's u32 hash (the runtime's
                 mod_tree_hash folded to 32 bits, net_relay.c) and u16 length and UTF-8 name;
                 the sha256 of the game's own layer map (romfs_vanilla.cfg's); u32 source
                 count and each source's u64 size; u32 length and the modded layer map; u64
-                length and the overlay (the layer map's last source)
+                length and the overlay (the layer map's last source); then (version 2) u32 length
+                and the host's plugins.txt; u32 plugin count, then each plugin's u16 length and
+                module name, u8 system (PLUGIN_OS), u64 length and library, u64 length and image
+                (dump/modules/<module>.reloc.bin)
 All numbers little-endian but the lobby's (tools/hostmods_depot.py)."""
 import argparse
 import base64
@@ -38,7 +42,8 @@ import sys
 SEALED_MAGIC = b"SSBUHME1"
 PLAIN_MAGIC = b"SSBUHMP1"
 LAYER_MAGIC = b"SSBUROM1"
-VERSION = 1
+VERSION = 2
+PLUGIN_OS = {".dll": 1, ".so": 2, ".dylib": 3}   # (runtime/hle_hostmods.c HM_OS: Windows x64, Linux x64, macOS arm64)
 CHUNK = 1 << 20
 HEAD = 40
 TAG = 16
@@ -121,7 +126,8 @@ def unseal(code, sealed):
 
 
 # ---- the plain pack ------------------------------------------------------------------------
-def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay):
+def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin_list=b"", plugins=()):
+    """plugins: [(module name, system (PLUGIN_OS), library bytes, image bytes)]."""
     out = [PLAIN_MAGIC, struct.pack("<II", VERSION, len(mods))]
     for name, h in mods:
         b = name.encode("utf-8")
@@ -131,6 +137,13 @@ def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay):
     out.append(struct.pack("<I", len(modded_map)) + modded_map)
     out.append(struct.pack("<Q", len(overlay)))
     out.append(overlay)
+    out.append(struct.pack("<I", len(plugin_list)) + plugin_list)
+    out.append(struct.pack("<I", len(plugins)))
+    for name, system, lib, image in plugins:
+        b = name.encode("utf-8")
+        out.append(struct.pack("<H", len(b)) + b + bytes([system]))
+        out.append(struct.pack("<Q", len(lib)) + lib)
+        out.append(struct.pack("<Q", len(image)) + image)
     return b"".join(out)
 
 
@@ -138,7 +151,7 @@ def parse_plain(p):
     if p[:8] != PLAIN_MAGIC:
         raise Error("not a mod pack")
     version, n = struct.unpack_from("<II", p, 8)
-    if version != VERSION:
+    if version not in (1, VERSION):
         raise Error(f"a mod pack of version {version}")
     at, mods = 16, []
     for _ in range(n):
@@ -155,9 +168,30 @@ def parse_plain(p):
     at += 4 + ml
     ol = struct.unpack_from("<Q", p, at)[0]
     overlay = p[at + 8:at + 8 + ol]
-    if at + 8 + ol != len(p):
+    at += 8 + ol
+    plugin_list, plugins = b"", []
+    if version >= 2:
+        ll = struct.unpack_from("<I", p, at)[0]
+        plugin_list = p[at + 4:at + 4 + ll]
+        at += 4 + ll
+        count = struct.unpack_from("<I", p, at)[0]
+        at += 4
+        for _ in range(count):
+            nl = struct.unpack_from("<H", p, at)[0]
+            name = p[at + 2:at + 2 + nl].decode("utf-8")
+            system = p[at + 2 + nl]
+            at += 3 + nl
+            lib_len = struct.unpack_from("<Q", p, at)[0]
+            lib = p[at + 8:at + 8 + lib_len]
+            at += 8 + lib_len
+            il = struct.unpack_from("<Q", p, at)[0]
+            image = p[at + 8:at + 8 + il]
+            at += 8 + il
+            plugins.append((name, system, lib, image))
+    if at != len(p):
         raise Error("a mod pack of the wrong size")
-    return {"mods": mods, "vanilla_map_sha256": sha, "source_sizes": sizes, "map": modded_map, "overlay": overlay}
+    return {"mods": mods, "vanilla_map_sha256": sha, "source_sizes": sizes, "map": modded_map, "overlay": overlay,
+            "plugin_list": plugin_list, "plugins": plugins}
 
 
 def check_map(modded_map, nsources):
@@ -212,13 +246,50 @@ def mod_hash32(folder):
     return (h ^ h >> 32) & 0xFFFFFFFF
 
 
+# ---- this tree's plugins ---------------------------------------------------------------------
+def tree_plugins(root):
+    """The host's plugins.txt and the turned-on mods' translated plugins (dump/skyline/plugin_dlls.txt,
+    written by tools/skyline.py): (list bytes, [(module, system, library, image)])."""
+    skyline = os.path.join(root, "dump", "skyline")
+    try:
+        with open(os.path.join(skyline, "plugins.txt"), "rb") as f:
+            plugin_list = f.read()
+    except OSError:
+        return b"", []
+    listed = {l.split(b"#")[0].strip().decode("utf-8", "replace") for l in plugin_list.splitlines()} - {""}
+    try:
+        rows = _cfg_lines(os.path.join(skyline, "plugin_dlls.txt"))
+    except OSError:
+        rows = []
+    plugins = []
+    for row in rows:
+        if row.startswith("#"):
+            continue
+        path = row if os.path.isabs(row) else os.path.join(root, row)
+        name, ext = os.path.splitext(os.path.basename(path))
+        if name not in listed:
+            continue
+        if ext.lower() not in PLUGIN_OS:
+            raise Error(f"{path}: not a plugin library")
+        image = os.path.join(root, "dump", "modules", name + ".reloc.bin")
+        try:
+            with open(path, "rb") as f:
+                lib = f.read()
+            with open(image, "rb") as f:
+                img = f.read()
+        except OSError as e:
+            raise Error(f"plugin {name}: {e} (build the game with the mods turned on first)") from None
+        plugins.append((name, PLUGIN_OS[ext.lower()], lib, img))
+    return plugin_list, plugins
+
+
 # ---- this tree's applied mods, as a pack -----------------------------------------------------
 def _cfg_lines(path):
     with open(path, encoding="utf-8-sig") as f:
         return [l.strip() for l in f.read().splitlines() if l.strip()]
 
 
-def pack_tree(root):
+def pack_tree(root, with_plugins=True):
     root = os.path.abspath(root)
     modules = os.path.join(root, "dump", "modules")
     cfg = _cfg_lines(os.path.join(modules, "romfs.cfg"))
@@ -245,7 +316,9 @@ def pack_tree(root):
     with open(overlay_path, "rb") as f:
         overlay = f.read()
     mods = [(name, mod_hash32(os.path.join(root, "mods", name))) for name in applied["mods"]]
-    return build_plain(mods, vanilla_sha, [os.path.getsize(s) for s in sources], modded_map, overlay), mods
+    plugin_list, plugins = tree_plugins(root) if with_plugins else (b"", [])
+    plain = build_plain(mods, vanilla_sha, [os.path.getsize(s) for s in sources], modded_map, overlay, plugin_list, plugins)
+    return plain, mods, [name for name, *_ in plugins]
 
 
 # ---- the lobby -----------------------------------------------------------------------------
@@ -295,13 +368,14 @@ def main(argv=None):
     sv.add_argument("--lobby", required=True, help="host[:port] (the players' SSBU_NET_RELAY)")
     sv.add_argument("--code", help="the invite code (default: a new one, printed)")
     sv.add_argument("--tree", default=".", help="the port's folder (default: here)")
+    sv.add_argument("--no-plugins", action="store_true", help="the data mods only (players use their own plugins)")
     o = ap.parse_args(argv)
     try:
         if o.cmd == "code":
             print(new_code())
             return 0
         code = o.code or new_code()
-        plain, mods = pack_tree(o.tree)
+        plain, mods, plugins = pack_tree(o.tree, not o.no_plugins)
         sealed = seal(code, plain)
         del plain
         pid = pack_id(code)
@@ -309,6 +383,8 @@ def main(argv=None):
         print(f"up: {len(mods)} mod(s), {len(sealed) / 1048576:.1f} MB sealed, pack {pid}")
         for name, h in mods:
             print(f"  {name}  {h:08x}")
+        if plugins:
+            print(f"plugins (Windows players): {', '.join(plugins)}")
         print(f"invite code: {code}\nplayers: set SSBU_HOST_MODS={code} and SSBU_NET_RELAY={o.lobby}, then start the game")
         print("(the pack is up while this runs: Ctrl+C takes it down)")
         try:

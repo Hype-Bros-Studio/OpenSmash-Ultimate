@@ -81,6 +81,25 @@ class Pack(unittest.TestCase):
         with self.assertRaises(hm.Error):
             hm.check_map(m, 1)   # source 2 is past the overlay
 
+    def test_plugins_round_trip(self):
+        m = layer_map([(0, 0, 0)], 0x10)
+        plugins = [("moveset_x", 1, b"MZ library", b"image bytes"), ("moveset_x", 2, b"\x7fELF", b"")]
+        p = hm.build_plain([("A", 1)], b"\0" * 32, [1], m, b"ov", b"smashline\nmoveset_x\n", plugins)
+        got = hm.parse_plain(p)
+        self.assertEqual(got["plugins"], plugins)
+        self.assertEqual(got["plugin_list"], b"smashline\nmoveset_x\n")
+        self.assertEqual(got["overlay"], b"ov")
+        with self.assertRaises(hm.Error):
+            hm.parse_plain(p + b"!")
+
+    def test_version_1_still_reads(self):
+        m = layer_map([(0, 0, 0)], 0x10)
+        v2 = hm.build_plain([("A", 1)], b"\0" * 32, [1], m, b"ov")
+        v1 = v2[:8] + struct.pack("<I", 1) + v2[12:-8]   # (no plugin list or plugins)
+        got = hm.parse_plain(v1)
+        self.assertEqual(got["plugins"], [])
+        self.assertEqual(got["overlay"], b"ov")
+
     def test_tree_hash_skips_what_the_runtime_skips(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "Fighter", "Sub"))
@@ -123,11 +142,34 @@ class Pack(unittest.TestCase):
                 f.write(f"layered\n{mmap_}\n{src}\n{ov}\n")
             with open(os.path.join(work, "applied.json"), "w") as f:
                 f.write('{"mods": ["A Mod"], "files": 1}')
-            plain, mods = hm.pack_tree(root)
+            plain, mods, plugins = hm.pack_tree(root)
             got = hm.parse_plain(plain)
             self.assertEqual(mods, [("A Mod", hm.mod_hash32(os.path.join(root, "mods", "A Mod")))])
             self.assertEqual(got["source_sizes"], [64])
             self.assertEqual(got["overlay"], b"modded!!")
+            self.assertEqual((plugins, got["plugins"]), ([], []))
+            # the turned-on mods' translated plugins (tools/skyline.py's list), those plugins.txt lists
+            skyline, built = os.path.join(root, "dump", "skyline"), os.path.join(root, "build", "plugins")
+            os.makedirs(skyline)
+            os.makedirs(built)
+            for name in ("one", "gone"):
+                with open(os.path.join(built, name + ".dll"), "wb") as f:
+                    f.write(b"MZ " + name.encode())
+                with open(os.path.join(modules, name + ".reloc.bin"), "wb") as f:
+                    f.write(b"image " + name.encode())
+            with open(os.path.join(skyline, "plugins.txt"), "w", newline="\n") as f:
+                f.write("smashline\none  # a moveset\n")
+            with open(os.path.join(skyline, "plugin_dlls.txt"), "w") as f:
+                f.write("build/plugins/one.dll\nbuild/plugins/gone.dll\n")
+            plain, _, plugins = hm.pack_tree(root)
+            got = hm.parse_plain(plain)
+            self.assertEqual(plugins, ["one"])
+            self.assertEqual(got["plugins"], [("one", 1, b"MZ one", b"image one")])
+            self.assertEqual(got["plugin_list"], b"smashline\none  # a moveset\n")
+            self.assertEqual(hm.parse_plain(hm.pack_tree(root, with_plugins=False)[0])["plugins"], [])
+            os.remove(os.path.join(modules, "one.reloc.bin"))
+            with self.assertRaises(hm.Error):
+                hm.pack_tree(root)
             with open(os.path.join(work, "applied.json"), "w") as f:
                 f.write('{"mods": ["A Mod"], "arcropolis": true}')
             with self.assertRaises(hm.Error):
@@ -267,7 +309,7 @@ class RuntimeRomfs(unittest.TestCase):
             f.write("layered\n/nowhere/romfs_mods.layers\n/nowhere/a\n/nowhere/overlay.bin\n")
         return data, bytes(image), vmap, [a, b]
 
-    def pack(self, image, vmap, sources):
+    def pack(self, image, vmap, sources, plugins=()):
         """The host's mods over that game: 0x200..0x400 changed, 512 bytes added past the end."""
         overlay = os.urandom(0x400)
         modded = layer_map([(0, 0, 0), (0x200, 2, 0), (0x400, 0, 0x400), (2048, 1, 0), (4096, 2, 0x200)], 4096 + 512)
@@ -275,7 +317,8 @@ class RuntimeRomfs(unittest.TestCase):
         with open(vmap, "rb") as f:
             sha = hashlib.sha256(f.read()).digest()
         plain = hm.build_plain([("Stage Pack", 0x0BADF00D), ("Costume, Slot 3", 0x12345678)], sha,
-                               [os.path.getsize(s) for s in sources], modded, overlay)
+                               [os.path.getsize(s) for s in sources], modded, overlay,
+                               b"smashline\nmoveset_x\n" if plugins else b"", plugins)
         want = image[:0x200] + overlay[:0x200] + image[0x400:] + overlay[0x200:]
         return plain, want
 
@@ -305,6 +348,31 @@ class RuntimeRomfs(unittest.TestCase):
                 self.assertEqual(sorted(os.listdir(d)), ["dump"])
                 self.assertEqual(sorted(os.listdir(os.path.dirname(data))), ["image.bin", "modules"])
                 self.assertEqual(sorted(os.listdir(data)), ["a.bin", "b.bin", "romfs.cfg", "romfs.layers", "romfs_vanilla.cfg"])
+            finally:
+                host.close()
+
+    def test_plugins_for_this_system(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, image, vmap, sources = self.game(d)
+            plugins = [("moveset_x", 1, b"windows-lib", b"win-image"), ("moveset_x", 2, b"linux-lib", b"linux-image")]
+            plain, _ = self.pack(image, vmap, sources, plugins)
+            code = hm.new_code()
+            host = hm.put(self.addr, hm.pack_id(code), hm.seal(code, plain))
+            try:
+                r, _ = self.run_game(data, code)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("plugin moveset_x linux-lib linux-image\n", r.stdout)
+                self.assertNotIn("windows-lib", r.stdout)
+                self.assertIn("list smashline\nmoveset_x\n", r.stdout)
+            finally:
+                host.close()
+            # the host's plugins built for Windows only: a Linux player's game stops, saying why
+            plain, _ = self.pack(image, vmap, sources, plugins[:1])
+            host = hm.put(self.addr, hm.pack_id(code), hm.seal(code, plain))
+            try:
+                r, _ = self.run_game(data, code)
+                self.assertEqual(r.returncode, 3)
+                self.assertIn("other systems", r.stderr)
             finally:
                 host.close()
 
@@ -376,6 +444,39 @@ class CryptoInC(unittest.TestCase):
                 got = subprocess.run([exe, "--sha256", path], capture_output=True, check=True).stdout.decode().strip()
                 import hashlib
                 self.assertEqual(got, hashlib.sha256(data).hexdigest(), n)
+
+
+def _windows_compiler():
+    if sys.platform != "win32":
+        return None
+    try:
+        import cc
+    except Exception:   # (no toolchain found at import)
+        return None
+    return cc if os.path.isfile(cc.CLANG) or shutil.which(cc.CLANG) else None
+
+
+@unittest.skipUnless(_windows_compiler(), "needs Windows and the game's compiler (tools/cc.py)")
+class PluginFromMemory(unittest.TestCase):
+    """runtime/hle_memdll.c: a plugin-shaped DLL (tools/dev/memdll_plugin.c), built as tools/skyline.py
+    builds a mod's plugin, loaded from memory twice - the second copy relocated - and run."""
+
+    def test_loads_and_runs(self):
+        cc = _windows_compiler()
+        with tempfile.TemporaryDirectory() as d:
+            obj, dll, exe = (os.path.join(d, n) for n in ("plugin.obj", "plugin.dll", "memdlltest.exe"))
+            r = subprocess.run(cc.compile_command(os.path.join(ROOT, "tools", "dev", "memdll_plugin.c"), obj, "/O1", cc.GAME_CFLAGS),
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            cc.link_library([obj], dll)
+            r = subprocess.run([cc.CLANG, "/nologo", "/O1", "-w", *(["/winsysroot", cc.WINSYSROOT] if cc.WINSYSROOT else []),
+                                "/I", os.path.join(ROOT, "runtime"), os.path.join(ROOT, "tools", "dev", "memdlltest.c"),
+                                "/Fe" + exe, "/Fo" + os.path.join(d, "memdlltest.obj")], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            r = subprocess.run([exe, dll], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            lines = r.stdout.splitlines()
+            self.assertEqual(lines, ["copy 0 at its address: 1 two three 42 7", "copy 1 at another address: 1 two three 42 7"])
 
 
 if __name__ == "__main__":

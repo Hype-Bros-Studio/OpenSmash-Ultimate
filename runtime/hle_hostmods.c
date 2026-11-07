@@ -5,8 +5,12 @@
  * and nothing of it is written to disk by the runtime. (Not an HLE of anything: named hle_ so
  * every build's runtime file pattern takes it.)
  *
- * A deterrent, not protection: the code, the key and the plain mods are in this process's memory
- * while it runs. Data mods only - the pack has no plugins or other code. */
+ * A pack of version 2 also has the host's Skyline plugin list and its mods' plugins, translated
+ * (tools/skyline.py) for each system the host built them for: this one's are loaded from memory
+ * (host.c load_plugin_dlls, hle_memdll.c) and never written to a file.
+ *
+ * A deterrent, not protection: the code, the key and the plain mods (plugins too) are in this
+ * process's memory while it runs. */
 #define _CRT_SECURE_NO_WARNINGS
 #ifdef _WIN32
 #include <winsock2.h>
@@ -47,7 +51,22 @@ static struct {
     const u8 *sizes;           /* nsources u64s */
     const u8 *map; u64 map_len;
     const u8 *overlay; u64 overlay_len;
+    const char *plugin_list;   /* (version 2) the host's plugins.txt, NUL-terminated copy; NULL for version 1 */
+    u32 nplugins;              /* this system's */
+    struct HmPlugin { char name[128]; const u8 *lib, *image; u64 lib_len, image_len; } *plugins;
+    u32 other_os_plugins;      /* the host's plugins for other systems only */
 } hm;
+
+/* The system a pack's plugin was built for (tools/hostmods.py PLUGIN_OS) */
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+#define HM_OS 1
+#elif defined(__linux__) && defined(__x86_64__)
+#define HM_OS 2
+#elif defined(__APPLE__) && defined(__aarch64__)
+#define HM_OS 3
+#else
+#define HM_OS 0
+#endif
 static INIT_ONCE hm_once = INIT_ONCE_STATIC_INIT;
 
 int hostmods_on(void) {
@@ -194,7 +213,8 @@ static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
     const u8 *p = hm.mem, *end = hm.mem + plain;
 #define NEED(n) do { if ((u64)(end - p) < (u64)(n)) rt_fatal("host mods: the host's pack is cut short"); } while (0)
     NEED(16);
-    if (memcmp(p, "SSBUHMP1", 8) || rd32(p + 8) != 1) rt_fatal("host mods: the host's pack is of another version (update the game)");
+    u32 version = rd32(p + 8);
+    if (memcmp(p, "SSBUHMP1", 8) || (version != 1 && version != 2)) rt_fatal("host mods: the host's pack is of another version (update the game)");
     hm.nmods = rd32(p + 12);
     p += 16;
     if (hm.nmods > 4096) rt_fatal("host mods: %u mods in the host's pack", hm.nmods);
@@ -223,9 +243,49 @@ static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
     p += 8;
     NEED(hm.overlay_len);
     hm.overlay = p;
+    p += hm.overlay_len;
+    if (version >= 2) {
+        /* u32 length and the host's plugins.txt; u32 plugin count, then each plugin's u16 length and
+         * module name, u8 system, u64 length and library, u64 length and image (<module>.reloc.bin) */
+        NEED(4);
+        u32 ll = rd32(p);
+        NEED(4 + (u64)ll + 4);
+        char *list = malloc((size_t)ll + 1);
+        if (!list) rt_fatal("host mods: no memory");
+        memcpy(list, p + 4, ll);
+        list[ll] = 0;
+        hm.plugin_list = list;
+        p += 4 + ll;
+        u32 n = rd32(p);
+        p += 4;
+        if (n > 64) rt_fatal("host mods: %u plugins in the host's pack", n);
+        hm.plugins = calloc(n ? n : 1, sizeof *hm.plugins);
+        for (u32 i = 0; i < n; i++) {
+            NEED(2);
+            u32 l = (u32)p[0] | (u32)p[1] << 8;
+            NEED(2 + (u64)l + 1 + 8);
+            struct HmPlugin pl = {0};
+            memcpy(pl.name, p + 2, l < sizeof pl.name - 1 ? l : sizeof pl.name - 1);
+            u8 os = p[2 + l];
+            p += 3 + l;
+            pl.lib_len = rd64(p);
+            NEED(8 + pl.lib_len + 8);
+            pl.lib = p + 8;
+            p += 8 + pl.lib_len;
+            pl.image_len = rd64(p);
+            NEED(8 + pl.image_len);
+            pl.image = p + 8;
+            p += 8 + pl.image_len;
+            if (os == HM_OS) hm.plugins[hm.nplugins++] = pl;
+            else hm.other_os_plugins++;
+        }
+    }
 #undef NEED
-    fprintf(stderr, "[hostmods] the host's %u mod(s), %.1f MB, in memory only (pack %s)\n", hm.nmods,
-            (double)plain / 1048576.0, id);
+    fprintf(stderr, "[hostmods] the host's %u mod(s) and %u plugin(s), %.1f MB, in memory only (pack %s)\n", hm.nmods,
+            hm.nplugins, (double)plain / 1048576.0, id);
+    if (!hm.nplugins && hm.other_os_plugins)
+        rt_fatal("host mods: the host's mods have plugins built for other systems than this one only "
+                 "(the host has to build them for this one too: docs/HOST_MODS.md)");
     return TRUE;
 }
 static void load(void) { InitOnceExecuteOnce(&hm_once, hm_load, NULL, NULL); }
@@ -273,4 +333,19 @@ int hostmods_mods(char (*names)[256], u32 *hashes, int max) {
         hashes[i] = hm.hashes[i];
     }
     return n;
+}
+
+/* The host's plugins (version 2 packs): this system's, by index; NULL past the last. */
+const char *hostmods_plugin(u32 i, const u8 **lib, u64 *lib_len, const u8 **image, u64 *image_len) {
+    load();
+    if (i >= hm.nplugins) return NULL;
+    if (lib) { *lib = hm.plugins[i].lib; *lib_len = hm.plugins[i].lib_len; }
+    if (image) { *image = hm.plugins[i].image; *image_len = hm.plugins[i].image_len; }
+    return hm.plugins[i].name;
+}
+
+/* The host's Skyline plugin list (its plugins.txt), or NULL from a version 1 pack. */
+const char *hostmods_plugin_list(void) {
+    load();
+    return hm.plugin_list;
 }
