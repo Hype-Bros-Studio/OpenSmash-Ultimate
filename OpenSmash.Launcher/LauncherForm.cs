@@ -2008,6 +2008,8 @@ namespace OpenSmash.Launcher
             else if (id == "share_prompt:cancel") { _sharePrompt = false; Invalidate(); }
             else if (id == "share_prompt:share") { _sharePrompt = false; Invalidate(); ShareModList(true); }
             else if (id == "share_prompt:install") { _sharePrompt = false; Invalidate(); ShareModList(false); }
+            else if (id == "share_prompt:net_share") { _sharePrompt = false; Invalidate(); ModSyncShare(); }
+            else if (id == "share_prompt:net_pull") { _sharePrompt = false; Invalidate(); ModSyncPull(); }
             else if (id == "share_prompt:block") { }
             else if (id == "check_prompt:close") { _checkModsPrompt = false; Invalidate(); }
             else if (id == "check_prompt:install") { _checkModsPrompt = false; Invalidate(); _ = InstallModUpdates(); }

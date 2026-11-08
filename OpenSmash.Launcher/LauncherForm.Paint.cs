@@ -1994,7 +1994,7 @@ namespace OpenSmash.Launcher
             using (var b = new SolidBrush(Color.FromArgb((int)(200 * e), 5, 5, 5))) g.FillRectangle(b, 0, 0, W, H);
             AddHit("share_prompt:block", 0, 0, W, H);
             var st = PushFade(g, e, 24 * s);
-            float mw = 700 * s, mh = 320 * s, mx = (W - mw) / 2, my = (H - mh) / 2;
+            float mw = 700 * s, mh = 420 * s, mx = (W - mw) / 2, my = (H - mh) / 2;
             using (var p = Theme.CutCorners(mx, my, mw, mh, 30 * s))
             {
                 using (var b = new SolidBrush(A(Theme.Bg2))) g.FillPath(b, p);
@@ -2008,7 +2008,17 @@ namespace OpenSmash.Launcher
             Theme.Label(g, "MOD LIST", FD(32 * s), A(Theme.Text), mx + pad, my + 34 * s, 30 * s, 0.32f * s);
             Theme.DrawWrapped(g, "Share your installed mods as a list file a friend can install, or install the mods from a list a friend sent you.",
                 FB(15 * s), A(Theme.Muted), mx + pad, my + 84 * s, mw - pad * 2, 60 * s);
+            Theme.DrawWrapped(g, "Or sync over the network (same router or Tailscale): one PC shares, the other matches its mods, files and all - mods that aren't on GameBanana too.",
+                FB(15 * s), A(Theme.Muted), mx + pad, my + 160 * s, mw - pad * 2, 60 * s);
             float bh = 46 * s, by = my + mh - bh - 28 * s, gap = 12 * s;
+            {
+                float wNet = 230 * s, wPull = 200 * s, ny = by - bh - 16 * s;
+                float xPull = mx + mw - pad - wPull, xNet = xPull - gap - wNet;
+                Theme.ButtonAnimated(g, "SHARE OVER NETWORK", xNet, ny, wNet, bh, s, false, Hov("share_prompt:net_share", _hover == "share_prompt:net_share"), true, 12 * s, _alpha, press: Press("share_prompt:net_share"));
+                AddHit("share_prompt:net_share", xNet, ny, wNet, bh);
+                Theme.ButtonAnimated(g, "SYNC FROM A PC", xPull, ny, wPull, bh, s, false, Hov("share_prompt:net_pull", _hover == "share_prompt:net_pull"), true, 12 * s, _alpha, press: Press("share_prompt:net_pull"));
+                AddHit("share_prompt:net_pull", xPull, ny, wPull, bh);
+            }
             float wInstall = 210 * s, wShare = 170 * s, wCancel = 120 * s;
             float xInstall = mx + mw - pad - wInstall;
             float xShare = xInstall - gap - wShare;
