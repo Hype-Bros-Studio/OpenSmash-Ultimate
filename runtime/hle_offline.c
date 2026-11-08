@@ -78,9 +78,45 @@ static int bcat_slot(char names[][33], const char *name) {
     return 0;
 }
 
+/* Online services switched on. The game asks 0x7101739120 (its service table, x0, and a
+ * service id, x1) whether each Online mode is open: a param table (key, value) the game holds,
+ * where 1 is on. The Online menu's tiles ask it through the Lua binding is_invalid_online_sequence
+ * (0x7101bef500): Online Tourney (sequence 0x7010300) is service 0x232c, which the game's own
+ * table has off - the tile shows "This service is not active". With a delivery folder the
+ * services in SSBU_SERVICES_ON (hex ids, comma separated; default 232c, Online Tourney) answer
+ * 1; the rest keep the game's answer. */
+#define SERVICE_CHECK 0x7101739120ull
+static u64 service_check_original;
+static u32 services_on[16];
+static int services_on_count;
+static void service_check(Cpu *c) {
+    u32 id = (u32)c->x[1];
+    for (int i = 0; i < services_on_count; i++)
+        if (services_on[i] == id) { c->x[0] = 1; return; }
+    rt_call(c, service_check_original);
+}
+static void services_install(void) {
+    static int done;
+    if (done || !bcat_root()) return;
+    done = 1;
+    const char *list = getenv("SSBU_SERVICES_ON");
+    if (!list) list = "232c";
+    for (const char *p = list; *p && services_on_count < 16;) {
+        char *end;
+        unsigned long v = strtoul(p, &end, 16);
+        if (end == p) break;
+        services_on[services_on_count++] = (u32)v;
+        p = *end == ',' ? end + 1 : end;
+    }
+    if (!services_on_count) return;
+    service_check_original = rt_hook_function(SERVICE_CHECK, rt_native(service_check, "online services on"));
+    fprintf(stderr, "[bcat] services on: %s%s\n", list, service_check_original ? "" : " (hook missed)");
+}
+
 HLE(_ZN2nn4bcat10InitializeEv) NOTHING
 HLE(_ZN2nn4bcat25MountDeliveryCacheStorageEv) {
     fprintf(stderr, "[bcat] mount (%s)\n", bcat_root() ? bcat_root() : "none");
+    services_install();
     c->x[0] = bcat_root() ? 0 : R_UNAVAILABLE;
 }
 HLE(_ZN2nn4bcat27UnmountDeliveryCacheStorageEv) NOTHING
