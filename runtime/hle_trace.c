@@ -94,6 +94,43 @@ static GuestFn *const trace_thunks[TRACES] = {R8(0) R8(1) R8(2) R8(3)};
  * from +0x4f8 to +0x500) and the network manager's per-station state (+0xa080 + i * 0x78)
  * whenever any of them changed. */
 static GuestFn *arena_orig;
+
+/* SSBU_ARENA_PLACE_FILE=<path> (research, with SSBU_TRACE_ARENA=1): every 30th room frame, read a
+ * place from the file (1, 2 the ring, 3 the Spectator Stands, 4 the Waiting Area) and, when this
+ * player's icon is elsewhere, ask the game to move it there as a drag and drop does: the room's
+ * controller (room+0x1950), its virtual +0x30 (main+0x189c160) with &own slot (room+0x1920), &place. */
+static void arena_place(Cpu *c, u64 room) {
+    static const char *path;
+    static int tick;
+    if (!path) path = getenv("SSBU_ARENA_PLACE_FILE");
+    if (!path || !*path || ++tick % 30) return;
+    FILE *f = fopen(path, "r");
+    int want = 0;
+    if (!f) return;
+    if (fscanf(f, "%d", &want) != 1) want = 0;
+    fclose(f);
+    if (want < 1 || want > 4) return;
+    u8 own = *P(u8, room + 0x1920);
+    if (own >= 8) return;
+    u8 cur = *P(u8, room + 0xaf8 + (u64)own * 0x1e8);
+    u64 ctl = *P(u64, room + 0x1950);
+    if (cur == want || !ctl) return;
+    u64 fn = *P(u64, *P(u64, ctl) + 0x30);
+    Cpu saved = *c;
+    u64 sp = (c->sp - 0x40) & ~15ull, a = sp + 0x20, b = sp + 0x24;
+    *P(u8, a) = own;
+    *P(u8, b) = (u8)want;
+    c->sp = sp;
+    c->x[0] = ctl;
+    c->x[1] = a;
+    c->x[2] = b;
+    rt_call(c, fn);
+    u64 r = c->x[0];
+    *c = saved;
+    fprintf(stderr, "[arena] place: slot %u was %u, asked %d (fn %llx) -> %llx\n", own, cur, want,
+            (unsigned long long)fn, (unsigned long long)r);
+    fflush(stderr);
+}
 static void arena_room(Cpu *c) {
     static char last[1024];
     char line[1024];
@@ -120,6 +157,7 @@ static void arena_room(Cpu *c) {
         fflush(stderr);
     }
     arena_orig(c);
+    arena_place(c, room);
 }
 
 void trace_install(void) {
