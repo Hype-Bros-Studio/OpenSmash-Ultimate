@@ -29,6 +29,7 @@ class Services:
         self.nex = nex
         from .tournament import Tourney
         self.tourney = Tourney(nex)
+        self.tourney.register(nex)
         r = nex.register
         r(110, 7, self.get_integer_settings)
         r(110, 9, self.utility_9)
