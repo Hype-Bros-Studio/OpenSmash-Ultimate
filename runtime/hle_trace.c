@@ -136,6 +136,9 @@ static void arena_request(int want, const char *word, const char *from, double n
     fflush(stderr);
 }
 long online_arena_assignment(int *place, char *role, int rcap);   /* (hle_online.c) */
+int online_arena_report(int won);
+static int a_battle;     /* this station started a battle and has not reported it yet */
+static double a_back;    /* when the room came back after that battle */
 void arena_poll(void) {
     static const char *path;
     static long long seen = -1;
@@ -175,6 +178,7 @@ void arena_poll(void) {
         hid_press(10, 0.15);   /* B_PLUS */
         a_start = 0;
         a_confirm = 3;
+        a_battle = 1;
         a_confirm_at = now + 2.0;
         fprintf(stderr, "[arena] start pressed at %.2f s\n", now);
         fflush(stderr);
@@ -183,6 +187,7 @@ void arena_poll(void) {
         hid_press(10, 0.15);   /* B_PLUS */
         a_join = 0;
         a_confirm = 3;
+        a_battle = 1;
         a_confirm_at = now + 2.0;
         fprintf(stderr, "[arena] joined the start at %.2f s\n", now);
         fflush(stderr);
@@ -199,9 +204,30 @@ void arena_poll(void) {
 }
 static void arena_place(Cpu *c, u64 room) {
     static double next;
+    double was = a_room;
     a_room = rt_now_ns() / 1e9;
     u8 own = *P(u8, room + 0x1920);
     if (own >= 8) return;
+    /* After a battle the room puts the loser back into the ring last: its record passes through
+     * kind 5 for a moment and takes the "newest" mark (+1), on every station alike. */
+    if (a_battle && was && a_room > was + 30.0) a_back = a_room;   /* (fighter select is quiet ~16 s at most) */
+    if (a_battle && a_back) {
+        int lost = -1;
+        for (int i = 0; i < 8; i++)
+            if (*P(u8, room + 0xaf8 + (u64)i * 0x1e8) == 5) lost = i == own;
+        if (lost < 0 && a_room >= a_back + 10.0)
+            for (int i = 0; i < 8; i++) {
+                u8 *r = P(u8, room + 0xaf8 + (u64)i * 0x1e8);
+                if (r[0] == 1 && r[1] == 1) lost = i == own;
+            }
+        if (lost >= 0) {
+            int sent = online_arena_report(!lost);
+            fprintf(stderr, "[arena] battle over: %s (%s)\n", lost ? "lost" : "won", sent ? "reporting" : "no bracket match");
+            fflush(stderr);
+            a_battle = 0;
+            a_back = 0;
+        }
+    }
     u8 cur = *P(u8, room + 0xaf8 + (u64)own * 0x1e8);
     int ring = 0;
     for (int i = 0; i < 8; i++) ring += *P(u8, room + 0xaf8 + (u64)i * 0x1e8) == 1;

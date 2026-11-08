@@ -529,9 +529,9 @@ void online_rb_counts(long long *back, long long *left_out, long long *differ) {
 static SRWLOCK ab_lock = SRWLOCK_INIT;
 static long ab_seq;
 static int ab_place;
-static char ab_role[8], ab_match[24];
+static char ab_role[8], ab_match[24], ab_opponent[48];
 
-static int http_get(const char *path, char *out, int cap) {
+static int http_request(const char *method, const char *path, const char *body, char *out, int cap) {
     struct sockaddr_in at;
     if (!lobby_address(&at)) return -1;
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -543,8 +543,10 @@ static int http_get(const char *path, char *out, int cap) {
     struct timeval tmo = {3, 0};
 #endif
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
-    char req[512];
-    int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: lobby\r\nConnection: close\r\n\r\n", path);
+    char req[1024];
+    int blen = body ? (int)strlen(body) : 0;
+    int n = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: lobby\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+                     method, path, blen, body ? body : "");
     int len = -1;
     if (n > 0 && n < (int)sizeof req && send(s, req, n, 0) == n) {
         len = 0;
@@ -554,11 +556,11 @@ static int http_get(const char *path, char *out, int cap) {
     }
     closesocket(s);
     if (len <= 0 || strncmp(out, "HTTP/1.1 200", 12)) return -1;
-    char *body = strstr(out, "\r\n\r\n");
-    if (!body) return -1;
-    body += 4;
-    len -= (int)(body - out);
-    memmove(out, body, (size_t)len + 1);
+    char *start = strstr(out, "\r\n\r\n");
+    if (!start) return -1;
+    start += 4;
+    len -= (int)(start - out);
+    memmove(out, start, (size_t)len + 1);
     return len;
 }
 
@@ -592,15 +594,18 @@ static DWORD WINAPI arena_bracket_thread(void *arg) {
                                                                      : snprintf(enc + e, sizeof enc - e, "%%%02X", *c);
         enc[e] = 0;
         snprintf(path, sizeof path, "/arena/assignment?name=%s", enc);
-        char place[8] = "", role[8] = "", match[24] = "";
-        if (http_get(path, buf, sizeof buf) > 0 && json_member(buf, "place", place, sizeof place)) {
+        char place[8] = "", role[8] = "", match[24] = "", opponent[48] = "";
+        if (http_request("GET", path, NULL, buf, sizeof buf) > 0 && json_member(buf, "place", place, sizeof place)) {
             json_member(buf, "role", role, sizeof role);
             json_member(buf, "match", match, sizeof match);
+            json_member(buf, "opponent", opponent, sizeof opponent);
+            if (!strcmp(match, "null")) match[0] = 0;
             AcquireSRWLockExclusive(&ab_lock);
             if (atoi(place) != ab_place || strcmp(role, ab_role) || strcmp(match, ab_match)) {
                 ab_place = atoi(place);
                 snprintf(ab_role, sizeof ab_role, "%s", role);
                 snprintf(ab_match, sizeof ab_match, "%s", match);
+                snprintf(ab_opponent, sizeof ab_opponent, "%s", opponent);
                 ab_seq++;
             }
             ReleaseSRWLockExclusive(&ab_lock);
@@ -629,4 +634,45 @@ long online_arena_assignment(int *place, char *role, int rcap) {
     snprintf(role, (size_t)rcap, "%s", ab_role);
     ReleaseSRWLockExclusive(&ab_lock);
     return seq;
+}
+
+/* This player's result of the match it was assigned (won or lost), to POST /arena/result: once,
+ * from a thread of its own; 0 when there is no match to report. */
+static DWORD WINAPI arena_report_thread(void *arg) {
+    char *body = arg, out[2048];
+    int ok = http_request("POST", "/arena/result", body, out, sizeof out) > 0;
+    fprintf(stderr, "[arena] result %s: %s -> %s\n", body, ok ? "sent" : "not taken", ok ? out : "");
+    fflush(stderr);
+    free(body);
+    return 0;
+}
+static void json_escape(char *out, int cap, const char *in) {
+    int n = 0;
+    for (; *in && n < cap - 7; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '"' || c == '\\') { out[n++] = '\\'; out[n++] = (char)c; }
+        else if (c < 0x20) n += snprintf(out + n, (size_t)(cap - n), "\\u%04x", c);
+        else out[n++] = (char)c;
+    }
+    out[n] = 0;
+}
+int online_arena_report(int won) {
+    char match[24], opp[48], me[48], m[64], o[112], i[112];
+    AcquireSRWLockExclusive(&ab_lock);
+    snprintf(match, sizeof match, "%s", ab_match);
+    snprintf(opp, sizeof opp, "%s", ab_opponent);
+    ReleaseSRWLockExclusive(&ab_lock);
+    snprintf(me, sizeof me, "%s", net_player_name() ? net_player_name() : "");
+    if (!match[0] || !opp[0] || !me[0]) return 0;
+    json_escape(m, sizeof m, match);
+    json_escape(o, sizeof o, opp);
+    json_escape(i, sizeof i, me);
+    char *body = malloc(512);
+    if (!body) return 0;
+    snprintf(body, 512, "{\"match\": \"%s\", \"winner\": \"%s\", \"loser\": \"%s\", \"reporter\": \"%s\"}",
+             m, won ? i : o, won ? o : i, i);
+    HANDLE t = CreateThread(NULL, 0, arena_report_thread, body, 0, NULL);
+    if (!t) { free(body); return 0; }
+    CloseHandle(t);
+    return 1;
 }
