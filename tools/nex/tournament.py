@@ -7,6 +7,18 @@ session" while date2 <= now <= date3 too (main+0x1bef310 / main+0x1bef3f0). The 
 event's Map<String, Variant> (keys read by the converter: melee_kind, melee_rule, time_sec, stock, ...,
 tournament_entry_max_seconds, competition_aggregate_at, url1, url2).
 
+That "convention" is not the Online Tourney tile, though. The tile (Lua is_in_period_online_tournament,
+main+0x1bed840) reads tourney files delivered by BCAT, which the runtime serves from SSBU_BCAT_DIR
+(runtime/hle_offline.c): every file in the delivery-cache directory "tournament" is loaded, whatever its
+name. Known so far of a tourney file (main+0x1761f80 checks it, main+0x1bf02a0 reads it):
+  +0x00 u32  file size (must equal the file's size)
+  +0x0c u32  kind, <= 0x1f
+  +0x10 u32  1 = needs a save-data flag; else 0
+  +0x18 u64  overwritten by the game with the file's id (hash40 of "tournament/<name>")
+  +0x20 date start, +0x28 date end: u16 year, u8 month, day, hour, minute, second (now must be inside)
+  +0x40 u32  entry count, +0x44 u32 offset of the entries (0x4c bytes each)
+  +0x48 (u32 offset, u32 size) per language (index from main+0x523d00c): a text blob, registered by
+         main+0x33798d0 (likely the tourney's name and description)
 The Tournament protocol (201) that runs entry and rounds is answered here as it is worked out."""
 import time
 

@@ -52,19 +52,142 @@ HLE(_ZN2nn5album20ReadAlbumMovieStreamEPmPvmNS0_17MovieStreamHandleEl) FAIL
 HLE(_ZN2nn5album23GetAlbumMovieStreamSizeEPmNS0_17MovieStreamHandleE) FAIL
 HLE(_ZN2nn5album21CloseAlbumMovieStreamENS0_17MovieStreamHandleE) NOTHING
 
-/* ---- nn::bcat: no delivered data ------------------------------------------------- */
+/* ---- nn::bcat: delivered data from a folder ------------------------------------------
+ * SSBU_BCAT_DIR=<folder> stands for the delivery cache: <folder>/<directory>/<file>. Without it
+ * the cache cannot be mounted, as on a console that never synced. Every name the game asks for is
+ * logged ([bcat]) - the Online Tourney's schedule arrives this way. */
+#include <dirent.h>
+#include <sys/stat.h>
+#define R_BCAT_NOT_FOUND RESULT(122, 1)
+
+static const char *bcat_root(void) {
+    static const char *root;
+    static int done;
+    if (!done) { root = getenv("SSBU_BCAT_DIR"); done = 1; if (root && !*root) root = NULL; }
+    return root;
+}
+static void bcat_name(char *out, u64 guest) {   /* DirectoryName / FileName: char[32] */
+    memcpy(out, P(char, guest), 32);
+    out[32] = 0;
+    for (char *p = out; *p; p++) if (*p == '/' || *p == '\\' || (p == out && *p == '.')) *p = '_';
+}
+static char bcat_dirs[16][33];   /* an open Directory or File keeps its slot in its first 8 bytes */
+static char bcat_files[16][33];
+static int bcat_slot(char names[][33], const char *name) {
+    for (int i = 0; i < 16; i++) if (!names[i][0] || !strcmp(names[i], name)) { strcpy(names[i], name); return i; }
+    return 0;
+}
+
 HLE(_ZN2nn4bcat10InitializeEv) NOTHING
-HLE(_ZN2nn4bcat25MountDeliveryCacheStorageEv) FAIL
+HLE(_ZN2nn4bcat25MountDeliveryCacheStorageEv) {
+    fprintf(stderr, "[bcat] mount (%s)\n", bcat_root() ? bcat_root() : "none");
+    c->x[0] = bcat_root() ? 0 : R_UNAVAILABLE;
+}
 HLE(_ZN2nn4bcat27UnmountDeliveryCacheStorageEv) NOTHING
-HLE(_ZN2nn4bcat31EnumerateDeliveryCacheDirectoryEPiPNS0_13DirectoryNameEi) { st32(c->x[0], 0); c->x[0] = R_UNAVAILABLE; }
-HLE(_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressE) FAIL
-HLE(_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressEPKc) FAIL
-HLE(_ZN2nn4bcat22DeliveryCacheDirectory4OpenERKNS0_13DirectoryNameE) FAIL
-HLE(_ZN2nn4bcat22DeliveryCacheDirectory4ReadEPiPNS0_27DeliveryCacheDirectoryEntryEi) { st32(c->x[1], 0); c->x[0] = R_UNAVAILABLE; }
+HLE(_ZN2nn4bcat31EnumerateDeliveryCacheDirectoryEPiPNS0_13DirectoryNameEi) {
+    int n = 0, max = (int)c->x[2];
+    DIR *d = bcat_root() ? opendir(bcat_root()) : NULL;
+    for (struct dirent *e; d && n < max && (e = readdir(d));) {
+        if (e->d_name[0] == '.' || strlen(e->d_name) > 31) continue;
+        memset(P(char, c->x[1] + 32 * n), 0, 32);
+        memcpy(P(char, c->x[1] + 32 * n), e->d_name, strlen(e->d_name));
+        n++;
+    }
+    if (d) closedir(d);
+    fprintf(stderr, "[bcat] enumerate: %d directories\n", n);
+    st32(c->x[0], n);
+    c->x[0] = bcat_root() ? 0 : R_UNAVAILABLE;
+}
+/* A sync finishes at once: the folder already is the cache. The SDK's DeliveryCacheProgress keeps
+ * its state inline (status at +0x58, result at +0x5c, read by GetStatus/GetResult; Update does
+ * nothing without the service object at +0x20), so the sync leaves it Done (9) and OK. */
+static void bcat_sync_done(u64 progress) {
+    st32(progress + 0x58, 9);
+    st32(progress + 0x5c, 0);
+}
+HLE(_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressE) {
+    fprintf(stderr, "[bcat] sync\n");
+    if (bcat_root()) bcat_sync_done(c->x[0]);
+    c->x[0] = bcat_root() ? 0 : R_UNAVAILABLE;
+}
+HLE(_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressEPKc) {
+    char name[33];
+    bcat_name(name, c->x[1]);
+    fprintf(stderr, "[bcat] sync directory %s\n", name);
+    if (bcat_root()) bcat_sync_done(c->x[0]);
+    c->x[0] = bcat_root() ? 0 : R_UNAVAILABLE;
+}
+HLE(_ZN2nn4bcat22DeliveryCacheDirectory4OpenERKNS0_13DirectoryNameE) {
+    char name[33], path[1024];
+    struct stat st;
+    bcat_name(name, c->x[1]);
+    snprintf(path, sizeof path, "%s/%s", bcat_root() ? bcat_root() : "", name);
+    int ok = bcat_root() && !stat(path, &st) && S_ISDIR(st.st_mode);
+    fprintf(stderr, "[bcat] open directory %s%s\n", name, ok ? "" : ": not there");
+    st64(c->x[0], bcat_slot(bcat_dirs, name));
+    c->x[0] = ok ? 0 : R_BCAT_NOT_FOUND;
+}
+HLE(_ZN2nn4bcat22DeliveryCacheDirectory4ReadEPiPNS0_27DeliveryCacheDirectoryEntryEi) {
+    /* entry: FileName[32], s64 size, Digest[16] = 0x38 bytes */
+    const char *name = bcat_dirs[ld64(c->x[0]) & 15];
+    char path[1024];
+    int n = 0, max = (int)c->x[3];
+    snprintf(path, sizeof path, "%s/%s", bcat_root() ? bcat_root() : "", name);
+    DIR *d = bcat_root() ? opendir(path) : NULL;
+    for (struct dirent *e; d && n < max && (e = readdir(d));) {
+        char f[1100];
+        struct stat st;
+        if (e->d_name[0] == '.' || strlen(e->d_name) > 31) continue;
+        snprintf(f, sizeof f, "%s/%s", path, e->d_name);
+        if (stat(f, &st) || !S_ISREG(st.st_mode)) continue;
+        u64 at = c->x[2] + 0x38 * (u64)n;
+        memset(P(char, at), 0, 0x38);
+        memcpy(P(char, at), e->d_name, strlen(e->d_name));
+        st64(at + 32, (u64)st.st_size);
+        n++;
+    }
+    if (d) closedir(d);
+    fprintf(stderr, "[bcat] read directory %s: %d files\n", name, n);
+    st32(c->x[1], n);
+    c->x[0] = d ? 0 : R_BCAT_NOT_FOUND;
+}
 HLE(_ZN2nn4bcat22DeliveryCacheDirectory5CloseEv) NOTHING
 HLE(_ZN2nn4bcat22DeliveryCacheDirectoryD1Ev) NOTHING
-HLE(_ZN2nn4bcat17DeliveryCacheFile4OpenERKNS0_13DirectoryNameERKNS0_8FileNameE) FAIL
-HLE(_ZN2nn4bcat17DeliveryCacheFile4ReadEPmlPvm) FAIL
+HLE(_ZN2nn4bcat17DeliveryCacheFile4OpenERKNS0_13DirectoryNameERKNS0_8FileNameE) {
+    char dir[33], file[33], path[1100], both[70];
+    struct stat st;
+    bcat_name(dir, c->x[1]);
+    bcat_name(file, c->x[2]);
+    snprintf(path, sizeof path, "%s/%s/%s", bcat_root() ? bcat_root() : "", dir, file);
+    int ok = bcat_root() && !stat(path, &st) && S_ISREG(st.st_mode);
+    fprintf(stderr, "[bcat] open file %s/%s%s\n", dir, file, ok ? "" : ": not there");
+    snprintf(both, sizeof both, "%s/%s", dir, file);
+    both[32] = 0;   /* (slot names hold 32 characters: long pairs are cut, the log has them whole) */
+    int slot = 0;
+    for (int i = 0; i < 16; i++) if (!bcat_files[i][0] || !strcmp(bcat_files[i], both)) { slot = i; break; }
+    static char full[16][70];
+    strcpy(bcat_files[slot], both);
+    snprintf(full[slot], sizeof full[slot], "%s/%s", dir, file);
+    st64(c->x[0], slot);
+    st64(c->x[0] + 8, (u64)(uintptr_t)full[slot]);   /* (host pointer kept beside the slot) */
+    c->x[0] = ok ? 0 : R_BCAT_NOT_FOUND;
+}
+HLE(_ZN2nn4bcat17DeliveryCacheFile4ReadEPmlPvm) {
+    const char *rel = (const char *)(uintptr_t)ld64(c->x[0] + 8);
+    char path[1100];
+    snprintf(path, sizeof path, "%s/%s", bcat_root() ? bcat_root() : "", rel ? rel : "");
+    FILE *f = bcat_root() && rel ? fopen(path, "rb") : NULL;
+    u64 got = 0;
+    if (f) {
+        fseek(f, (long)c->x[2], SEEK_SET);
+        got = fread(P(char, c->x[3]), 1, c->x[4], f);
+        fclose(f);
+    }
+    fprintf(stderr, "[bcat] read %s @%llu: %llu of %llu bytes\n", rel ? rel : "?", (unsigned long long)c->x[2],
+            (unsigned long long)got, (unsigned long long)c->x[4]);
+    st64(c->x[1], got);
+    c->x[0] = f ? 0 : R_BCAT_NOT_FOUND;
+}
 HLE(_ZN2nn4bcat17DeliveryCacheFile5CloseEv) NOTHING
 HLE(_ZN2nn4bcat17DeliveryCacheFileD1Ev) NOTHING
 
