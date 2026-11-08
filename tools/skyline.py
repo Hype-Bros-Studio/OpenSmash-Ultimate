@@ -349,6 +349,17 @@ def sync(tree, log=print, jobs=1):
     return names
 
 
+# On Linux a mod's plugin is compiled into the program as the standard ones are
+# (tools/linux/build_linux.py links every build/nro/<name>): no plugin file of its own.
+LINUX = sys.platform.startswith("linux")
+
+
+def programs_of(tree):
+    """The game's program, as each system's build makes it."""
+    return [os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"),
+            os.path.join(tree, "build", "ssbu.exe"), os.path.join(tree, "build-linux", "ssbu")]
+
+
 def built_in(tree, name):
     """Whether the game's program has the plugin compiled in (its nro_table names it), from C the
     current recompiler made (an older one's can carry bugs fixed since), and compiled since (Apply
@@ -356,11 +367,11 @@ def built_in(tree, name):
     c = os.path.join(tree, "build", "nro", name, "g_module.c")
     if c_stale(c):
         return False
-    programs = [os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"), os.path.join(tree, "build", "ssbu.exe")]
-    built = max((os.path.getmtime(x) for x in programs if os.path.exists(x)), default=0)
+    built = max((os.path.getmtime(x) for x in programs_of(tree) if os.path.exists(x)), default=0)
     if os.path.getmtime(c) > built:
         return False
-    for table in (os.path.join(tree, "build-mac", "gen", "nro_table.c"), os.path.join(tree, "build", "rt", "nro_table.c")):
+    for table in (os.path.join(tree, "build-mac", "gen", "nro_table.c"), os.path.join(tree, "build", "rt", "nro_table.c"),
+                  os.path.join(tree, "build-linux", "gen", "nro_table.c")):
         if os.path.exists(table) and f"rt_module_{name}," in open(table, encoding="utf-8").read():
             return True
     return False
@@ -389,7 +400,7 @@ def plugin_state(tree, mod, rels):
         except Exception:   # (not an NRO the recompiler reads)
             entry = None
         name = entry and entry["module"]
-        out.append({"file": rel, "module": name, "built": dll_current(tree, name) if name else None})
+        out.append({"file": rel, "module": name, "built": (built_in(tree, name) if LINUX else dll_current(tree, name)) if name else None})
     return out
 
 
@@ -511,8 +522,7 @@ def _stale_hooks(tree):
 
 
 def program(tree):
-    for exe in (os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"),
-                os.path.join(tree, "build", "ssbu.exe"), os.path.join(tree, "build-linux", "ssbu")):
+    for exe in programs_of(tree):
         if os.path.exists(exe):
             return exe
     return None
@@ -661,7 +671,10 @@ __declspec(dllexport) void ssbu_plugin_bind(GuestFn *(*lookup)(u64), GuestFn *(*
 
 def cache_mod_plugins(tree, jobs, log=print, quiet=False):
     """Compile each turned-on mod's plugin into build/plugins/<name>.dll and list those files.
-    The standard plugins stay in the program. Returns the module names that translated."""
+    The standard plugins stay in the program. Returns the module names that translated.
+    On Linux they are linked into the program instead (build), so this makes none."""
+    if LINUX:
+        return []
     import cc
     import recomp
     p = Paths(tree)
@@ -787,6 +800,9 @@ def build(tree, jobs, log=print, again=True):
         log(f"linking the game once ({reason})")
         if sys.platform == "darwin":
             cmd = [sys.executable, os.path.join(HERE, "mac", "build_mac.py"), "--port", tree, "--jobs", str(jobs)]
+        elif LINUX:
+            cmd = [sys.executable, os.path.join(HERE, "linux", "build_linux.py"), "--port", tree,
+                   "--out", os.path.join(tree, "build-linux"), "--jobs", str(jobs)]
         else:
             cmd = [sys.executable, os.path.join(HERE, "recomp.py"), "all", exefs, "--out", os.path.join(tree, "build"),
                    "--jobs", str(jobs), "--tree", tree]
@@ -832,8 +848,7 @@ def needs_build(tree):
     """Why the game's program needs building again, or None: it's missing, a file that goes into it
     (the runtime, the recompiler, the build's tools, the plugins' hook lists) is newer than it, a
     standard plugin isn't fetched, or a plugin that runs isn't compiled in (current)."""
-    programs = [os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"), os.path.join(tree, "build", "ssbu.exe")]
-    built = max((os.path.getmtime(x) for x in programs if os.path.exists(x)), default=0)
+    built = max((os.path.getmtime(x) for x in programs_of(tree) if os.path.exists(x)), default=0)
     if not built:
         return "it isn't built"
     for top in ("runtime", "tools"):
