@@ -50,8 +50,10 @@ HLE(getRegionAddress) {
 
 /* Every hook target, "<module> <offset>" a line in <data dir>/../skyline/hooks.txt: the next build
  * makes the ones the game also calls directly reach their hooks too (tools/recomp.py hookable). */
+int hostmods_on(void);   /* (hle_hostmods.c: a host's mods run here - nothing of theirs is written to this tree) */
 static void note_hook_target(u64 target) {
     char where[96], line[128], path[1200];
+    if (hostmods_on()) return;
     rt_describe(target, where, sizeof where);
     char *plus = strchr(where, '+');
     if (!plus || strncmp(plus, "+0x", 3)) return;
@@ -68,6 +70,7 @@ static void note_hook_target(u64 target) {
 
 static void note_inline_point(u64 at) {
     char where[96], line[128], path[1200], have[128];
+    if (hostmods_on()) return;
     rt_describe(at, where, sizeof where);
     char *plus = strchr(where, '+');
     if (!plus || strncmp(plus, "+0x", 3)) return;
@@ -1118,7 +1121,7 @@ static int csk_loaded;   /* (the plugins' mains have run: each entry from now on
 /* csk.json: what is written so far, closed as a list - if it changed (then the mods need applying again) */
 static SRWLOCK csk_lock = SRWLOCK_INIT;
 static void csk_publish(void) {
-    if (!csk) return;
+    if (!csk || hostmods_on()) return;
     AcquireSRWLockExclusive(&csk_lock);
     fflush(csk);
     FILE *in = fopen(csk_tmp, "rb");
@@ -1547,7 +1550,13 @@ void skyline_load_plugins(Cpu *c) {
     }
     snprintf(csk_path, sizeof csk_path, "%s/../skyline/csk.json", rt_data_dir);
     snprintf(csk_tmp, sizeof csk_tmp, "%s.tmp", csk_path);
-    csk = fopen(csk_tmp, "w");
+#ifdef _WIN32
+#define NULL_DEVICE "NUL"
+#else
+#define NULL_DEVICE "/dev/null"
+#endif
+    /* (a host's mods: its pack already carries the entries - they're still read, for the costume redirects, but not saved) */
+    csk = fopen(hostmods_on() ? NULL_DEVICE : csk_tmp, "w");
     if (csk) fprintf(csk, "[\n");
     if (!real_smashline) {
     static_data_original = rt_hook_function(MAIN_BASE + STATIC_FIGHTER_DATA, rt_native(static_data, "smashline fighter articles"));

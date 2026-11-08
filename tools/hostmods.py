@@ -468,6 +468,21 @@ def mods_index(root, names):
     return out
 
 
+def check_csk(root, applied):
+    """The select-screen entries the plugins add (dump/skyline/csk.json, written as this tree's game
+    starts) go into the game's databases when the mods are applied: players get the databases as
+    applied, so entries recorded since then would be missing from their select screens."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import csk
+    if not os.path.exists(os.path.join(root, "dump", "skyline", "csk.json")):
+        print("note: the plugins haven't recorded their select-screen entries here yet (dump/skyline/csk.json):"
+              " if they add characters, start this game once, then tools/mods.py apply again", file=sys.stderr)
+        return
+    if applied.get("csk") != csk.digest(csk.load(root)):
+        raise Error("the plugins' select-screen entries changed since the mods were applied"
+                    " (dump/skyline/csk.json): tools/mods.py apply again")
+
+
 def pack_tree(root, with_plugins=True, open_pack=False):
     """The plain pack of this tree's applied mods; open_pack: version 3, with the mods' folders."""
     root = os.path.abspath(root)
@@ -498,6 +513,8 @@ def pack_tree(root, with_plugins=True, open_pack=False):
     modded_map, overlay = compact_overlay(modded_map, overlay, len(sources))
     mods = [(name, mod_hash32(os.path.join(root, "mods", name))) for name in applied["mods"]]
     plugin_list, plugins = tree_plugins(root) if with_plugins else (b"", [])
+    if plugins:
+        check_csk(root, applied)
     folders = None
     if open_pack:
         folders = []

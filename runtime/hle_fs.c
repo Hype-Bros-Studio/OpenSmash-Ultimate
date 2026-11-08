@@ -395,7 +395,9 @@ static void host_path(char *out, size_t n, struct Mount *m, const char *rest) {
         const char *sub = rest + 13 + (rest[13] == '/'), *end = strchr(sub, '/');
         size_t len = end ? (size_t)(end - sub) : strlen(sub);
         const char *root = len ? mod_root_named(sub, len) : NULL;
-        if (root) snprintf(out, n, "%s/../../mods/%s%s", rt_data_dir, root, end ? end : "");
+        if (hostmods_on())   /* (a host's mods run: this tree's own mods aren't on the SD card) */
+            snprintf(out, n, "%s/../skyline/sd/ultimate/no-mod/%s", rt_data_dir, rest);
+        else if (root) snprintf(out, n, "%s/../../mods/%s%s", rt_data_dir, root, end ? end : "");
         else snprintf(out, n, "%s/../../mods%s", rt_data_dir, rest + 13);
     } else
         snprintf(out, n, "%s/%s", m->root, rest);
@@ -1450,9 +1452,9 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
                 listing_add(&h, rom_file(k)->name, rom_file(k)->name_len, FILE_ENTRY, rom_file(k)->size);
     } else if (!strcmp(m->name, "sd") && !_strnicmp(rest + strspn(rest, "/"), "ultimate/mods", 13) &&
                (!rest[strspn(rest, "/") + 13] || !strcmp(rest + strspn(rest, "/") + 13, "/"))) {
-        load_mods_list();   /* (the turned-on mods only) */
+        load_mods_list();   /* (the turned-on mods only; none of this tree's under a host's mods) */
         char flat[4200];
-        for (int i = 0; i < mods_count && (mode & LIST_DIRS); i++) {
+        for (int i = 0; i < mods_count && (mode & LIST_DIRS) && !hostmods_on(); i++) {
             mod_folder_name(flat, sizeof flat, mods_list[i]);
             listing_add(&h, flat, strlen(flat), DIR_ENTRY, 0);
         }
