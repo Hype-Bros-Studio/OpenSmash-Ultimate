@@ -42,6 +42,7 @@ The formats (runtime/hle_hostmods.c reads them):
 All numbers little-endian but the lobby's (tools/hostmods_depot.py)."""
 import argparse
 import base64
+import bisect
 import hashlib
 import json
 import os
@@ -55,6 +56,8 @@ PLAIN_MAGIC = b"SSBUHMP1"
 LAYER_MAGIC = b"SSBUROM1"
 VERSION = 3            # (an open pack's; a sealed one stays SEALED_VERSION, without the mods' folders)
 SEALED_VERSION = 2
+MODS_INDEX_MAGIC = b"SSBUHMI1"   # (the pack's last section, when there: the mods' files as mods:/ sees them)
+MODS_INDEX_DATA_MAX = 4 << 10    # (the bytes of files this small are in it: plugins' marker files)
 PLUGIN_OS = {".dll": 1, ".so": 2, ".dylib": 3}   # (runtime/hle_hostmods.c HM_OS: Windows x64, Linux x64, macOS arm64)
 CHUNK = 1 << 20
 HEAD = 40
@@ -138,7 +141,8 @@ def unseal(code, sealed):
 
 
 # ---- the plain pack ------------------------------------------------------------------------
-def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin_list=b"", plugins=(), folders=None):
+def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin_list=b"", plugins=(), folders=None,
+                mods_index=None):
     """plugins: [(module name, system (PLUGIN_OS), library bytes, image bytes)]. folders (an open pack,
     version 3): [(mod folder name, [(path in the folder, bytes)])]; None for a sealed pack (version 2).
     (Names aren't checked here: tests build bad packs with it. parse_plain checks them.)"""
@@ -168,6 +172,11 @@ def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin
                 pb = path.encode("utf-8")
                 out.append(struct.pack("<H", len(pb)) + pb + struct.pack("<Q", len(data)))
                 out.append(data)
+    if mods_index is not None:
+        out.append(MODS_INDEX_MAGIC + struct.pack("<I", len(mods_index)))
+        for path, size, data in mods_index:
+            pb = path.encode("utf-8")
+            out.append(struct.pack("<HQI", len(pb), size, len(data)) + pb + data)
     return b"".join(out)
 
 
@@ -268,10 +277,54 @@ def _parse_plain(p):
                 files.append((path, p[at:at + dl]))
                 at += dl
             folders.append((name, files))
+    mods_index = None
+    if p[at:at + 8] == MODS_INDEX_MAGIC:
+        mods_index = []
+        count = struct.unpack_from("<I", p, at + 8)[0]
+        at += 12
+        for _ in range(count):
+            pl, size, dl = struct.unpack_from("<HQI", p, at)
+            path = p[at + 14:at + 14 + pl].decode("utf-8")
+            at += 14 + pl
+            if not safe_path(path) or dl > size or at + dl > len(p):
+                raise Error(f"a mods: file at {path!r} in the pack")
+            mods_index.append((path, size, p[at:at + dl]))
+            at += dl
     if at != len(p):
         raise Error("a mod pack of the wrong size")
     return {"mods": mods, "vanilla_map_sha256": sha, "source_sizes": sizes, "map": modded_map, "overlay": overlay,
-            "plugin_list": plugin_list, "plugins": plugins, "folders": folders}
+            "plugin_list": plugin_list, "plugins": plugins, "folders": folders, "mods_index": mods_index}
+
+
+def compact_overlay(modded_map, overlay, src):
+    """mods.py writes the overlay sparse (its pieces at scattered offsets, holes between them):
+    send only the bytes the map reads from it, packed, with the map's offsets moved to match."""
+    size, count, _ = struct.unpack_from("<QII", modded_map, 8)
+    ents = list(struct.iter_unpack("<QQII", modded_map[24:]))
+    spans = []
+    for i, (at, off, s, pad) in enumerate(ents):
+        if s == src:
+            end = ents[i + 1][0] if i + 1 < len(ents) else size
+            spans.append((off, off + end - at))
+    merged = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    if any(hi > len(overlay) for _, hi in merged):
+        raise Error("the layer map reads past the end of the overlay: apply the mods again")
+    moved, packed, out = {}, bytearray(), []
+    for lo, hi in merged:
+        moved[lo] = len(packed)
+        packed += overlay[lo:hi]
+    starts = [lo for lo, _ in merged]
+    for at, off, s, pad in ents:
+        if s == src:
+            lo = starts[bisect.bisect_right(starts, off) - 1]
+            off = moved[lo] + off - lo
+        out.append(struct.pack("<QQII", at, off, s, pad))
+    return modded_map[:24] + b"".join(out), bytes(packed)
 
 
 def check_map(modded_map, nsources):
@@ -386,6 +439,35 @@ def mod_folder(folder):
     return files
 
 
+def mods_index(root, names):
+    """The turned-on mods' files as ARCropolis' mods:/ shows them (one tree, a later mod's file over an
+    earlier one's): [(path, size, bytes - only for a file of MODS_INDEX_DATA_MAX or less)]. Players' games
+    serve mods:/ from it under host mods (plugins look for their marker files there)."""
+    files = {}
+    for name in names:
+        folder = os.path.join(root, "mods", name)
+        for top, dirs, fnames in os.walk(folder):
+            dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(top, d)))
+            for n in sorted(fnames):
+                full = os.path.join(top, n)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                rel = os.path.relpath(full, folder).replace(os.sep, "/")
+                if not safe_path(rel):
+                    continue
+                files[rel.lower()] = (rel, full)
+    out = []
+    for _, (rel, full) in sorted(files.items()):
+        size = os.path.getsize(full)
+        data = b""
+        if size <= MODS_INDEX_DATA_MAX:
+            with open(full, "rb") as f:
+                data = f.read()
+            size = len(data)
+        out.append((rel, size, data))
+    return out
+
+
 def pack_tree(root, with_plugins=True, open_pack=False):
     """The plain pack of this tree's applied mods; open_pack: version 3, with the mods' folders."""
     root = os.path.abspath(root)
@@ -413,6 +495,7 @@ def pack_tree(root, with_plugins=True, open_pack=False):
     check_map(modded_map, len(sources))
     with open(overlay_path, "rb") as f:
         overlay = f.read()
+    modded_map, overlay = compact_overlay(modded_map, overlay, len(sources))
     mods = [(name, mod_hash32(os.path.join(root, "mods", name))) for name in applied["mods"]]
     plugin_list, plugins = tree_plugins(root) if with_plugins else (b"", [])
     folders = None
@@ -423,7 +506,7 @@ def pack_tree(root, with_plugins=True, open_pack=False):
                 raise Error(f"mods/{name}: a name players' games won't save (rename it)")
             folders.append((name, mod_folder(os.path.join(root, "mods", name))))
     plain = build_plain(mods, vanilla_sha, [os.path.getsize(s) for s in sources], modded_map, overlay, plugin_list, plugins,
-                        folders)
+                        folders, mods_index(root, [name for name, _ in mods]))
     return plain, mods, [name for name, *_ in plugins]
 
 

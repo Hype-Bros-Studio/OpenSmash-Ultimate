@@ -150,10 +150,16 @@ void mods_start(const char *data_dir) {
         free(t);
     }
     code_patches = mod_switch_code_patches(setting, running);
+    /* Host mods (SSBU_HOST_MODS): the host's mods run, not ours - and the host's game runs them with
+     * the code patches on, which their added files and plugins need (a fighter's new costume loads
+     * nothing without them), whatever this game's own switch says. */
+    int hostmods_on(void);
+    int host = hostmods_on();
+    if (host) code_patches = 1;
     const char *env = getenv("SSBU_CODE_PATCHES");   /* (test runs) */
     if (env && (*env == '0' || *env == '1')) code_patches = *env == '1';
     fprintf(stderr, "[mods] %d mod%s run; %s: %s%s\n", running, running == 1 ? "" : "s", MOD_SWITCH_CODE_TITLE, code_patches ? "on" : "off",
-            setting < 0 && !(env && (*env == '0' || *env == '1')) ? " (on while a mod runs)" : "");
+            env && (*env == '0' || *env == '1') ? "" : host ? " (the host's mods)" : setting < 0 ? " (on while a mod runs)" : "");
 }
 
 int rt_code_patches_on(void) {

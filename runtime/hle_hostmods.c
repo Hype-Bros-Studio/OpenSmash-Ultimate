@@ -67,6 +67,8 @@ static struct {
     u32 other_os_plugins;      /* the host's plugins for other systems only */
     int open;                  /* an open pack (not sealed) */
     const u8 *folders; u32 nfolders;   /* (version 3) the mods' folders, as in the pack */
+    struct HmModsFile { const char *path; u32 path_len; u64 size; const u8 *data; u32 data_len; } *mods_files;
+    u32 nmods_files; int mods_index;   /* (the pack's last section, when there) mods:/ as the host's game sees it */
 } hm;
 
 /* The system a pack's plugin was built for (tools/hostmods.py PLUGIN_OS) */
@@ -595,6 +597,29 @@ static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
             }
         }
     }
+    if ((u64)(end - p) >= 12 && !memcmp(p, "SSBUHMI1", 8)) {
+        /* "SSBUHMI1", u32 count, then each file of the mods' one tree: u16 path length, u64 size, u32 length of
+         * the bytes carried (the whole file, or none for a big one), the UTF-8 path ('/' between folders), the bytes */
+        u32 n = rd32(p + 8);
+        p += 12;
+        if (n > (1u << 20)) rt_fatal("host mods: %u files in the host's mods:/", n);
+        hm.mods_files = calloc(n ? n : 1, sizeof *hm.mods_files);
+        if (!hm.mods_files) rt_fatal("host mods: no memory");
+        for (u32 i = 0; i < n; i++) {
+            NEED(14);
+            struct HmModsFile f = {0};
+            f.path_len = (u32)p[0] | (u32)p[1] << 8;
+            f.size = rd64(p + 2);
+            f.data_len = rd32(p + 10);
+            NEED(14 + (u64)f.path_len + f.data_len);
+            if (f.data_len && f.data_len != f.size) rt_fatal("host mods: a mods:/ file cut short in the host's pack");
+            f.path = (const char *)p + 14;
+            f.data = p + 14 + f.path_len;
+            p += 14 + (u64)f.path_len + f.data_len;
+            hm.mods_files[hm.nmods_files++] = f;
+        }
+        hm.mods_index = 1;
+    }
 #undef NEED
     fprintf(stderr, "[hostmods] the host's %u mod(s) and %u plugin(s), %.1f MB, %s (pack %s)\n", hm.nmods,
             hm.nplugins, (double)plain / 1048576.0, hm.open ? "an open pack (not sealed), played from memory" : "in memory only", id);
@@ -633,6 +658,62 @@ void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n,
             rt_fatal("host mods: %s isn't the host's (its size): the host's mods can't be read over it", sources[i]);
     *map = hm.map; *map_len = hm.map_len;
     *overlay = hm.overlay; *overlay_len = hm.overlay_len;
+}
+
+/* ---- mods:/ (hle_fs.c): ARCropolis' view of the mods, the host's under host mods ---------------------
+ * Plugins look there for their marker files (mods:/fighter/<name>/model/body/cNN/<x>.marker) to know
+ * which costume slots they run on; this game's own mods aren't the ones running. */
+static int hm_path_eq(const char *a, u32 al, const char *b, size_t bl) {
+    return al == bl && !_strnicmp(a, b, bl);
+}
+/* What `rest` is in the host's mods:/ (leading '/' left out): 0 nothing, 1 a file (*data NULL: its bytes
+ * aren't in the pack - a big one), 2 a folder. */
+int hostmods_mods_entry(const char *rest, const u8 **data, u64 *size) {
+    load();
+    while (*rest == '/') rest++;
+    size_t l = strlen(rest);
+    while (l && rest[l - 1] == '/') l--;
+    if (!l) return 2;
+    for (u32 i = 0; i < hm.nmods_files; i++) {
+        const struct HmModsFile *f = &hm.mods_files[i];
+        if (hm_path_eq(f->path, f->path_len, rest, l)) {
+            *data = f->data_len || !f->size ? f->data : NULL;
+            *size = f->size;
+            return 1;
+        }
+    }
+    for (u32 i = 0; i < hm.nmods_files; i++) {
+        const struct HmModsFile *f = &hm.mods_files[i];
+        if (f->path_len > l && f->path[l] == '/' && !_strnicmp(f->path, rest, l)) return 2;
+    }
+    return 0;
+}
+/* A folder's entries in the host's mods:/: add(ctx, name, length, is a folder, size) for each, once. */
+int hostmods_mods_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx) {
+    load();
+    while (*rest == '/') rest++;
+    size_t l = strlen(rest);
+    while (l && rest[l - 1] == '/') l--;
+    int found = !l;
+    for (u32 i = 0; i < hm.nmods_files; i++) {
+        const struct HmModsFile *f = &hm.mods_files[i];
+        if (l && !(f->path_len > l && f->path[l] == '/' && !_strnicmp(f->path, rest, l))) continue;
+        found = 1;
+        const char *name = f->path + (l ? l + 1 : 0);
+        u32 left = f->path_len - (u32)(name - f->path);
+        const char *slash = memchr(name, '/', left);
+        size_t nl = slash ? (size_t)(slash - name) : left;
+        int seen = 0;   /* (a folder: listed at its first file) */
+        for (u32 k = 0; k < i && !seen; k++) {
+            const struct HmModsFile *g = &hm.mods_files[k];
+            if (l && !(g->path_len > l && g->path[l] == '/' && !_strnicmp(g->path, rest, l))) continue;
+            const char *gn = g->path + (l ? l + 1 : 0);
+            u32 gleft = g->path_len - (u32)(gn - g->path);
+            seen = gleft >= nl && !_strnicmp(gn, name, nl) && (gleft == nl || gn[nl] == '/');
+        }
+        if (!seen) add(ctx, name, nl, slash != NULL, slash ? 0 : f->size);
+    }
+    return found;
 }
 
 /* The pack's mods, for the online mod set (net_relay.c mod_set_make): names and the hashes the host's

@@ -118,6 +118,8 @@ static HANDLE rom_file_open(const char *path) {
  * With host mods (SSBU_HOST_MODS, hle_hostmods.c) the game's own data (romfs_vanilla.cfg, else
  * romfs.cfg) is read through the host's modded layer map, its overlay a source in memory. */
 int hostmods_on(void);
+int hostmods_mods_entry(const char *rest, const u8 **data, u64 *size);
+int hostmods_mods_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx);
 void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n, const u8 **map, u64 *map_len,
                     const u8 **overlay, u64 *overlay_len);
 static void rom_open(void) {
@@ -235,9 +237,12 @@ typedef struct Handle {
     u32 mount;                /* the mount's id */
     HANDLE host;              /* host file */
     u64 offset, size;         /* rom file: data offset in the RomFS image and length */
+    const u8 *mem;            /* a file in memory (the host's mods:/ under host mods): its bytes, `size` long */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
 } Handle;
 static Handle handles[512];
+/* Under host mods mods:/ is the host's mods (hle_hostmods.c), not this game's own. */
+static int host_mods_mount(const struct Mount *m) { return !strcmp(m->name, "mods") && hostmods_on(); }
 static CRITICAL_SECTION lock;      /* the mount and handle tables */
 static CRITICAL_SECTION jlock;     /* save mounts' working state (taken before `lock`, never after) */
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -1205,6 +1210,12 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
         LeaveCriticalSection(&jlock);
         if (r || !type) { c->x[0] = r ? r : R_PATH_NOT_FOUND; return; }
         st32(c->x[0], type == 2 ? DIR_ENTRY : FILE_ENTRY);
+    } else if (host_mods_mount(m)) {
+        const u8 *data;
+        u64 size;
+        int e = hostmods_mods_entry(rest, &data, &size);
+        if (!e) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        st32(c->x[0], e == 2 ? DIR_ENTRY : FILE_ENTRY);
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
@@ -1248,6 +1259,18 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         st64(c->x[0], v);
         c->x[0] = 0;
         return;
+    } else if (host_mods_mount(m)) {
+        const u8 *data;
+        u64 size;
+        if (hostmods_mods_entry(rest, &data, &size) != 1) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        if (mode & OPEN_WRITE) { c->x[0] = R_UNSUPPORTED; return; }
+        if (!data && size) {   /* (a big file: the pack has its name, not its bytes) */
+            fprintf(stderr, "[fs] mods:/%s: the host's pack doesn't carry this file's bytes\n", rest + strspn(rest, "/"));
+            c->x[0] = R_PATH_NOT_FOUND;
+            return;
+        }
+        h.mem = data;
+        h.size = size;
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
@@ -1273,6 +1296,7 @@ static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     if (offset < 0 || (u64)offset > total) return ~0ull;
     if (size > total - (u64)offset) size = total - (u64)offset;
     if (!size) return 0;
+    if (h->mem) { rb_guest_writing(buf, size); memcpy(buf, h->mem + offset, size); return size; }
     int ok = h->host ? pread_all(h->host, (u64)offset, buf, size) : rom_read(h->offset + (u64)offset, buf, size);
     return ok ? size : ~0ull;
 }
@@ -1400,6 +1424,12 @@ static void listing_free(Handle *h) {
     free(h->names); free(h->types); free(h->sizes);
 }
 
+typedef struct { Handle *h; int mode; } ModsListing;
+static void mods_list_add(void *p, const char *name, size_t len, int dir, u64 size) {   /* (hostmods_mods_list) */
+    ModsListing *ctx = p;
+    if (ctx->mode & (dir ? LIST_DIRS : LIST_FILES)) listing_add(ctx->h, name, len, dir ? DIR_ENTRY : FILE_ENTRY, size);
+}
+
 HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path, mode) */
     const char *rest;
     ready();
@@ -1426,6 +1456,9 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
             mod_folder_name(flat, sizeof flat, mods_list[i]);
             listing_add(&h, flat, strlen(flat), DIR_ENTRY, 0);
         }
+    } else if (host_mods_mount(m)) {
+        ModsListing ctx = {&h, mode};
+        if (!hostmods_mods_list(rest, mods_list_add, &ctx)) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
     } else if (!strcmp(m->name, "mods")) {
         /* every turned-on mod's files as one tree: a later mod's entry over an earlier one's */
         load_mods_list();
