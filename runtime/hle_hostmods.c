@@ -9,8 +9,15 @@
  * (tools/skyline.py) for each system the host built them for: this one's are loaded from memory
  * (host.c load_plugin_dlls, hle_memdll.c) and never written to a file.
  *
+ * A pack of version 3 is an open one (tools/hostmods.py serve --open): it comes unsealed (it starts
+ * "SSBUHMP1", not "SSBUHME1") and also has each turned-on mod's folder. The game still plays from the
+ * pack in memory; when the player has ticked F1 > Online > Download host's mods (online_host_mods_download.txt
+ * "on", or SSBU_HOST_MODS_DOWNLOAD=1) the folders are also saved into this tree's mods/, turned off
+ * (tools/mods.py takes a new folder as off until it's enabled). The pack is untrusted: a name or path
+ * that could leave mods/<name> is refused (hm_safe_part).
+ *
  * A deterrent, not protection: the code, the key and the plain mods (plugins too) are in this
- * process's memory while it runs. */
+ * process's memory while it runs. An open pack is no deterrent at all. */
 #define _CRT_SECURE_NO_WARNINGS
 #ifdef _WIN32
 #include <winsock2.h>
@@ -19,6 +26,7 @@ typedef SOCKET HmSock;
 #define HM_NO_SOCK INVALID_SOCKET
 #define hm_close closesocket
 #else
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -37,9 +45,11 @@ typedef int HmSock;
 #include <string.h>
 #include <sys/stat.h>
 
+#include "config_folder.h"
 #include "host.h"
 #include "hostmods_crypto.h"
 #include "net.h"
+#include "settings.h"
 
 static struct {
     u8 *mem; u64 cap;          /* the pack: sealed as it came, then plain in place */
@@ -55,6 +65,8 @@ static struct {
     u32 nplugins;              /* this system's */
     struct HmPlugin { char name[128]; const u8 *lib, *image; u64 lib_len, image_len; } *plugins;
     u32 other_os_plugins;      /* the host's plugins for other systems only */
+    int open;                  /* an open pack (not sealed) */
+    const u8 *folders; u32 nfolders;   /* (version 3) the mods' folders, as in the pack */
 } hm;
 
 /* The system a pack's plugin was built for (tools/hostmods.py PLUGIN_OS) */
@@ -187,6 +199,282 @@ static u8 *fetch_pack(const char *id, u64 *len, void *(*alloc)(u64), char *why, 
 static u32 rd32(const u8 *p) { return hm_le32(p); }
 static u64 rd64(const u8 *p) { return (u64)hm_le32(p) | (u64)hm_le32(p + 4) << 32; }
 
+static i64 path_size(const char *path) {
+#ifdef _WIN32
+    struct _stat64 st;
+    return _stat64(path, &st) ? -1 : (i64)st.st_size;
+#else
+    struct stat st;
+    return stat(path, &st) ? -1 : (i64)st.st_size;
+#endif
+}
+
+/* ---- an open pack's mod folders, saved into mods/ (the player's choice) ------------------- */
+/* Whether the player wants an open pack's mods kept: SSBU_HOST_MODS_DOWNLOAD (1/on, 0/off), else the
+ * settings menu's Online > Download host's mods (online_host_mods_download.txt, read here: the pack is
+ * fetched at the RomFS's opening, before the menu is). Off unless asked. */
+static int hm_download_wanted(void) {
+    const char *v = getenv("SSBU_HOST_MODS_DOWNLOAD");
+    if (v && *v) return !(v[0] == '0' || !_strnicmp(v, "off", 3) || !_strnicmp(v, "no", 2));
+    const char *path = config_path(CONFIG_ONLINE_HOST_MODS_DOWNLOAD);
+    char line[16] = "";
+    return path && settings_line_read(path, line, sizeof line) && !_strnicmp(line, "on", 2);
+}
+
+/* One folder or file name that stays where it is put (tools/hostmods.py _safe_part): not empty, '.' or
+ * '..'; no '/', '\\', ':' (drive letters, streams) or control character; not ending in '.' or ' ' (Windows
+ * drops them); not a Windows device name (CON, NUL, COM1, ...). */
+static int hm_safe_part(const char *s, size_t n) {
+    if (!n || n > 255 || (n == 1 && s[0] == '.') || (n == 2 && s[0] == '.' && s[1] == '.')) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] == '/' || s[i] == '\\' || s[i] == ':' || (u8)s[i] < 32 || s[i] == 127) return 0;
+    if (s[n - 1] == '.' || s[n - 1] == ' ') return 0;
+    char stem[8];
+    size_t k = 0;
+    while (k < n && s[k] != '.') k++;
+    while (k && s[k - 1] == ' ') k--;
+    if (k >= sizeof stem) return 1;
+    for (size_t i = 0; i < k; i++) stem[i] = (char)(s[i] >= 'a' && s[i] <= 'z' ? s[i] - 32 : s[i]);
+    stem[k] = 0;
+    static const char *const RESERVED[] = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"};
+    for (size_t i = 0; i < sizeof RESERVED / sizeof *RESERVED; i++)
+        if (!strcmp(stem, RESERVED[i])) return 0;
+    if (k == 4 && (!memcmp(stem, "COM", 3) || !memcmp(stem, "LPT", 3)) && stem[3] >= '0' && stem[3] <= '9') return 0;
+    return 1;
+}
+
+/* A file's path in a mod's folder: relative, '/' between safe parts (so no '..', no absolute path). */
+static int hm_safe_path(const char *s, size_t n) {
+    if (!n || n > 1024) return 0;
+    for (size_t a = 0; a <= n;) {
+        size_t b = a;
+        while (b < n && s[b] != '/') b++;
+        if (!hm_safe_part(s + a, b - a)) return 0;
+        a = b + 1;
+    }
+    return 1;
+}
+
+/* A folder of the pack (its place parsed and bounds-checked by hm_load). */
+typedef struct { const char *name; u32 name_len, nfiles; const u8 *files, *next; } HmFolder;
+static const u8 *hm_folder_at(const u8 *p, HmFolder *f) {
+    f->name_len = (u32)p[0] | (u32)p[1] << 8;
+    f->name = (const char *)p + 2;
+    f->nfiles = rd32(p + 2 + f->name_len);
+    p += 6 + f->name_len;
+    f->files = p;
+    for (u32 i = 0; i < f->nfiles; i++) {
+        u32 l = (u32)p[0] | (u32)p[1] << 8;
+        p += 10 + l + rd64(p + 2 + l);
+    }
+    return f->next = p;
+}
+/* Its files one by one: the path (not NUL-terminated), its bytes; the next file's place. */
+static const u8 *hm_file_at(const u8 *p, const char **path, u32 *path_len, const u8 **data, u64 *len) {
+    *path_len = (u32)p[0] | (u32)p[1] << 8;
+    *path = (const char *)p + 2;
+    *len = rd64(p + 2 + *path_len);
+    *data = p + 10 + *path_len;
+    return *data + *len;
+}
+
+static int hm_is_there(const char *path) {
+#ifdef _WIN32
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return lstat(path, &st) == 0;
+#endif
+}
+
+static int hm_make_dir(const char *path) {
+#ifdef _WIN32
+    return CreateDirectoryA(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+#else
+    return mkdir(path, 0777) == 0 || errno == EEXIST;
+#endif
+}
+
+/* Calls fn(path, is a folder, ctx) for each entry of a folder (not '.', '..'), links not followed. */
+static void hm_each_entry(const char *dir, void (*fn)(const char *, int, void *), void *ctx) {
+    char child[1400];
+#ifdef _WIN32
+    char pattern[1400];
+    WIN32_FIND_DATAA fd;
+    snprintf(pattern, sizeof pattern, "%s\\*", dir);
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        if ((size_t)snprintf(child, sizeof child, "%s/%s", dir, fd.cFileName) >= sizeof child) continue;
+        fn(child, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT), ctx);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if ((size_t)snprintf(child, sizeof child, "%s/%s", dir, e->d_name) >= sizeof child) continue;
+        struct stat st;
+        fn(child, lstat(child, &st) == 0 && S_ISDIR(st.st_mode), ctx);
+    }
+    closedir(d);
+#endif
+}
+
+static void hm_remove_entry(const char *path, int is_dir, void *ctx) {
+    (void)ctx;
+    if (is_dir) {
+        hm_each_entry(path, hm_remove_entry, NULL);
+#ifdef _WIN32
+        RemoveDirectoryA(path);
+#else
+        rmdir(path);
+#endif
+    } else {
+#ifdef _WIN32
+        DeleteFileA(path);
+#else
+        unlink(path);
+#endif
+    }
+}
+/* (only the folders this file made: a half-written one) */
+static void hm_remove_tree(const char *path) {
+    if (hm_is_there(path)) hm_remove_entry(path, 1, NULL);
+}
+
+static void hm_count_entry(const char *path, int is_dir, void *ctx) {
+    if (is_dir) hm_each_entry(path, hm_count_entry, ctx);
+    else ++*(u32 *)ctx;
+}
+
+/* Whether the folder at dir holds the pack folder's files, byte for byte, and nothing else. */
+static int hm_same_folder(const char *dir, const HmFolder *f) {
+    u32 files = 0;
+    hm_each_entry(dir, hm_count_entry, &files);
+    if (files != f->nfiles) return 0;
+    const u8 *p = f->files;
+    static u8 buf[1 << 16];
+    for (u32 i = 0; i < f->nfiles; i++) {
+        const char *rel;
+        u32 rl;
+        const u8 *data;
+        u64 len;
+        p = hm_file_at(p, &rel, &rl, &data, &len);
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%.*s", dir, (int)rl, rel);
+        if (path_size(path) != (i64)len) return 0;
+        FILE *fp = fopen(path, "rb");
+        if (!fp) return 0;
+        u64 at = 0;
+        size_t got;
+        while (at < len && (got = fread(buf, 1, sizeof buf, fp)) > 0 && got <= len - at && !memcmp(buf, data + at, got)) at += got;
+        fclose(fp);
+        if (at != len) return 0;
+    }
+    return 1;
+}
+
+/* The pack folder's files into dir (made new). */
+static int hm_write_folder(const char *dir, const HmFolder *f) {
+    if (!hm_make_dir(dir)) return 0;
+    const u8 *p = f->files;
+    for (u32 i = 0; i < f->nfiles; i++) {
+        const char *rel;
+        u32 rl;
+        const u8 *data;
+        u64 len;
+        p = hm_file_at(p, &rel, &rl, &data, &len);
+        char path[1400];
+        int base = snprintf(path, sizeof path, "%s/", dir);
+        if (base < 0 || (size_t)base + rl >= sizeof path) return 0;
+        memcpy(path + base, rel, rl);
+        path[base + rl] = 0;
+        for (char *c = path + base; *c; c++)   /* (its folders first) */
+            if (*c == '/') {
+                *c = 0;
+                int ok = hm_make_dir(path);
+                *c = '/';
+                if (!ok) return 0;
+            }
+        FILE *fp = fopen(path, "wb");
+        if (!fp) return 0;
+        int ok = !len || fwrite(data, 1, (size_t)len, fp) == (size_t)len;
+        if (fclose(fp) != 0) ok = 0;
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* Each of the pack's mod folders into <tree>/mods/<name>: written next to it first, then renamed into place.
+ * One that is there with the same files is left; another folder of that name: "<name> (host)". */
+static void hm_save_folders(void) {
+    char mods[1100];
+    snprintf(mods, sizeof mods, "%s/../../mods", rt_data_dir ? rt_data_dir : ".");
+    if (!hm_make_dir(mods)) { fprintf(stderr, "[hostmods] cannot make %s: the host's mods aren't saved\n", mods); return; }
+#ifdef _WIN32
+    unsigned long pid = GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+    const u8 *p = hm.folders;
+    u32 saved = 0, had = 0;
+    for (u32 i = 0; i < hm.nfolders; i++) {
+        HmFolder f;
+        p = hm_folder_at(p, &f);
+        int safe = hm_safe_part(f.name, f.name_len) && f.name[0] != '.';
+        const u8 *q = f.files;
+        for (u32 k = 0; safe && k < f.nfiles; k++) {
+            const char *rel;
+            u32 rl;
+            const u8 *data;
+            u64 len;
+            q = hm_file_at(q, &rel, &rl, &data, &len);
+            if (!hm_safe_path(rel, rl)) {
+                fprintf(stderr, "[hostmods] not saved: the host's %.*s has a file at \"%.*s\", which would leave its folder\n",
+                        (int)f.name_len, f.name, (int)(rl > 200 ? 200 : rl), rel);
+                safe = -1;
+            }
+        }
+        if (!safe) fprintf(stderr, "[hostmods] not saved: a mod folder named \"%.*s\" (not a folder name of mods/)\n",
+                           (int)(f.name_len > 200 ? 200 : f.name_len), f.name);
+        if (safe != 1) continue;
+        char name[300], dest[1400];
+        int found = 0;
+        for (int k = 0; k < 10 && !found; k++) {
+            if (!k) snprintf(name, sizeof name, "%.*s", (int)f.name_len, f.name);
+            else if (k == 1) snprintf(name, sizeof name, "%.*s (host)", (int)f.name_len, f.name);
+            else snprintf(name, sizeof name, "%.*s (host %d)", (int)f.name_len, f.name, k);
+            if (!hm_safe_part(name, strlen(name))) break;
+            snprintf(dest, sizeof dest, "%s/%s", mods, name);
+            if (!hm_is_there(dest)) found = 1;
+            else if (hm_same_folder(dest, &f)) found = 2;
+        }
+        if (found == 2) { had++; fprintf(stderr, "[hostmods] mods/%s is the host's already\n", name); continue; }
+        if (!found) { fprintf(stderr, "[hostmods] not saved: the host's %.*s (mods/ has other folders of its names)\n", (int)f.name_len, f.name); continue; }
+        char tmp[1400];
+        snprintf(tmp, sizeof tmp, "%s/.hostmods-%lu-%u.tmp", mods, pid, i);   /* (a leading dot: tools/mods.py passes it over) */
+        hm_remove_tree(tmp);
+        int ok = hm_write_folder(tmp, &f);
+#ifdef _WIN32
+        ok = ok && MoveFileExA(tmp, dest, 0);
+#else
+        ok = ok && !hm_is_there(dest) && rename(tmp, dest) == 0;
+#endif
+        if (!ok) {
+            hm_remove_tree(tmp);
+            fprintf(stderr, "[hostmods] cannot save the host's %.*s into mods/%s\n", (int)f.name_len, f.name, name);
+            continue;
+        }
+        saved++;
+        fprintf(stderr, "[hostmods] saved the host's mod into mods/%s (%u file(s); off until you enable it)\n", name, f.nfiles);
+    }
+    fprintf(stderr, "[hostmods] the host's mods: %u saved into mods/, %u there already\n", saved, had);
+}
+
 static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
     (void)o; (void)a; (void)ctx;
     /* the code as tools/hostmods.py normalize takes it: upper case, without '-' and blanks */
@@ -206,7 +494,9 @@ static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
     u64 len = 0;
     hm.mem = fetch_pack(id, &len, pack_alloc, why, sizeof why);
     if (!hm.mem) rt_fatal("host mods (SSBU_HOST_MODS): cannot get the host's mods from the lobby: %s", why);
-    i64 plain = hm_unseal(code, cl, hm.mem, len);
+    /* an open pack (hostmods.py serve --open) is the plain pack itself: nothing to unseal */
+    hm.open = len >= 8 && !memcmp(hm.mem, "SSBUHMP1", 8);
+    i64 plain = hm.open ? (i64)len : hm_unseal(code, cl, hm.mem, len);
     memset(code, 0, sizeof code);
     if (plain < 0) rt_fatal("host mods (SSBU_HOST_MODS): the host's pack doesn't open with that invite code");
 
@@ -214,7 +504,7 @@ static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
 #define NEED(n) do { if ((u64)(end - p) < (u64)(n)) rt_fatal("host mods: the host's pack is cut short"); } while (0)
     NEED(16);
     u32 version = rd32(p + 8);
-    if (memcmp(p, "SSBUHMP1", 8) || (version != 1 && version != 2)) rt_fatal("host mods: the host's pack is of another version (update the game)");
+    if (memcmp(p, "SSBUHMP1", 8) || version < 1 || version > 3) rt_fatal("host mods: the host's pack is of another version (update the game)");
     hm.nmods = rd32(p + 12);
     p += 16;
     if (hm.nmods > 4096) rt_fatal("host mods: %u mods in the host's pack", hm.nmods);
@@ -280,25 +570,47 @@ static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
             else hm.other_os_plugins++;
         }
     }
+    if (version >= 3) {
+        /* u32 folder count, then each turned-on mod's folder: u16 length and name, u32 file count, then each
+         * file's u16 length and path in the folder, u64 length and bytes (checked whole here: hm_folder_at) */
+        NEED(4);
+        hm.nfolders = rd32(p);
+        p += 4;
+        if (hm.nfolders > 4096) rt_fatal("host mods: %u mod folders in the host's pack", hm.nfolders);
+        hm.folders = p;
+        for (u32 i = 0; i < hm.nfolders; i++) {
+            NEED(2);
+            u32 l = (u32)p[0] | (u32)p[1] << 8;
+            NEED(2 + (u64)l + 4);
+            u32 nf = rd32(p + 2 + l);
+            p += 6 + l;
+            for (u32 k = 0; k < nf; k++) {
+                NEED(2);
+                u32 pl = (u32)p[0] | (u32)p[1] << 8;
+                NEED(2 + (u64)pl + 8);
+                u64 dl = rd64(p + 2 + pl);
+                p += 10 + pl;
+                NEED(dl);
+                p += dl;
+            }
+        }
+    }
 #undef NEED
-    fprintf(stderr, "[hostmods] the host's %u mod(s) and %u plugin(s), %.1f MB, in memory only (pack %s)\n", hm.nmods,
-            hm.nplugins, (double)plain / 1048576.0, id);
+    fprintf(stderr, "[hostmods] the host's %u mod(s) and %u plugin(s), %.1f MB, %s (pack %s)\n", hm.nmods,
+            hm.nplugins, (double)plain / 1048576.0, hm.open ? "an open pack (not sealed), played from memory" : "in memory only", id);
+    if (hm_download_wanted() && !hm.open)
+        fprintf(stderr, "[hostmods] the host didn't allow downloads (a sealed pack): its mods aren't saved\n");
+    else if (hm_download_wanted() && hm.nfolders)
+        hm_save_folders();
+    else if (hm.nfolders)
+        fprintf(stderr, "[hostmods] the host lets players keep its mods: tick F1 > Online > Download host's mods "
+                        "(or set SSBU_HOST_MODS_DOWNLOAD=1) and start the game again\n");
     if (!hm.nplugins && hm.other_os_plugins)
         rt_fatal("host mods: the host's mods have plugins built for other systems than this one only "
                  "(the host has to build them for this one too: docs/HOST_MODS.md)");
     return TRUE;
 }
 static void load(void) { InitOnceExecuteOnce(&hm_once, hm_load, NULL, NULL); }
-
-static i64 path_size(const char *path) {
-#ifdef _WIN32
-    struct _stat64 st;
-    return _stat64(path, &st) ? -1 : (i64)st.st_size;
-#else
-    struct stat st;
-    return stat(path, &st) ? -1 : (i64)st.st_size;
-#endif
-}
 
 /* The RomFS from the pack (hle_fs.c rom_open): this game's own layer map and sources (romfs_vanilla.cfg's,
  * or romfs.cfg's for a game without mods) must be the ones the host's mods were applied over. */

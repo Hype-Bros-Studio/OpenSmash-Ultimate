@@ -45,8 +45,10 @@ const char *rt_data_dir = ".";
 const RtModule rt_module_main = {.build_id = build_text};
 static const char *const FILES[CONFIG_FILES] = {"display.ini", "controllers.ini", "launcher.ini", "online_server.txt",
                                                 "online_name.txt", "online_direct.txt", "online_protocol.txt",
-                                                "online_rollback.txt"};
+                                                "online_rollback.txt", "online_host_mods_download.txt"};
 const char *config_path(enum ConfigFile file) { return (unsigned)file < CONFIG_FILES ? FILES[file] : NULL; }   /* (this folder's) */
+int hostmods_on(void) { return 0; }   /* (hle_hostmods.c: no host mods here) */
+int hostmods_mods(char (*names)[256], unsigned *hashes, int max) { (void)names; (void)hashes; (void)max; return 0; }
 #ifdef _WIN32
 u64 rt_now_ns(void) {
     static LARGE_INTEGER freq, t0;

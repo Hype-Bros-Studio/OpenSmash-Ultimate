@@ -351,7 +351,7 @@ class Pages(MenuTest):
         self.assertEqual(m.labels()[3], 'Keyboard keys...')
         m.type('3')
         self.assertEqual(m.labels(), ['Now', 'Play online in', 'Your name', 'Direct connections'] + (['Rollback netcode'] if os.name == 'nt' else [])
-                         + ['Netplay version'])   # (offline: no code)
+                         + ['Netplay version', "Download host's mods"])   # (offline: no code)
         m.type('6')
         self.assertEqual(m.labels(), ['Mods', 'ARCropolis code patches', 'No mod installed'])   # (the harness has no mods)
         m.type('4')
@@ -388,6 +388,35 @@ class Pages(MenuTest):
         self.assertEqual([(r['label'], r['value']) for r in rows], [('Lobby', 'offline'), ('Netplay version', '2')])
         self.assertEqual(sel, 1)   # (the Lobby row is information: the cursor is on the next)
         self.assertIn('choose a lobby in Online > Play online in', rows[0]['help'])
+
+
+class HostModsDownload(MenuTest):
+    """Online > Download host's mods (online_host_mods_download.txt, which runtime/hle_hostmods.c reads at
+    the RomFS's opening): off unless set, saved at once, read again when the menu opens."""
+    def test_setting_saved(self):
+        m = self.menu()
+        m.key('ESC')
+        m.type('3')
+        r = m.row("Download host's mods")
+        self.assertEqual((r['value'], r['note']), ('off', ''))
+        self.assertIn('never saved', r['help'])
+        m.go_to("Download host's mods")
+        m.key('RIGHT')
+        self.assertEqual(m.row("Download host's mods")['value'], 'on')
+        self.assertEqual(m.file('online_host_mods_download.txt'), 'on')
+        self.assertIn('Restart now', m.labels())   # (next start)
+        m.key('ESC')
+        m.key('ESC')   # (opened again: read from the file)
+        self.assertEqual(m.row("Download host's mods")['value'], 'on')
+        m.go_to("Download host's mods")
+        m.key('LEFT')
+        self.assertEqual(m.file('online_host_mods_download.txt'), 'off')
+
+    def test_variable_noted(self):
+        m = self.menu(SSBU_HOST_MODS_DOWNLOAD='1')
+        m.key('ESC')
+        m.type('3')
+        self.assertEqual(m.row("Download host's mods")['note'], 'SSBU_HOST_MODS_DOWNLOAD set')
 
 
 class Version(MenuTest):

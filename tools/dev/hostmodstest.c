@@ -7,7 +7,9 @@
  *   hostmodstest <data folder> <out file>
  *       SSBU_HOST_MODS and SSBU_NET_RELAY as a player sets them: the RomFS image as the game would
  *       read it, whole, to <out file>; the pack's mods (hash, name) on stdout. Exit 3 and why on
- *       stderr when the runtime would stop the game (rt_fatal). */
+ *       stderr when the runtime would stop the game (rt_fatal). An open pack's mods are saved into
+ *       <data folder>/../../mods as the game saves them (SSBU_HOST_MODS_DOWNLOAD, or the settings file
+ *       HOSTMODSTEST_SETTING names: online_host_mods_download.txt's stand-in). */
 #define FS_TEST
 #include <stdarg.h>
 #include "../../runtime/hle_fs.c"
@@ -25,6 +27,21 @@ void rb_guest_writing(void *p, u64 n) { (void)p; (void)n; }
 u64 rt_native(GuestFn *fn, const char *name) { (void)fn; (void)name; return 0; }
 u64 rt_hook_function(u64 target, u64 replace) { (void)target; (void)replace; return 0; }
 void account_save_id(u64 uid[2]) { (void)uid; }
+/* (hle_config.c, hle_settings.c: the download setting's file and its first line) */
+const char *config_path(enum ConfigFile file) {
+    return file == CONFIG_ONLINE_HOST_MODS_DOWNLOAD && getenv("HOSTMODSTEST_SETTING") ? getenv("HOSTMODSTEST_SETTING") : "/nonexistent/setting";
+}
+int settings_line_read(const char *path, char *out, int size) {
+    FILE *f = fopen(path, "r");
+    char line[256];
+    int found = 0;
+    while (f && !found && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0] && line[0] != '#') { snprintf(out, (size_t)size, "%s", line); found = 1; }
+    }
+    if (f) fclose(f);
+    return found;
+}
 const char *rt_data_dir;
 const char *net_relay_address(void) { return getenv("SSBU_NET_RELAY"); }   /* (net_relay.c: the setting itself) */
 void rt_fatal(const char *fmt, ...) {

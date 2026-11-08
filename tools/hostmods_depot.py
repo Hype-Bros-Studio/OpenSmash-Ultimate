@@ -1,13 +1,14 @@
-"""The lobby's side of host-only mods (docs/HOST_MODS.md): it holds a host's sealed mod pack, in
-memory only and only while that host stays connected, and hands it to whoever asks for it by its id.
+"""The lobby's side of host-only mods (docs/HOST_MODS.md): it holds a host's mod pack, in memory
+only and only while that host stays connected, and hands it to whoever asks for it by its id.
 
-The lobby can't open a pack: it is sealed with the room's invite code, which the lobby never sees
-(the id is a hash of the code, tools/hostmods.py pack_id). A TCP connection on the lobby's port that
+The lobby can't open a sealed pack: it is sealed with the room's invite code, which the lobby never
+sees (the id is a hash of the code, tools/hostmods.py pack_id). An open pack (hostmods.py serve
+--open: the plain pack, unsealed, which players may save) it takes as well, under the same limits. A TCP connection on the lobby's port that
 starts with "SSBUPAK1" is this service (tools/ssbu_online_lobby.py stream):
 
     "SSBUPAK1" "PUT " u32 id length (big-endian) id  u64 size
         -> "GO  ", or "TAKN" (an id that is up) or "BIG " (over the limits) and the end
-    the sealed pack
+    the pack (sealed, or open)
         -> "OK  " and the pack is up until the connection closes, or "BAD " (not a pack)
     "SSBUPAK1" "GET " u32 id length id
         -> u64 size and the pack (size 0: no pack by that id)
@@ -18,6 +19,7 @@ import time
 
 MAGIC = b"SSBUPAK1"
 SEALED_MAGIC = b"SSBUHME1"   # a sealed pack's first bytes (tools/hostmods.py seal)
+PLAIN_MAGIC = b"SSBUHMP1"    # an open one's (tools/hostmods.py build_plain, serve --open)
 MAX_ID = 64
 MAX_PACK = 1 << 30           # bytes one pack may be
 MAX_TOTAL = 2 << 30          # bytes all the packs up may be, together
@@ -30,7 +32,7 @@ class PackDepot:
     def __init__(self, log=print, max_pack=MAX_PACK, max_total=MAX_TOTAL, max_packs=MAX_PACKS):
         self.log = log
         self.max_pack, self.max_total, self.max_packs = max_pack, max_total, max_packs
-        self.packs = {}   # id -> the sealed pack (bytes)
+        self.packs = {}   # id -> the pack (bytes): sealed, or open
         self.coming = 0   # bytes of packs on their way up
         self.gets = 0
 
@@ -76,14 +78,15 @@ class PackDepot:
                 body += got
         finally:
             self.coming -= size
-        if body[:8] != SEALED_MAGIC or pid in self.packs:
+        if body[:8] not in (SEALED_MAGIC, PLAIN_MAGIC) or pid in self.packs:
             writer.write(b"TAKN" if pid in self.packs else b"BAD ")
             await writer.drain()
             return
+        body_open = body[:8] == PLAIN_MAGIC
         self.packs[pid] = bytes(body)
         del body
         t0 = time.monotonic()
-        self.log(f"host mods: pack {pid} ({size} B) up from {peer}")
+        self.log(f"host mods: pack {pid} ({size} B{', open' if body_open else ''}) up from {peer}")
         try:
             writer.write(b"OK  ")
             await writer.drain()

@@ -1,14 +1,20 @@
 """Host-only mods: a host's applied mods, sealed and sent through the lobby to the room's other
 players, whose games read them from memory and never write them to disk (docs/HOST_MODS.md).
+With --open the host lets them keep the mods: the pack goes up unsealed, with each turned-on mod's
+folder, which a player who ticked Download host's mods saves into their own mods/.
 
     python tools/hostmods.py code
         a new invite code (give it to the players you play with, not in the room's name)
     python tools/hostmods.py serve --lobby HOST[:PORT] --code CODE [--tree .]
         seal this tree's applied mods (tools/mods.py apply) and keep them up on the lobby for as
         long as this runs; players start their game with SSBU_HOST_MODS=CODE
+    python tools/hostmods.py serve --open ...
+        the same, unsealed, with the mods' folders: players who tick F1 > Online > Download host's
+        mods (or set SSBU_HOST_MODS_DOWNLOAD=1) get them saved into their mods/, turned off
 
 This is a deterrent, not protection: a player's game holds the key and the plain mods in its
-memory while it runs, and anyone who can read that memory can take them. The pack has the data mods (what
+memory while it runs, and anyone who can read that memory can take them. An open pack (--open) is no
+deterrent at all: anyone with the code, and the lobby, can read it. The pack has the data mods (what
 tools/mods.py apply puts in the layer map) and the turned-on mods' Skyline plugins as this host's game
 translated them (tools/skyline.py: build/plugins/<module>.dll, Windows), which players load from memory.
 
@@ -20,14 +26,19 @@ The formats (runtime/hle_hostmods.c reads them):
                 with key sha256("HypeSmash host mods v1\\0" + salt + code), nonce 4 zero bytes
                 and the chunk's index (u64), additional data the 40-byte head and a byte that
                 is 1 for the last chunk, 0 before; each chunk's 16-byte tag after it
-  plain pack    "SSBUHMP1", u32 version (2; 1 has no plugins); u32 mod count, then each mod's u32 hash (the runtime's
+  open pack     the plain pack as it is, unsealed (serve --open), under the same pack id
+  plain pack    "SSBUHMP1", u32 version (3 open, 2 sealed; 1 has no plugins); u32 mod count, then each mod's u32 hash (the runtime's
                 mod_tree_hash folded to 32 bits, net_relay.c) and u16 length and UTF-8 name;
                 the sha256 of the game's own layer map (romfs_vanilla.cfg's); u32 source
                 count and each source's u64 size; u32 length and the modded layer map; u64
                 length and the overlay (the layer map's last source); then (version 2) u32 length
                 and the host's plugins.txt; u32 plugin count, then each plugin's u16 length and
                 module name, u8 system (PLUGIN_OS), u64 length and library, u64 length and image
-                (dump/modules/<module>.reloc.bin)
+                (dump/modules/<module>.reloc.bin); then (version 3) u32 folder count, then each
+                turned-on mod's folder: u16 length and UTF-8 name (mods/<name>), u32 file count,
+                then each file's u16 length and UTF-8 path in the folder ('/' between folders),
+                u64 length and its bytes. A name or path that could leave mods/<name> (.., '\\', ':',
+                an absolute path, ...: safe_name, safe_path) makes the pack refused.
 All numbers little-endian but the lobby's (tools/hostmods_depot.py)."""
 import argparse
 import base64
@@ -42,7 +53,8 @@ import sys
 SEALED_MAGIC = b"SSBUHME1"
 PLAIN_MAGIC = b"SSBUHMP1"
 LAYER_MAGIC = b"SSBUROM1"
-VERSION = 2
+VERSION = 3            # (an open pack's; a sealed one stays SEALED_VERSION, without the mods' folders)
+SEALED_VERSION = 2
 PLUGIN_OS = {".dll": 1, ".so": 2, ".dylib": 3}   # (runtime/hle_hostmods.c HM_OS: Windows x64, Linux x64, macOS arm64)
 CHUNK = 1 << 20
 HEAD = 40
@@ -126,9 +138,12 @@ def unseal(code, sealed):
 
 
 # ---- the plain pack ------------------------------------------------------------------------
-def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin_list=b"", plugins=()):
-    """plugins: [(module name, system (PLUGIN_OS), library bytes, image bytes)]."""
-    out = [PLAIN_MAGIC, struct.pack("<II", VERSION, len(mods))]
+def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin_list=b"", plugins=(), folders=None):
+    """plugins: [(module name, system (PLUGIN_OS), library bytes, image bytes)]. folders (an open pack,
+    version 3): [(mod folder name, [(path in the folder, bytes)])]; None for a sealed pack (version 2).
+    (Names aren't checked here: tests build bad packs with it. parse_plain checks them.)"""
+    version = SEALED_VERSION if folders is None else VERSION
+    out = [PLAIN_MAGIC, struct.pack("<II", version, len(mods))]
     for name, h in mods:
         b = name.encode("utf-8")
         out.append(struct.pack("<IH", h & 0xFFFFFFFF, len(b)) + b)
@@ -144,14 +159,54 @@ def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin
         out.append(struct.pack("<H", len(b)) + b + bytes([system]))
         out.append(struct.pack("<Q", len(lib)) + lib)
         out.append(struct.pack("<Q", len(image)) + image)
+    if folders is not None:
+        out.append(struct.pack("<I", len(folders)))
+        for name, files in folders:
+            b = name.encode("utf-8")
+            out.append(struct.pack("<H", len(b)) + b + struct.pack("<I", len(files)))
+            for path, data in files:
+                pb = path.encode("utf-8")
+                out.append(struct.pack("<H", len(pb)) + pb + struct.pack("<Q", len(data)))
+                out.append(data)
     return b"".join(out)
 
 
+# ---- an open pack's folders: names and paths that stay in mods/<name> (runtime: hle_hostmods.c safe_part) ----
+RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {f"{d}{i}" for d in ("COM", "LPT") for i in range(10)}
+
+
+def _safe_part(part):
+    """One folder or file name: not '.' or '..', no '/', '\\', ':' or control character, not ending in a
+    dot or a space, and not a Windows device name (CON, NUL, COM1, ...)."""
+    if not part or part in (".", "..") or len(part.encode("utf-8")) > 255:
+        return False
+    if any(c in "/\\:" or ord(c) < 32 or ord(c) == 127 for c in part) or part[-1] in ". ":
+        return False
+    return part.split(".")[0].upper().rstrip(" ") not in RESERVED
+
+
+def safe_name(name):
+    """A mod folder's name: one safe part, not hidden (a leading dot: mods/.packs and the like are tools/mods.py's)."""
+    return _safe_part(name) and not name.startswith(".")
+
+
+def safe_path(path):
+    """A file's path in a mod's folder: '/' between safe parts, relative (so no drive letter, no leading '/')."""
+    return 0 < len(path.encode("utf-8")) <= 1024 and all(_safe_part(p) for p in path.split("/"))
+
+
 def parse_plain(p):
+    try:
+        return _parse_plain(p)
+    except (struct.error, UnicodeDecodeError):
+        raise Error("a mod pack cut short or broken") from None
+
+
+def _parse_plain(p):
     if p[:8] != PLAIN_MAGIC:
         raise Error("not a mod pack")
     version, n = struct.unpack_from("<II", p, 8)
-    if version not in (1, VERSION):
+    if version not in (1, 2, VERSION):
         raise Error(f"a mod pack of version {version}")
     at, mods = 16, []
     for _ in range(n):
@@ -188,10 +243,35 @@ def parse_plain(p):
             image = p[at + 8:at + 8 + il]
             at += 8 + il
             plugins.append((name, system, lib, image))
+    folders = None
+    if version >= 3:
+        folders = []
+        count = struct.unpack_from("<I", p, at)[0]
+        at += 4
+        for _ in range(count):
+            nl = struct.unpack_from("<H", p, at)[0]
+            name = p[at + 2:at + 2 + nl].decode("utf-8")
+            nf = struct.unpack_from("<I", p, at + 2 + nl)[0]
+            at += 6 + nl
+            if not safe_name(name):
+                raise Error(f"a mod folder named {name!r} in the pack")
+            files = []
+            for _ in range(nf):
+                pl = struct.unpack_from("<H", p, at)[0]
+                path = p[at + 2:at + 2 + pl].decode("utf-8")
+                dl = struct.unpack_from("<Q", p, at + 2 + pl)[0]
+                at += 10 + pl
+                if not safe_path(path):
+                    raise Error(f"a file at {path!r} in the pack's {name}")
+                if at + dl > len(p):
+                    raise Error("a mod pack of the wrong size")
+                files.append((path, p[at:at + dl]))
+                at += dl
+            folders.append((name, files))
     if at != len(p):
         raise Error("a mod pack of the wrong size")
     return {"mods": mods, "vanilla_map_sha256": sha, "source_sizes": sizes, "map": modded_map, "overlay": overlay,
-            "plugin_list": plugin_list, "plugins": plugins}
+            "plugin_list": plugin_list, "plugins": plugins, "folders": folders}
 
 
 def check_map(modded_map, nsources):
@@ -289,7 +369,25 @@ def _cfg_lines(path):
         return [l.strip() for l in f.read().splitlines() if l.strip()]
 
 
-def pack_tree(root, with_plugins=True):
+def mod_folder(folder):
+    """Every file of a mod's folder, with its path in it ('/' between folders), sorted. Links are left out."""
+    files = []
+    for top, dirs, names in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(top, d)))
+        for n in sorted(names):
+            full = os.path.join(top, n)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            rel = os.path.relpath(full, folder).replace(os.sep, "/")
+            if not safe_path(rel):
+                raise Error(f"{full}: a name players' games won't save (rename it)")
+            with open(full, "rb") as f:
+                files.append((rel, f.read()))
+    return files
+
+
+def pack_tree(root, with_plugins=True, open_pack=False):
+    """The plain pack of this tree's applied mods; open_pack: version 3, with the mods' folders."""
     root = os.path.abspath(root)
     modules = os.path.join(root, "dump", "modules")
     cfg = _cfg_lines(os.path.join(modules, "romfs.cfg"))
@@ -317,7 +415,15 @@ def pack_tree(root, with_plugins=True):
         overlay = f.read()
     mods = [(name, mod_hash32(os.path.join(root, "mods", name))) for name in applied["mods"]]
     plugin_list, plugins = tree_plugins(root) if with_plugins else (b"", [])
-    plain = build_plain(mods, vanilla_sha, [os.path.getsize(s) for s in sources], modded_map, overlay, plugin_list, plugins)
+    folders = None
+    if open_pack:
+        folders = []
+        for name, _ in mods:
+            if not safe_name(name):
+                raise Error(f"mods/{name}: a name players' games won't save (rename it)")
+            folders.append((name, mod_folder(os.path.join(root, "mods", name))))
+    plain = build_plain(mods, vanilla_sha, [os.path.getsize(s) for s in sources], modded_map, overlay, plugin_list, plugins,
+                        folders)
     return plain, mods, [name for name, *_ in plugins]
 
 
@@ -369,23 +475,27 @@ def main(argv=None):
     sv.add_argument("--code", help="the invite code (default: a new one, printed)")
     sv.add_argument("--tree", default=".", help="the port's folder (default: here)")
     sv.add_argument("--no-plugins", action="store_true", help="the data mods only (players use their own plugins)")
+    sv.add_argument("--open", action="store_true", help="send the pack unsealed, with the mods' folders, so players can "
+                    "save them (F1 > Online > Download host's mods): no deterrent at all")
     o = ap.parse_args(argv)
     try:
         if o.cmd == "code":
             print(new_code())
             return 0
         code = o.code or new_code()
-        plain, mods, plugins = pack_tree(o.tree, not o.no_plugins)
-        sealed = seal(code, plain)
+        plain, mods, plugins = pack_tree(o.tree, not o.no_plugins, o.open)
+        pack = plain if o.open else seal(code, plain)
         del plain
         pid = pack_id(code)
-        s = put(o.lobby, pid, sealed)
-        print(f"up: {len(mods)} mod(s), {len(sealed) / 1048576:.1f} MB sealed, pack {pid}")
+        s = put(o.lobby, pid, pack)
+        print(f"up: {len(mods)} mod(s), {len(pack) / 1048576:.1f} MB {'open (not sealed)' if o.open else 'sealed'}, pack {pid}")
         for name, h in mods:
             print(f"  {name}  {h:08x}")
         if plugins:
             print(f"plugins (Windows players): {', '.join(plugins)}")
         print(f"invite code: {code}\nplayers: set SSBU_HOST_MODS={code} and SSBU_NET_RELAY={o.lobby}, then start the game")
+        if o.open:
+            print("open: players who tick F1 > Online > Download host's mods (or set SSBU_HOST_MODS_DOWNLOAD=1) keep the mods")
         print("(the pack is up while this runs: Ctrl+C takes it down)")
         try:
             while s.recv(4096):

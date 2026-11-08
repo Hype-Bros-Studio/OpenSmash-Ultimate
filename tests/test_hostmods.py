@@ -1,4 +1,4 @@
-"""Host-only mods (docs/HOST_MODS.md): the sealed pack (tools/hostmods.py), the lobby's pack service
+"""Host-only mods (docs/HOST_MODS.md): the sealed and open packs (tools/hostmods.py), the lobby's pack service
 (tools/hostmods_depot.py) through the online lobby's TCP port (tools/ssbu_online_lobby.py), and the
 runtime's C crypto (runtime/hostmods_crypto.h) against Python's when a C compiler is there."""
 import asyncio
@@ -92,13 +92,54 @@ class Pack(unittest.TestCase):
         with self.assertRaises(hm.Error):
             hm.parse_plain(p + b"!")
 
-    def test_version_1_still_reads(self):
+    def test_version_1_and_2_still_read(self):
         m = layer_map([(0, 0, 0)], 0x10)
+        v2 = hm.build_plain([("A", 1)], b"\0" * 32, [1], m, b"ov", b"list\n", [("p", 1, b"lib", b"img")])
+        self.assertEqual(struct.unpack_from("<I", v2, 8)[0], 2)   # (a sealed pack's: no mods' folders)
+        got = hm.parse_plain(v2)
+        self.assertEqual((got["plugins"], got["folders"]), ([("p", 1, b"lib", b"img")], None))
         v2 = hm.build_plain([("A", 1)], b"\0" * 32, [1], m, b"ov")
         v1 = v2[:8] + struct.pack("<I", 1) + v2[12:-8]   # (no plugin list or plugins)
         got = hm.parse_plain(v1)
         self.assertEqual(got["plugins"], [])
         self.assertEqual(got["overlay"], b"ov")
+        self.assertIsNone(got["folders"])
+
+    def test_open_pack_round_trip(self):
+        m = layer_map([(0, 0, 0)], 0x10)
+        folders = [("Some Mod", [("config.json", b"{}"), ("fighter/mario/model/body/c00/model.numdlb", b"\0" * 100),
+                                 ("plugin.nro", b"NRO0"), (".gitkeep", b""), ("Ünï/ok.bin", b"x")]),
+                   ("Empty", [])]
+        p = hm.build_plain([("Some Mod", 1), ("Empty", 2)], b"\0" * 32, [1], m, b"ov", b"list", [("p", 2, b"l", b"i")], folders)
+        self.assertEqual(p[:8], hm.PLAIN_MAGIC)
+        self.assertEqual(struct.unpack_from("<I", p, 8)[0], 3)
+        got = hm.parse_plain(p)
+        self.assertEqual(got["folders"], folders)
+        self.assertEqual(got["plugins"], [("p", 2, b"l", b"i")])
+        self.assertEqual(got["overlay"], b"ov")
+        with self.assertRaises(hm.Error):
+            hm.parse_plain(p + b"!")
+        with self.assertRaises(hm.Error):
+            hm.parse_plain(p[:-1])
+
+    BAD_PATHS = ["..", "../x", "a/../b", "a/..", ".", "./a", "/abs", "/etc/passwd", "C:/x", "C:x", "c:\\x", "a\\b",
+                 "..\\x", "", "a//b", "a/", "con", "NUL.txt", "a/Com1.bin", "lpt9", "x.", "x ", "a\x01b", "a:stream"]
+    BAD_NAMES = ["..", ".", ".packs", "a/b", "a\\b", "C:", "", "AUX", "mod.", "../mods"]
+
+    def test_names_that_leave_the_folder_are_refused(self):
+        for good in ("config.json", "fighter/mario/c00/model.numdlb", ".gitkeep", "a b/c d.txt", "Ünï/ok", "console.bin", "com10"):
+            self.assertTrue(hm.safe_path(good), good)
+        m = layer_map([(0, 0, 0)], 0x10)
+        for bad in self.BAD_PATHS:
+            self.assertFalse(hm.safe_path(bad), bad)
+            p = hm.build_plain([("M", 1)], b"\0" * 32, [1], m, b"ov", folders=[("M", [("ok.bin", b"1"), (bad, b"evil")])])
+            with self.assertRaises(hm.Error, msg=bad):
+                hm.parse_plain(p)
+        for bad in self.BAD_NAMES:
+            self.assertFalse(hm.safe_name(bad), bad)
+            p = hm.build_plain([("M", 1)], b"\0" * 32, [1], m, b"ov", folders=[(bad, [("ok.bin", b"1")])])
+            with self.assertRaises(hm.Error, msg=bad):
+                hm.parse_plain(p)
 
     def test_tree_hash_skips_what_the_runtime_skips(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,6 +208,21 @@ class Pack(unittest.TestCase):
             self.assertEqual(got["plugins"], [("one", 1, b"MZ one", b"image one")])
             self.assertEqual(got["plugin_list"], b"smashline\none  # a moveset\n")
             self.assertEqual(hm.parse_plain(hm.pack_tree(root, with_plugins=False)[0])["plugins"], [])
+            self.assertIsNone(got["folders"])   # (sealed packs: no mods' folders)
+            # an open pack: the turned-on mods' folders, every file
+            mod = os.path.join(root, "mods", "A Mod")
+            os.makedirs(os.path.join(mod, "plugins"))
+            os.makedirs(os.path.join(root, "mods", "Not On"))
+            for rel, data in (("config.json", b'{"a": 1}'), ("plugins/libmoveset.nro", b"NRO0 bytes")):
+                with open(os.path.join(mod, rel), "wb") as f:
+                    f.write(data)
+            with open(os.path.join(root, "mods", "Not On", "x.bin"), "wb") as f:
+                f.write(b"off")
+            plain, _, _ = hm.pack_tree(root, open_pack=True)
+            got = hm.parse_plain(plain)
+            self.assertEqual(got["folders"], [("A Mod", [("config.json", b'{"a": 1}'), ("fighter/f.bin", b"abc"),
+                                                         ("plugins/libmoveset.nro", b"NRO0 bytes")])])
+            self.assertEqual(got["plugins"], [("one", 1, b"MZ one", b"image one")])
             os.remove(os.path.join(modules, "one.reloc.bin"))
             with self.assertRaises(hm.Error):
                 hm.pack_tree(root)
@@ -220,6 +276,27 @@ class Depot(unittest.TestCase):
                     break
                 threading.Event().wait(0.02)
             self.assertIsNone(hm.get(addr, pid))
+        self.run_lobby(body)
+
+    def test_open_pack(self):
+        def body(addr, lobby):
+            pid = hm.pack_id(CODE)
+            m = layer_map([(0, 0, 0)], 0x10)
+            plain = hm.build_plain([("A", 1)], b"\0" * 32, [1], m, b"ov" * 1000, folders=[("A", [("f.bin", os.urandom(5000))])])
+            host = hm.put(addr, pid, plain)
+            try:
+                self.assertEqual(hm.get(addr, pid), plain)
+                self.assertEqual(hm.parse_plain(hm.get(addr, pid))["folders"][0][0], "A")
+            finally:
+                host.close()
+            lobby.depot.max_pack = 1000   # (the same limits as a sealed one)
+            with self.assertRaises(hm.Error):
+                hm.put(addr, "big-open", plain)
+            for _ in range(100):
+                if not lobby.depot.packs:
+                    break
+                threading.Event().wait(0.02)
+            self.assertEqual(lobby.depot.packs, {})
         self.run_lobby(body)
 
     def test_limits_and_not_a_pack(self):
@@ -309,7 +386,7 @@ class RuntimeRomfs(unittest.TestCase):
             f.write("layered\n/nowhere/romfs_mods.layers\n/nowhere/a\n/nowhere/overlay.bin\n")
         return data, bytes(image), vmap, [a, b]
 
-    def pack(self, image, vmap, sources, plugins=()):
+    def pack(self, image, vmap, sources, plugins=(), folders=None):
         """The host's mods over that game: 0x200..0x400 changed, 512 bytes added past the end."""
         overlay = os.urandom(0x400)
         modded = layer_map([(0, 0, 0), (0x200, 2, 0), (0x400, 0, 0x400), (2048, 1, 0), (4096, 2, 0x200)], 4096 + 512)
@@ -318,13 +395,16 @@ class RuntimeRomfs(unittest.TestCase):
             sha = hashlib.sha256(f.read()).digest()
         plain = hm.build_plain([("Stage Pack", 0x0BADF00D), ("Costume, Slot 3", 0x12345678)], sha,
                                [os.path.getsize(s) for s in sources], modded, overlay,
-                               b"smashline\nmoveset_x\n" if plugins else b"", plugins)
+                               b"smashline\nmoveset_x\n" if plugins else b"", plugins, folders)
         want = image[:0x200] + overlay[:0x200] + image[0x400:] + overlay[0x200:]
         return plain, want
 
-    def run_game(self, data, code):
+    def run_game(self, data, code, **more):
         out = os.path.join(os.path.dirname(data), "image.bin")
         env = dict(os.environ, SSBU_HOST_MODS=code, SSBU_NET_RELAY=self.addr)
+        env.pop("SSBU_HOST_MODS_DOWNLOAD", None)
+        env.pop("HOSTMODSTEST_SETTING", None)
+        env.update(more)
         r = subprocess.run([self.exe, data, out], capture_output=True, text=True, env=env, timeout=60)
         got = None
         if r.returncode == 0:
@@ -348,6 +428,110 @@ class RuntimeRomfs(unittest.TestCase):
                 self.assertEqual(sorted(os.listdir(d)), ["dump"])
                 self.assertEqual(sorted(os.listdir(os.path.dirname(data))), ["image.bin", "modules"])
                 self.assertEqual(sorted(os.listdir(data)), ["a.bin", "b.bin", "romfs.cfg", "romfs.layers", "romfs_vanilla.cfg"])
+            finally:
+                host.close()
+
+    FOLDERS = [("Stage Pack", [("config.json", b'{"stage": 1}'), ("stage/battlefield/normal/model/m.numdlb", b"\1" * 3000),
+                               ("plugins/libstage.nro", b"NRO0 plugin")]),
+               ("Costume, Slot 3", [("fighter/mario/c03/model.numdlb", os.urandom(70000)), ("empty.bin", b"")])]
+
+    def tree_files(self, folder):
+        out = {}
+        for top, _, names in os.walk(folder):
+            for n in names:
+                with open(os.path.join(top, n), "rb") as f:
+                    out[os.path.relpath(os.path.join(top, n), folder).replace(os.sep, "/")] = f.read()
+        return out
+
+    def test_open_pack_saved_when_asked(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, image, vmap, sources = self.game(d)
+            plain, want = self.pack(image, vmap, sources, folders=self.FOLDERS)
+            code = hm.new_code()
+            host = hm.put(self.addr, hm.pack_id(code), plain)   # (open: not sealed)
+            try:
+                mods = os.path.join(d, "mods")
+                # not asked: played from memory, nothing saved
+                r, got = self.run_game(data, code)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(got, want)
+                self.assertIn("an open pack", r.stderr)
+                self.assertIn("Download host's mods", r.stderr)
+                self.assertFalse(os.path.exists(mods))
+                # SSBU_HOST_MODS_DOWNLOAD=0 wins over the setting
+                setting = os.path.join(d, "setting.txt")
+                with open(setting, "w") as f:
+                    f.write("# download\non\n")
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_DOWNLOAD="0", HOSTMODSTEST_SETTING=setting)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertFalse(os.path.exists(mods))
+                # the setting (online_host_mods_download.txt's stand-in) "on": saved
+                r, got = self.run_game(data, code, HOSTMODSTEST_SETTING=setting)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(got, want)
+                self.assertEqual(sorted(os.listdir(mods)), ["Costume, Slot 3", "Stage Pack"])
+                for name, files in self.FOLDERS:
+                    self.assertEqual(self.tree_files(os.path.join(mods, name)), dict(files), name)
+                self.assertIn("2 saved into mods/", r.stderr)
+                # again (SSBU_HOST_MODS_DOWNLOAD=1): the same folders are left as they are
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_DOWNLOAD="1")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("0 saved into mods/, 2 there already", r.stderr)
+                self.assertEqual(sorted(os.listdir(mods)), ["Costume, Slot 3", "Stage Pack"])
+                # the player's own Stage Pack (another file): the host's goes to "Stage Pack (host)"
+                with open(os.path.join(mods, "Stage Pack", "config.json"), "wb") as f:
+                    f.write(b'{"stage": 2}')
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_DOWNLOAD="1")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(sorted(os.listdir(mods)), ["Costume, Slot 3", "Stage Pack", "Stage Pack (host)"])
+                self.assertEqual(self.tree_files(os.path.join(mods, "Stage Pack (host)")), dict(self.FOLDERS[0][1]))
+                self.assertEqual(self.tree_files(os.path.join(mods, "Stage Pack"))["config.json"], b'{"stage": 2}')
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_DOWNLOAD="1")   # ("(host)" is the host's: left)
+                self.assertIn("0 saved into mods/, 2 there already", r.stderr)
+                self.assertEqual(sorted(os.listdir(mods)), ["Costume, Slot 3", "Stage Pack", "Stage Pack (host)"])
+            finally:
+                host.close()
+
+    def test_open_pack_paths_that_leave_mods_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, image, vmap, sources = self.game(d)
+            outside = os.path.join(d, "escaped.txt")
+            folders = [("../escaped", [("x.txt", b"evil")]), (".packs", [("x.txt", b"evil")]), ("C:", [("x.txt", b"evil")]),
+                       ("Up", [("ok.txt", b"fine"), ("../../escaped.txt", b"evil")]),
+                       ("Abs", [(outside, b"evil")]), ("Back", [("..\\..\\escaped.txt", b"evil")]),
+                       ("Drive", [("C:escaped.txt", b"evil")]), ("Dev", [("nul", b"evil")]),
+                       ("Good", [("ok.txt", b"fine")])]
+            plain, want = self.pack(image, vmap, sources, folders=folders)
+            code = hm.new_code()
+            host = hm.put(self.addr, hm.pack_id(code), plain)
+            try:
+                r, got = self.run_game(data, code, SSBU_HOST_MODS_DOWNLOAD="1")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(got, want)
+                self.assertEqual(os.listdir(os.path.join(d, "mods")), ["Good"])
+                self.assertEqual(self.tree_files(os.path.join(d, "mods", "Good")), {"ok.txt": b"fine"})
+                self.assertEqual(sorted(os.listdir(d)), ["dump", "mods"])
+                self.assertFalse(os.path.exists(outside))
+                self.assertEqual(r.stderr.count("[hostmods] not saved"), 8, r.stderr)
+                self.assertIn("1 saved into mods/", r.stderr)
+            finally:
+                host.close()
+
+    def test_sealed_pack_never_saved(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, image, vmap, sources = self.game(d)
+            plain, want = self.pack(image, vmap, sources)
+            code = hm.new_code()
+            # a version 1 pack (no plugins) still reads
+            v1 = plain[:8] + struct.pack("<I", 1) + plain[12:-8]
+            host = hm.put(self.addr, hm.pack_id(code), hm.seal(code, v1))
+            try:
+                r, got = self.run_game(data, code, SSBU_HOST_MODS_DOWNLOAD="1")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(got, want)
+                self.assertIn("in memory only", r.stderr)
+                self.assertIn("the host didn't allow downloads", r.stderr)
+                self.assertEqual(sorted(os.listdir(d)), ["dump"])
             finally:
                 host.close()
 
