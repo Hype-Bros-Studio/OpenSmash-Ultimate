@@ -8,7 +8,11 @@ HTTP, on the lobby's TCP port (the lobby hands over any connection that starts w
 "POST"):
 
   GET  /arena/assignment?name=N  {"match": id|null, "opponent": name, "owner": bool, "plus": bool,
-                                  "arena": arena ID}. "plus": N owns the arena and a match is ready.
+                                  "arena": arena ID, "place": 0|1|3, "role": ""|"start"|"join"}.
+                                 "plus": N owns the arena and a match is ready. "place": where N's
+                                 icon goes while a match is on (1 the ring, 3 the Spectator Stands,
+                                 0 not in the bracket or nothing on); "role": the match's two players
+                                 press + in turn, "start" first, then "join" (runtime/hle_trace.c).
   POST /arena/result             {"match", "winner", "loser", "reporter", "stocks"?, "percent"?}
                                  -> {"ok", "state": "pending"|"confirmed"|"disputed"}; 409 when the
                                  match isn't being played.
@@ -254,14 +258,17 @@ class Bracket:
         me = norm(name)
         mid = self.current()
         owner = bool(me) and me == norm(self.state.get("owner"))
-        out = {"match": None, "opponent": "", "owner": owner, "plus": False, "arena": self.state.get("arena", "")}
+        out = {"match": None, "opponent": "", "owner": owner, "plus": False, "arena": self.state.get("arena", ""),
+               "place": 0, "role": ""}
         if mid:
             a, b = self.players_of(mid)
             out["plus"] = owner
+            if me and me in (norm(p) for p in self.state["players"]):
+                out["place"] = 3
             if me == norm(a):
-                out.update(match=mid, opponent=b)
+                out.update(match=mid, opponent=b, place=1, role="start")
             elif me == norm(b):
-                out.update(match=mid, opponent=a)
+                out.update(match=mid, opponent=a, place=1, role="join")
         return out
 
     # --- results -----------------------------------------------------------------------------

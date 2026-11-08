@@ -96,74 +96,88 @@ static GuestFn *const trace_thunks[TRACES] = {R8(0) R8(1) R8(2) R8(3)};
  * whenever any of them changed. */
 static GuestFn *arena_orig;
 
-/* SSBU_ARENA_PLACE_FILE=<path> (research, with SSBU_TRACE_ARENA=1): a request "PLACE [start|join]" for this
- * player, taken once each time the file changes (its mtime). PLACE is 1 or 2 the ring, 3 the Spectator
- * Stands, 4 the Waiting Area: while this player's icon is elsewhere, ask the game to move it there as a
- * drag and drop does (room controller room+0x1950, its virtual +0x30 = main+0x189c160 with &own slot,
- * &place), at most 5 times, and never again after it got there, so the game's own kicks (a cancelled
- * start, the rotation after a battle) are left alone until the next request.
- * "start" then presses + (Smash!) on player 1, as a player would, half a second after this player is
- * in its place: the server sends it to the first player of the pair once both have sat in the ring for
- * a few seconds (a lone press, or one before the other stations see both, gets "Could not begin the
- * battle." and both are sent away). "join" is for the second player: it presses once this station's
- * room logic has stopped for 1 s, which it does while another player's start is pending. After either,
- * A confirms the fighter in fighter select (3 times, 2 s apart, only while the room logic is stopped). Each station sees the others' moves seconds
- * late, so a fixed gap between the two presses doesn't hold up; a second
- * press 6 s or more after the first, or in the same frame, cancels both. The file is read and the
- * press made from the pad read (arena_poll): the room hook stops while another start is pending. */
+/* Arena requests (research, with SSBU_TRACE_ARENA=1): "PLACE [start|join]" for this player, from
+ * SSBU_ARENA_PLACE_FILE=<path> (taken each time the file changes, its mtime) or, with
+ * SSBU_ARENA_BRACKET=1, from the lobby's bracket (tools/bracket.py /arena/assignment: "place" and
+ * "role", taken each time they or the match change; hle_online.c asks every 2 s).
+ * PLACE is 1 or 2 the ring, 3 the Spectator Stands, 4 the Waiting Area: while this player's icon is
+ * elsewhere, ask the game to move it there as a drag and drop does (room controller room+0x1950, its
+ * virtual +0x30 = main+0x189c160 with &own slot, &place), at most 5 times, and never again after it
+ * got there, so the game's own kicks (a cancelled start, the rotation after a battle) are left alone
+ * until the next request.
+ * "start" then presses + (Smash!) on player 1, as a player would, once this station has shown two
+ * players in the ring for 8 s (a lone press, or one before the other stations see both, gets "Could
+ * not begin the battle." and both are sent away). "join" is for the second player: it presses once
+ * this station's room logic has stopped for 1 s, which it does while another player's start is
+ * pending. Each station sees the others' moves seconds late, so a fixed gap between the two presses
+ * doesn't hold up; a second press 6 s or more after the first, or in the same frame, cancels both.
+ * After either, A confirms the fighter in fighter select (3 times, 2 s apart, only while the room
+ * logic is stopped), or its timer sends both back. The requests are read and the presses made from
+ * the pad read (arena_poll), since the room logic stops while another start is pending. */
 void hid_press(int button, double secs);   /* (hle_hid.c) */
 static volatile int a_want, a_start, a_tries;   /* the request: place, "start", placement tries */
 static volatile u8 a_cur;   /* this player's place as the room last showed it */
 static volatile int a_join;   /* "join": waiting for another station's start */
 static volatile double a_room;   /* when the room logic last ran */
+static volatile double a_ring_since;   /* since when the room shows two players in the ring */
 static int a_confirm;   /* A presses left for fighter select after a start or join */
 static double a_confirm_at;
 /* Reads the request file (every 1/4 s) and does the start press. Called with every read of player 1's
  * pad, not from the room: while another player's start is pending this station's room update stops
  * running, and the second press has to land then. */
+static void arena_request(int want, const char *word, const char *from, double now) {
+    if (want < 1 || want > 4) want = 0;
+    a_start = a_join = a_confirm = 0;
+    a_tries = 0;
+    a_want = want;
+    a_start = want && want <= 2 && !strcmp(word, "start");
+    a_join = want && want <= 2 && !strcmp(word, "join");
+    fprintf(stderr, "[arena] place request (%s): %d%s at %.2f s\n", from, want, a_start ? " start" : a_join ? " join" : "", now);
+    fflush(stderr);
+}
+long online_arena_assignment(int *place, char *role, int rcap);   /* (hle_online.c) */
 void arena_poll(void) {
     static const char *path;
     static long long seen = -1;
-    static double next, in_place;
+    static long bracket_seen;
+    static double next;
     if (!path) path = getenv("SSBU_ARENA_PLACE_FILE") ? getenv("SSBU_ARENA_PLACE_FILE") : "";
-    if (!*path) return;
     double now = rt_now_ns() / 1e9;
     if (now < next) return;
     next = now + 0.25;
-    struct stat st;
+    if (*path) {
+        struct stat st;
 #ifdef _WIN32
-    long long m = stat(path, &st) ? -1 : (long long)st.st_mtime * 1000000ll + st.st_size;   /* (seconds only: the size tells "1" and "1 start" apart) */
+        long long m = stat(path, &st) ? -1 : (long long)st.st_mtime * 1000000ll + st.st_size;   /* (seconds only: the size tells "1" and "1 start" apart) */
 #else
-    long long m = stat(path, &st) ? -1 : (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec;
+        long long m = stat(path, &st) ? -1 : (long long)st.st_mtim.tv_sec * 1000000000ll + st.st_mtim.tv_nsec;
 #endif
-    if (m != seen) {
-        seen = m;
-        int want = 0;
-        char word[16] = "";
-        FILE *f = m < 0 ? NULL : fopen(path, "r");
-        if (f) {
-            if (fscanf(f, "%d %15s", &want, word) < 1 || want < 1 || want > 4) want = 0;
-            fclose(f);
+        if (m != seen) {
+            seen = m;
+            int want = 0;
+            char word[16] = "";
+            FILE *f = m < 0 ? NULL : fopen(path, "r");
+            if (f) {
+                if (fscanf(f, "%d %15s", &want, word) < 1) want = 0;
+                fclose(f);
+            }
+            arena_request(want, word, "file", now);
         }
-        a_start = a_join = a_confirm = 0;
-        a_tries = 0;
-        a_want = want;
-        a_start = want && want <= 2 && !strcmp(word, "start");
-        a_join = want && want <= 2 && !strcmp(word, "join");
-        in_place = 0;
-        fprintf(stderr, "[arena] place request: %d%s at %.2f s\n", want, a_start ? " start" : a_join ? " join" : "", now);
-        fflush(stderr);
     }
-    if (a_start && a_want && a_cur == a_want) {
-        if (!in_place) in_place = now;
-        else if (now >= in_place + 0.5) {
-            hid_press(10, 0.15);   /* B_PLUS */
-            a_start = 0;
-            a_confirm = 3;
-            a_confirm_at = now + 2.0;
-            fprintf(stderr, "[arena] start pressed at %.2f s\n", now);
-            fflush(stderr);
-        }
+    int place;
+    char role[8];
+    long seq = online_arena_assignment(&place, role, sizeof role);
+    if (seq != bracket_seen) {
+        bracket_seen = seq;
+        arena_request(place, role, "bracket", now);
+    }
+    if (a_start && a_want && a_cur == a_want && a_ring_since && now >= a_ring_since + 8.0) {   /* both in the ring, as this station sees it, for 8 s */
+        hid_press(10, 0.15);   /* B_PLUS */
+        a_start = 0;
+        a_confirm = 3;
+        a_confirm_at = now + 2.0;
+        fprintf(stderr, "[arena] start pressed at %.2f s\n", now);
+        fflush(stderr);
     }
     if (a_join && a_cur == a_want && a_room && now >= a_room + 1.0) {   /* the room went quiet: another player's start is up */
         hid_press(10, 0.15);   /* B_PLUS */
@@ -189,6 +203,10 @@ static void arena_place(Cpu *c, u64 room) {
     u8 own = *P(u8, room + 0x1920);
     if (own >= 8) return;
     u8 cur = *P(u8, room + 0xaf8 + (u64)own * 0x1e8);
+    int ring = 0;
+    for (int i = 0; i < 8; i++) ring += *P(u8, room + 0xaf8 + (u64)i * 0x1e8) == 1;
+    if (ring < 2) a_ring_since = 0;
+    else if (!a_ring_since) a_ring_since = a_room;
     if (cur != a_cur) { fprintf(stderr, "[arena] own place %u -> %u at %.2f s\n", a_cur, cur, rt_now_ns() / 1e9); fflush(stderr); a_cur = cur; }
     int want = a_want;
     if (!want) return;

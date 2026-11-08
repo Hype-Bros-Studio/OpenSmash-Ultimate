@@ -125,9 +125,13 @@ class Reports(unittest.TestCase):
 
     def test_assignment(self):
         b = self.b
-        self.assertEqual(b.assignment(" ann "), {"match": "W1-1", "opponent": "Di", "owner": True, "plus": True, "arena": "12345"})
+        self.assertEqual(b.assignment(" ann "), {"match": "W1-1", "opponent": "Di", "owner": True, "plus": True, "arena": "12345",
+                                                 "place": 1, "role": "start"})
         self.assertEqual(b.assignment("DI")["opponent"], "Ann")
-        self.assertEqual(b.assignment("Bo"), {"match": None, "opponent": "", "owner": False, "plus": False, "arena": "12345"})
+        self.assertEqual((b.assignment("DI")["place"], b.assignment("DI")["role"]), (1, "join"))
+        self.assertEqual((b.assignment("Zed")["place"], b.assignment("Zed")["role"]), (0, ""))
+        self.assertEqual(b.assignment("Bo"), {"match": None, "opponent": "", "owner": False, "plus": False, "arena": "12345",
+                                              "place": 3, "role": ""})
         self.assertFalse(b.assignment("")["owner"])
 
     def test_owner_not_playing_still_presses_plus(self):
@@ -253,7 +257,8 @@ class Http(unittest.TestCase):
     def test_player_flow(self):
         st, _, body = self.get("/arena/assignment?name=Bo")
         self.assertEqual(st, 200)
-        self.assertEqual(json.loads(body), {"match": "W1-2", "opponent": "Cy", "owner": False, "plus": False, "arena": "4242"})
+        self.assertEqual(json.loads(body), {"match": "W1-2", "opponent": "Cy", "owner": False, "plus": False, "arena": "4242",
+                                            "place": 1, "role": "start"})
         st, _, body = self.post("/arena/result", {"match": "W1-2", "winner": "Cy", "loser": "Bo", "reporter": "Bo"})
         self.assertEqual((st, json.loads(body)), (200, {"ok": True, "state": "pending"}))
         st, _, body = self.post("/arena/result", {"match": "W1-2", "winner": "Cy", "loser": "Bo", "reporter": "Cy"})

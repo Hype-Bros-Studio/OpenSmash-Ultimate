@@ -34,6 +34,7 @@ typedef int SOCKET;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "host.h"
 #include "net.h"
@@ -519,3 +520,113 @@ void online_rb_load(const OnlineRb *o) {
     if (any) changed();
 }
 void online_rb_counts(long long *back, long long *left_out, long long *differ) { *back = rb_back_bytes; *left_out = rb_resent_left_out; *differ = rb_resend_differ; }
+
+/* ---- the arena bracket (tools/bracket.py) ---------------------------------------------------
+ * With SSBU_ARENA_BRACKET=1, a thread asks the lobby (its HTTP shares the lobby's port) where this
+ * player goes in the Battle Arena every 2 s: GET /arena/assignment?name=<this player>, of which it
+ * keeps "match", "place" and "role". online_arena_assignment hands the latest out, with a number
+ * that changes when the answer does (runtime/hle_trace.c turns it into a place request). */
+static SRWLOCK ab_lock = SRWLOCK_INIT;
+static long ab_seq;
+static int ab_place;
+static char ab_role[8], ab_match[24];
+
+static int http_get(const char *path, char *out, int cap) {
+    struct sockaddr_in at;
+    if (!lobby_address(&at)) return -1;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return -1;
+    if (!connect_within(s, &at)) { closesocket(s); return -1; }
+#ifdef _WIN32
+    DWORD tmo = 3000;
+#else
+    struct timeval tmo = {3, 0};
+#endif
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
+    char req[512];
+    int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: lobby\r\nConnection: close\r\n\r\n", path);
+    int len = -1;
+    if (n > 0 && n < (int)sizeof req && send(s, req, n, 0) == n) {
+        len = 0;
+        int r;
+        while (len < cap - 1 && (r = recv(s, out + len, cap - 1 - len, 0)) > 0) len += r;
+        out[len] = 0;
+    }
+    closesocket(s);
+    if (len <= 0 || strncmp(out, "HTTP/1.1 200", 12)) return -1;
+    char *body = strstr(out, "\r\n\r\n");
+    if (!body) return -1;
+    body += 4;
+    len -= (int)(body - out);
+    memmove(out, body, (size_t)len + 1);
+    return len;
+}
+
+/* A JSON string or number member's text (flat objects only: bracket.py's answer). */
+static int json_member(const char *js, const char *key, char *out, int cap) {
+    char pat[40];
+    snprintf(pat, sizeof pat, "\"%s\":", key);
+    const char *p = strstr(js, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    while (*p == ' ') p++;
+    int n = 0;
+    if (*p == '"') {
+        for (p++; *p && *p != '"' && n < cap - 1; p++) out[n++] = *p;
+    } else {
+        for (; *p && *p != ',' && *p != '}' && *p != ' ' && n < cap - 1; p++) out[n++] = *p;
+    }
+    out[n] = 0;
+    return 1;
+}
+
+static DWORD WINAPI arena_bracket_thread(void *arg) {
+    (void)arg;
+    static char buf[4096];
+    for (;;) {
+        const char *name = net_player_name();
+        char path[200], enc[120];
+        int e = 0;
+        for (const unsigned char *c = (const unsigned char *)(name ? name : ""); *c && e < (int)sizeof enc - 4; c++)
+            e += isalnum(*c) || *c == '-' || *c == '_' || *c == '.' ? snprintf(enc + e, sizeof enc - e, "%c", *c)
+                                                                     : snprintf(enc + e, sizeof enc - e, "%%%02X", *c);
+        enc[e] = 0;
+        snprintf(path, sizeof path, "/arena/assignment?name=%s", enc);
+        char place[8] = "", role[8] = "", match[24] = "";
+        if (http_get(path, buf, sizeof buf) > 0 && json_member(buf, "place", place, sizeof place)) {
+            json_member(buf, "role", role, sizeof role);
+            json_member(buf, "match", match, sizeof match);
+            AcquireSRWLockExclusive(&ab_lock);
+            if (atoi(place) != ab_place || strcmp(role, ab_role) || strcmp(match, ab_match)) {
+                ab_place = atoi(place);
+                snprintf(ab_role, sizeof ab_role, "%s", role);
+                snprintf(ab_match, sizeof ab_match, "%s", match);
+                ab_seq++;
+            }
+            ReleaseSRWLockExclusive(&ab_lock);
+        }
+        Sleep(2000);
+    }
+    return 0;
+}
+
+long online_arena_assignment(int *place, char *role, int rcap) {
+    static int started;
+    if (!started) {
+        started = 1;
+        const char *v = getenv("SSBU_ARENA_BRACKET");
+        if (!v || strcmp(v, "1")) started = 2;
+        else {
+            HANDLE t = CreateThread(NULL, 0, arena_bracket_thread, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            else started = 2;
+        }
+    }
+    if (started == 2) return 0;
+    AcquireSRWLockExclusive(&ab_lock);
+    long seq = ab_seq;
+    *place = ab_place;
+    snprintf(role, (size_t)rcap, "%s", ab_role);
+    ReleaseSRWLockExclusive(&ab_lock);
+    return seq;
+}
