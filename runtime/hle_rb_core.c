@@ -2861,6 +2861,7 @@ static void panel_dump(const char *when, int idx, u64 st) {
  * and the match is left to the game's own netcode on both. Online matches of more than 2 players are left to it too. */
 int net_recent_peers(u32 *out, int max, u32 within_ms);   /* (net.h) */
 #define ONLINE_MELEE 14
+#define TOURNEY_MELEE 24   /* (an Online Tourney game: set up by both games from the NEX game server's match as a Quickplay one is) */
 #define ONLINE_WAIT_MS 15000.0
 static int online_match;   /* (the match set up now is an Online one played with rollback) */
 /* (what the game set up, put back as the fight ends: its own results and what follows them - the GSP, the next
@@ -2932,8 +2933,8 @@ static int online_setup(u64 st) {
     u8 mode = ld8(MELEE_INFO);
     u32 ips[RBN_PLAYERS] = {0}, seen[8];
     int peers;
-    const char *what = "an Online match";
-    if (mode != ONLINE_MELEE) {
+    const char *what = mode == TOURNEY_MELEE ? "an Online Tourney game" : "an Online match";
+    if (mode != ONLINE_MELEE && mode != TOURNEY_MELEE) {
         /* (a Local Wireless room's match: set up by both games from the room's own, as an Online one is; the same
          * rollback, the room's other game the peer) */
         peers = lw_room_others(seen, 8);

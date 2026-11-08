@@ -23,7 +23,7 @@ The Tournament protocol (201) that runs entry and rounds is answered here as it 
 import os
 import time
 
-from .streams import StreamOut, datetime_of
+from .streams import StreamIn, StreamOut, datetime_of
 
 EVENT_CONVENTION = 4
 
@@ -36,6 +36,10 @@ class Tourney:
         self.description = "Best of 3, 1-on-1"
         self.event_type = int(os.environ.get("HS_EVENT_TYPE", "1"), 0)
         self.rules = {"stock": 3, "time_sec": 420}
+        # HS_TOURNEY_RULES="stock=1,time_sec=60": the host's own rules (any key the converter reads)
+        for kv in filter(None, os.environ.get("HS_TOURNEY_RULES", "").split(",")):
+            k, _, v = kv.partition("=")
+            self.rules[k.strip()] = int(v, 0)
 
     def game_event(self, out):
         now = time.time()
@@ -87,8 +91,18 @@ class Tourney:
     # Tournament protocol (201). The client (TournamentProtocolClient, stubs main+0x2af540..0x2b0100 for
     # methods 9..14, result readers in the table filled at main+0x52b65f0) reads one u32 back from 9, 10,
     # 11, 13 and 14 and a list from 12 (main+0x2b1dc0 -> 0x2b03a0). Game-side callers: main+0x17375d0..
+    # The round starts on a server push: Notification (14) method 1 with a type 201000..201999
+    # (main+0x171f9d0 takes it): param1 must be the u32 the entry (method 9) returned, param2 goes
+    # to the entry task's status byte (0xff until then), and the tourney manager's idle state
+    # (main+0x16c3c00) then pushes the round state (main+0x16c5200).
+    N_TOURNEY = 201000
+
     def register(self, nex):
-        self.next_entry = 1
+        self.group = 1
+        self.entrants = []          # pids, in entry order
+        self.size = int(os.environ.get("HS_TOURNEY_SIZE", "2"))
+        self.start_at = None
+        self.round = 0
         for m in (9, 10, 11, 13, 14):
             nex.register(201, m, self.method_u32(m))
         nex.register(201, 12, self.method_list(12))
@@ -99,8 +113,24 @@ class Tourney:
             self.nex.info(f"Tournament.{m} from {self.nex.name(conn)}: {self.nex.shown(conn, body, 512, 201)}")
             v = 0
             if m == 9:
-                v = self.next_entry
-                self.next_entry += 1
+                v = self.group
+                if not self.entrants or getattr(self, "done", False):
+                    # a new tourney: forget the last one's entrants, rounds and results
+                    self.entrants, self.started, self.done = [], False, False
+                    self.round, self.winners, self.reports, self.games = 0, {}, {}, []
+                if conn.pid not in self.entrants and not getattr(self, "started", False):
+                    self.entrants.append(conn.pid)
+                # (an eliminated player entering again waits for the next tourney; it must not
+                # restart this one's round notification)
+                if len(self.entrants) >= self.size and self.start_at is None and not getattr(self, "started", False):
+                    self.start_at = time.monotonic() + 2.0   # after the entry's reply is through
+            elif m == 14:
+                self.report(conn, body)
+                v = 1
+            elif m in (13, 14):
+                # match start (13) and result (14): the game reads the reply into its entry
+                # task (+0x144) and, if it is 0, shows a communication error (-989).
+                v = 1
             v = int(os.environ.get(f"HS_T{m}", v), 0) if isinstance(os.environ.get(f"HS_T{m}"), str) else v
             out = StreamOut()
             out.u32(v)
@@ -112,6 +142,224 @@ class Tourney:
             body = s.read(s.left())
             self.nex.info(f"Tournament.{m} from {self.nex.name(conn)}: {self.nex.shown(conn, body, 512, 201)}")
             out = StreamOut()
-            out.u32(0)
+            self.bracket(out)
             return out.get()
         return handler
+
+    def bracket(self, out):
+        """Method 12 reply (reader 0x2b03a0, copied by 0x170a1a0 into the tourney manager):
+        struct { u32 group, u32 round, u8 kind, u8, u32,
+                 Map<u32 id, match>  (struct { u32 id, u32 round, u8, u8 (0xff), u8, List<u32> slots,
+                                        u8 state (<=6), u64 }),
+                 Map<u32 id, entrant> (struct { u32 id, u64 pid, u32, u16, u8, u8 (<=2), u8 (<=4),
+                                         List<player> (<=2: struct { u8 fighter, u8 color,
+                                         u8 state (2 = none), String name, qBuffer x3 }) }) }
+        The game wants 8/16/32 entrants when matches are 1v1, so the bracket is padded."""
+        slots = 8
+        while slots < len(self.entrants):
+            slots *= 2
+        ids = list(range(1, slots + 1))
+        rnd = self.round
+        tree = self.tree(slots)
+
+        def match(o, m):
+            def body(q):
+                q.u32(m["id"])
+                # +4: the id of the match its winner goes on to (0 for the final); the bracket
+                # screen after a game (main+0x239acc0) follows it from the finished match.
+                q.u32(m["next"])
+                # the match's level (0 = first round): the bracket screen lays matches out by it
+                # (main+0x16c528c) and an entrant's own match is the first one listing it whose
+                # level is the bracket's round (main+0x172be08).
+                q.u8(m["level"])
+                q.u8(0xff)
+                q.u8(0)
+                # the game copies a match's slots only when the list grows (main+0x170a3dc),
+                # so later rounds list just the entrants decided so far.
+                shown = m["slots"] if m["level"] == 0 else [e for e in m["slots"] if e]
+                q.list(shown, lambda r, v: r.u32(v))
+                # state (<=6, kept at +9): 5 = decided; the bracket screen waits for it.
+                q.u8(5 if m["winner"] is not None else 0)
+                q.u64(0)
+            o.struct(body)
+
+        def entrant(o, i):
+            pid = self.entrants[i] if i < len(self.entrants) else 0
+            conn = self.nex.by_pid.get(pid) if pid else None
+
+            def player(r, _):
+                def pb(t):
+                    t.u8(int(os.environ.get("HS_TFIGHTER", "0xff"), 0))
+                    t.u8(0)
+                    t.u8(0)
+                    t.string(self.nex.name(conn) if conn else "")
+                    t.qbuffer(b"")
+                    t.qbuffer(b"")
+                    t.qbuffer(b"")
+                r.struct(pb)
+
+            def body(q):
+                q.u32(ids[i])
+                q.u64(self.own_id(pid))
+                q.u32(0)
+                q.u16(0)
+                q.u8(0)
+                q.u8(0)
+                q.u8(0)
+                q.list([0] if pid else [], player)
+            o.struct(body)
+
+        def top(o):
+            o.u32(self.group)
+            o.u32(rnd)
+            o.u8(0)
+            # the manager keeps this byte at +0x549 and compares it with the notified round
+            # (main+0x16c3d0c, main+0x16c54d8): it has to be the round the notification named.
+            o.u8(rnd)
+            # the champion's entrant id (kept at +0x54c): after the final the bracket screen
+            # (main+0x239acc0, final match) waits for it to show up as the final's winner.
+            o.u32(getattr(self, "winners", {}).get(1, 0))
+            o.u32(len(tree))           # Map<u32 id, match>: the whole tree, by id
+            for m in sorted(tree, key=lambda m: m["id"]):
+                o.u32(m["id"])
+                match(o, m)
+            o.u32(slots)               # Map<u32 id, entrant>
+            for i in range(slots):
+                o.u32(ids[i])
+                entrant(o, i)
+        out.struct(top)
+
+    def tree(self, slots):
+        """The single-elimination tree the game draws (4 + 2 + 1 matches for 8 slots, ids in heap
+        order: final 1, semis 2-3, first round 4-7): level 0 pairs the entry order, later levels hold the winners decided so
+        far. A side with no entrant (padding) is a bye: its opponent goes through undecided play."""
+        winners = getattr(self, "winners", {})
+        present = set(range(1, len(self.entrants) + 1))
+        levels, n, base = [], slots // 2, 1
+        while n >= 1:
+            # heap order, as the bracket screen counts them (main+0x239acc0): the final is 1,
+            # a level of n matches holds ids n..2n-1, and match k goes on to k // 2.
+            levels.append([dict(id=n + j, level=len(levels)) for j in range(n)])
+            base += n
+            n //= 2
+        out = []
+        for k, lv in enumerate(levels):
+            for j, m in enumerate(lv):
+                m["next"] = levels[k + 1][j // 2]["id"] if k + 1 < len(levels) else 0
+                if k == 0:
+                    m["slots"] = [2 * j + 1, 2 * j + 2]
+                else:
+                    a, b = levels[k - 1][2 * j], levels[k - 1][2 * j + 1]
+                    m["slots"] = [a["winner"] or 0, b["winner"] or 0]
+                real = [e for e in m["slots"] if e in present]
+                if m["id"] in winners:
+                    m["winner"] = winners[m["id"]]
+                elif k == 0 and len(real) < 2:
+                    # a bye; with nobody real in it a padding entrant goes on, since the bracket
+                    # screen (main+0x239acc0) waits for every match's winner to show up next
+                    m["winner"] = real[0] if real else m["slots"][0]
+                elif k > 0 and len(real) < 2 and all(
+                        c["winner"] is not None for c in (levels[k - 1][2 * j], levels[k - 1][2 * j + 1])):
+                    m["winner"] = real[0] if real else m["slots"][0]
+                else:
+                    m["winner"] = None
+                out.append(m)
+        return out
+
+    def report(self, conn, body):
+        """Method 14, a game's result: struct {u32 group, u32 a, u32 b, u64 c} (worker main+0x1737cb0;
+        a and b come from the match, b looks like the winner's entrant id). Once every player of the
+        match has reported, the next game (best of 3) or round is announced."""
+        st = StreamIn(body)
+        _v, raw = st.struct()
+        q = StreamIn(raw)
+        group, a, b, c = q.u32(), q.u32(), q.u32(), q.u64()
+        self.nex.info(f"Tournament: result from {self.nex.name(conn)}: group {group} a {a} b {b} c {c}")
+        self.reports = getattr(self, "reports", {})
+        self.reports[conn.pid] = (a, b, c)
+        tree = self.tree(self.slots())
+        m = next((m for m in tree if m["id"] == a), None)
+        players = [self.entrants[e - 1] for e in (m["slots"] if m else []) if 0 < e <= len(self.entrants)]
+        if m is None or m["winner"] is not None or not all(p in self.reports for p in players):
+            return
+        self.games = getattr(self, "games", [])
+        self.games.append({p: self.reports.pop(p) for p in players})
+        self.nex.info(f"Tournament: match {a} (level {m['level']}) done: {self.games[-1]}")
+        # b is the winner's entrant id, a the match's id (both players agree)
+        self.winners = getattr(self, "winners", {})
+        self.winners[a] = b
+        open_ = [m for m in self.tree(self.slots()) if m["winner"] is None]
+        if not open_:
+            self.nex.info(f"Tournament: done, champion entrant {b}")
+            self.done = True
+        elif open_[0]["level"] == self.round:
+            return        # the round's other matches are still on
+        # the tourney manager (main+0x16c3c00) only moves on when the notified round is above the
+        # last one it saw ([+0x549]): the next round is the first level with a match to play.
+        self.round = open_[0]["level"] if open_ else self.round + 1
+        self.start_at = time.monotonic() + float(os.environ.get("HS_TNEXT_DELAY", "5"))
+
+    def slots(self):
+        n = 8
+        while n < len(self.entrants):
+            n *= 2
+        return n
+
+    def opponents(self, pid):
+        """The players a tourney entrant's search (game mode 12) may meet: those of its open match
+        this round, or None when it is not in the tourney."""
+        if pid not in self.entrants:
+            return None
+        me = self.entrants.index(pid) + 1
+        for m in self.tree(self.slots()):
+            if m["winner"] is None and m["level"] == self.round and me in m["slots"]:
+                return {self.entrants[e - 1] for e in m["slots"] if 0 < e <= len(self.entrants)}
+        return {pid}
+
+    def own_id(self, pid):
+        """The id an entrant's game knows itself by (0x172bcc0 looks itself up with it): its NSA
+        id by default, HS_TOWN=pid for the NEX PID."""
+        if not pid or os.environ.get("HS_TOWN") == "pid":
+            return pid
+        nsa = self.nex.accounts.nsa_of.get(pid)
+        return int(nsa, 16) if nsa else pid
+
+    def tick(self, now):
+        trig = os.environ.get("HS_TNOTIFY_FILE")
+        if trig and os.path.exists(trig):
+            # testing: "<round> [kind]" in the file sends that notification to every entrant
+            try:
+                parts = open(trig).read().split()
+                if not parts:
+                    return        # still being written
+                os.remove(trig)
+                if not self.entrants:
+                    raise ValueError("nobody has entered yet")
+                self.round = int(parts[0], 0)
+                self.notify_round(self.entrants[:self.size], self.round,
+                                  int(parts[1], 0) if len(parts) > 1 else None)
+            except (OSError, ValueError, IndexError) as e:
+                self.nex.info(f"Tournament: bad trigger file: {e}")
+        if getattr(self, "start_at", None) is None or time.monotonic() < self.start_at:
+            return
+        self.start_at = None
+        self.started = True
+        self.notify_round(self.entrants[:self.size], self.round)
+
+    def notify_round(self, pids, rnd, kind=None):
+        kind = self.N_TOURNEY if kind is None else kind
+        body = StreamOut()
+
+        def event(o):
+            o.pid(pids[0])
+            o.u32(kind)
+            o.u64(self.group)
+            o.u64(rnd)
+            o.string("")
+            o.u64(0)
+        body.struct(event)
+        for pid in pids:
+            conn = self.nex.by_pid.get(pid)
+            if conn is not None:
+                self.nex.info(f"Tournament: notification {kind} group {self.group} round {rnd} to {self.nex.name(conn)}")
+                self.nex.call(conn, 14, 1, body.get())

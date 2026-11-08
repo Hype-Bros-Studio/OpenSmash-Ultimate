@@ -415,10 +415,14 @@ class Matchmaking:
         part = conn.user.get("part")
         mine = self.rating_of(conn.pid)
         now = time.monotonic()
+        services = getattr(self.nex, "services", None)
+        want = services.tourney.opponents(conn.pid) if services and source.game_mode == 12 else None
         candidates, fallback = [], []
         for ms in self.sessions.values():
             if ms.part != part or not ms.open or conn.pid in ms.participants:
                 continue
+            if want is not None and not set(ms.participants) <= want:
+                continue   # a tourney search meets only its bracket opponent
             if targets and ms.gid not in targets:
                 continue
             if ms.game_mode != source.game_mode and not criteria:

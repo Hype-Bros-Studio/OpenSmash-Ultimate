@@ -243,6 +243,9 @@ class NexServer:
 
     def flush(self, now, force=False):
         """Writes changed accounts and ratings (force: now, as when the server stops)."""
+        services = getattr(self, "services", None)
+        if services is not None and not force:
+            services.tourney.tick(now)
         self.accounts.flush(now, force)
         ranked = getattr(self, "ranked", None)
         if ranked is not None:
