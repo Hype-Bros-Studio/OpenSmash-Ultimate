@@ -286,6 +286,16 @@ static u64 keyboard_buttons(i32 *lx, i32 *ly, i32 *rx, i32 *ry) {
  * logic frame, and the sampling number follows the logic frame. */
 void rb_pad(u32 id, u64 *buttons, i32 *lx, i32 *ly, i32 *rx, i32 *ry, i32 *lt, i32 *rt);
 int rb_pad_sampling(u64 *sampling);
+/* hid_press(button, secs): the runtime itself holds a button of player 1 for a while (the arena
+ * tourney start in hle_trace.c presses + as a player would). */
+static volatile u64 press_mask;
+static volatile double press_until;
+void arena_poll(void);   /* (hle_trace.c) */
+void hid_press(int button, double secs) {
+    press_until = rt_now_ns() / 1e9 + secs;
+    press_mask = 1ull << button;
+}
+static u64 pressed_buttons(void) { return press_mask && rt_now_ns() / 1e9 < press_until ? press_mask : 0; }
 static void npad_state(u64 out, u32 id, u32 style) {
     u64 buttons = 0;
     i32 lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0;
@@ -302,7 +312,8 @@ static void npad_state(u64 out, u32 id, u32 style) {
             lx = p.lx; ly = p.ly; rx = p.rx; ry = p.ry;
             lt = p.lt; rt = p.rt;
         }
-        if (ph == NPAD_NO1 && !bench_on()) buttons |= scripted_buttons(&lx, &ly);
+        if (ph == NPAD_NO1) arena_poll();
+        if (ph == NPAD_NO1 && !bench_on()) buttons |= scripted_buttons(&lx, &ly) | pressed_buttons();
         if ((int)ph == keyboard_slot() && (!bench_on() || bench_pads())) buttons |= keyboard_buttons(&lx, &ly, &rx, &ry);
         if (menu_blocks_input()) { buttons = 0; lx = ly = rx = ry = 0; }   /* the settings menu has them (still connected) */
         rb_pad(id, &buttons, &lx, &ly, &rx, &ry, &lt, &rt);
