@@ -96,6 +96,9 @@ class OnlineLobby(relay.Lobby):
         self.handshakes = collections.Counter()   # address -> its TCP connections not known yet
         self.pairs = {}          # (PAIR_LOG) (from, to, from port, to port) -> packets
         self.bracket = bracket.Bracket(o.state)   # (tools/bracket.py: its HTTP shares the NEX streams' port)
+        services = getattr(self.nex, "services", None)
+        if services is not None:
+            self.bracket.live = services.tourney.view   # the Online Tourney, while one is on
 
     def part_of(self, ip):
         c = self.by_ip.get(ip_int(ip))

@@ -103,6 +103,17 @@ class Tourney:
         self.size = int(os.environ.get("HS_TOURNEY_SIZE", "2"))
         self.start_at = None
         self.round = 0
+        # HS_TOURNEY_ONE_AT_A_TIME=1: one match is played at a time, in bracket order. A game
+        # takes one notification per bracket level: the tourney manager moves on only when the
+        # notified round is above the last one it saw (main+0x16c3d18), an entrant's match is on
+        # when its level is that round (main+0x172be08), and the level is the match's column on
+        # the bracket screen (any other level overruns its layout: std::out_of_range). So only
+        # the pair whose match is up hears of it; first-round players wait in the entry room
+        # (CPU practice) until called, later ones on the bracket screen after their win.
+        # (Best of 3 needs a second notification at the same level: not without a game patch.)
+        self.one_at_a_time = os.environ.get("HS_TOURNEY_ONE_AT_A_TIME", "") not in ("", "0")
+        self.waves = self.one_at_a_time
+        self.reset()
         for m in (9, 10, 11, 13, 14):
             nex.register(201, m, self.method_u32(m))
         nex.register(201, 12, self.method_list(12))
@@ -115,11 +126,10 @@ class Tourney:
             if m == 9:
                 v = self.group
                 if not self.entrants or getattr(self, "done", False):
-                    # a new tourney: forget the last one's entrants, rounds and results
-                    self.entrants, self.started, self.done = [], False, False
-                    self.round, self.winners, self.reports, self.games = 0, {}, {}, []
+                    self.reset()     # a new tourney: forget the last one's entrants, rounds and results
                 if conn.pid not in self.entrants and not getattr(self, "started", False):
                     self.entrants.append(conn.pid)
+                    self.names[conn.pid] = self.nex.name(conn)
                 # (an eliminated player entering again waits for the next tourney; it must not
                 # restart this one's round notification)
                 if len(self.entrants) >= self.size and self.start_at is None and not getattr(self, "started", False):
@@ -277,6 +287,8 @@ class Tourney:
         self.nex.info(f"Tournament: result from {self.nex.name(conn)}: group {group} a {a} b {b} c {c}")
         self.reports = getattr(self, "reports", {})
         self.reports[conn.pid] = (a, b, c)
+        if self.waves:
+            return self.report_game(a, b)
         tree = self.tree(self.slots())
         m = next((m for m in tree if m["id"] == a), None)
         players = [self.entrants[e - 1] for e in (m["slots"] if m else []) if 0 < e <= len(self.entrants)]
@@ -299,6 +311,75 @@ class Tourney:
         self.round = open_[0]["level"] if open_ else self.round + 1
         self.start_at = time.monotonic() + float(os.environ.get("HS_TNEXT_DELAY", "5"))
 
+    def reset(self):
+        self.entrants, self.names, self.started, self.done = [], {}, False, False
+        self.round, self.winners, self.reports, self.games = 0, {}, {}, []
+        self.active = set()       # (one at a time) the match being played
+
+    def players_of(self, m):
+        return [self.entrants[e - 1] for e in m["slots"] if 0 < e <= len(self.entrants)]
+
+    def next_wave(self):
+        """(one at a time) The match to play next: the first undecided one of the lowest level
+        whose two players are known."""
+        ready = [m for m in self.tree(self.slots())
+                 if m["winner"] is None and len(self.players_of(m)) == 2]
+        if not ready:
+            return []
+        low = min(m["level"] for m in ready)
+        ready = sorted((m for m in ready if m["level"] == low), key=lambda m: m["id"])
+        return [m["id"] for m in ready[:1]]
+
+    def report_game(self, a, b):
+        """(one at a time) Once both players of match a reported, b goes on; the next match is
+        announced to its two players."""
+        if a not in self.active:
+            return
+        m = next((m for m in self.tree(self.slots()) if m["id"] == a), None)
+        players = self.players_of(m) if m else []
+        if not players or not all(p in self.reports for p in players):
+            return
+        self.games.append({p: self.reports.pop(p) for p in players})
+        self.active.discard(a)
+        self.winners[a] = b
+        self.nex.info(f"Tournament: match {a} (level {m['level']}) won by entrant {b}")
+        if not self.next_wave():
+            self.nex.info(f"Tournament: done, champion entrant {self.winners.get(1)}")
+            self.done = True
+            return
+        self.start_at = time.monotonic() + float(os.environ.get("HS_TNEXT_DELAY", "5"))
+
+    def view(self):
+        """The tourney for the bracket web page (tools/bracket.py's /bracket.json shape), or None
+        when nobody has entered."""
+        if not self.entrants:
+            return None
+        name = lambda e: self.names.get(self.entrants[e - 1], f"#{e}") if 0 < e <= len(self.entrants) else ""  # noqa: E731
+        tree = self.tree(self.slots())
+        depth = max(m["level"] for m in tree)
+        rows, current = [], None
+        for m in sorted(tree, key=lambda m: (m["level"], m["id"])):
+            real = self.players_of(m)
+            if m["level"] == 0 and len(real) < 2:
+                continue      # a bye
+            j = m["id"] - (1 << (depth - m["level"]))
+            mid = f"W{m['level'] + 1}-{j + 1}"
+            label = ("Final" if m["level"] == depth else "Semifinal" if m["level"] == depth - 1
+                     else f"Round {m['level'] + 1}")
+            on = m["id"] in self.active if self.waves else (
+                getattr(self, "started", False) and m["winner"] is None and m["level"] == self.round and len(real) == 2)
+            st = "done" if m["winner"] is not None else "playing" if on else "ready" if len(real) == 2 else "waiting"
+            if on and current is None:
+                current = mid
+            row = {"id": mid, "label": label, "a": name(m["slots"][0]), "b": name(m["slots"][1]), "state": st}
+            if m["winner"] is not None:
+                row["winner"] = name(m["winner"])
+            rows.append(row)
+        champ = self.winners.get(1)
+        return {"source": "tourney", "players": [self.names.get(p, "") for p in self.entrants], "format": "single",
+                "one_at_a_time": self.one_at_a_time, "arena": "", "owner": "",
+                "current": current, "champion": name(champ) if champ else None, "matches": rows}
+
     def slots(self):
         n = 8
         while n < len(self.entrants):
@@ -312,7 +393,8 @@ class Tourney:
             return None
         me = self.entrants.index(pid) + 1
         for m in self.tree(self.slots()):
-            if m["winner"] is None and m["level"] == self.round and me in m["slots"]:
+            on = m["id"] in self.active if self.waves else m["level"] == self.round
+            if m["winner"] is None and on and me in m["slots"]:
                 return {self.entrants[e - 1] for e in m["slots"] if 0 < e <= len(self.entrants)}
         return {pid}
 
@@ -344,7 +426,19 @@ class Tourney:
             return
         self.start_at = None
         self.started = True
-        self.notify_round(self.entrants[:self.size], self.round)
+        if not self.waves:
+            self.notify_round(self.entrants[:self.size], self.round)
+            return
+        # (one at a time) the round named is the match's level; only its two players hear of it
+        self.active = set(self.next_wave())
+        pids = []
+        for m in self.tree(self.slots()):
+            if m["id"] in self.active:
+                self.round = m["level"]
+                pids += self.players_of(m)
+        self.nex.info(f"Tournament: match {sorted(self.active)} is up (round {self.round})")
+        if pids:
+            self.notify_round(pids, self.round)
 
     def notify_round(self, pids, rnd, kind=None):
         kind = self.N_TOURNEY if kind is None else kind

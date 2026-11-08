@@ -352,6 +352,12 @@ class Bracket:
 
     # --- views -------------------------------------------------------------------------------
     def view(self):
+        # an Online Tourney on the lobby's NEX server shows instead while it has entrants
+        # (tools/nex/tournament.py; the lobby sets .live)
+        live = getattr(self, "live", None)
+        v = live() if live else None
+        if v:
+            return v
         cur = self.current()
         rows = []
         for mid in self.order:
@@ -470,7 +476,7 @@ def page(b, key):
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Arena Bracket</title>
+<title>Bracket</title>
 <style>
 :root{--bg:#0f1115;--card:#181b22;--line:#2a2f3a;--text:#e8eaf0;--dim:#9aa1b2;--accent:#ffb020;--win:#3ccf7a;--bad:#ff5d5d}
 @media (prefers-color-scheme: light){:root{--bg:#f4f5f8;--card:#fff;--line:#d9dce4;--text:#1a1d24;--dim:#5d6475;--accent:#c97a00;--win:#1f9d55;--bad:#d63c3c}}
@@ -489,7 +495,7 @@ textarea,input,select{background:var(--card);color:var(--text);border:1px solid 
 .admin{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:20px;max-width:520px}
 .admin label{display:block;margin:8px 0 4px;color:var(--dim);font-size:13px}.err{color:var(--bad)}
 </style></head><body>
-<h1>Arena Bracket</h1><div class="sub" id="sub"></div>
+<h1 id="title">Bracket</h1><div class="sub" id="sub"></div>
 <div class="now" id="now"></div>
 <div class="cols" id="cols"></div>
 <div class="admin" id="admin" hidden>
@@ -508,7 +514,7 @@ async function admin(body){const r=await fetch("/bracket/admin",{method:"POST",b
  const j=await r.json();$("msg").textContent=j.error||"";if(j.bracket)draw(j.bracket);}
 function col(m){return m.id.startsWith("W")?"Winners "+m.id.split("-")[0].slice(1):m.id.startsWith("L")?"Losers "+m.id.split("-")[0].slice(1):"Finals"}
 function draw(b){
- $("sub").textContent=(b.arena?"Arena ID "+b.arena:"No arena ID yet")+(b.owner?" · owner "+b.owner:"")+" · "+(b.format==="double"?"double":"single")+" elimination, "+b.players.length+" players";
+ $("sub").textContent=b.source==="tourney"?"Online Tourney · single elimination"+(b.one_at_a_time?", one match at a time":"")+", "+b.players.length+" players":(b.arena?"Arena ID "+b.arena:"No arena ID yet")+(b.owner?" · owner "+b.owner:"")+" · "+(b.format==="double"?"double":"single")+" elimination, "+b.players.length+" players";
  const cur=b.matches.find(m=>m.id===b.current);
  $("now").innerHTML=b.champion?"Champion: <b>"+esc(b.champion)+"</b>":cur?"Now playing ("+esc(cur.label)+")<br><b>"+esc(cur.a)+"</b> vs <b>"+esc(cur.b)+"</b>"+(cur.state==="disputed"?' <span class="err">(reports disagree: the organizer decides)</span>':""):b.players.length?"Waiting":"No bracket yet";
  const groups={};for(const m of b.matches)(groups[col(m)]=groups[col(m)]||[]).push(m);
