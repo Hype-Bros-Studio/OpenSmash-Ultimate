@@ -25,6 +25,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bracket   # noqa: E402
 import ssbu_relay as relay   # noqa: E402
 from nex.prudp import lite_size   # noqa: E402
 from nex.server import NAT_CHECK_SECOND_IP, make_server   # noqa: E402
@@ -94,6 +95,7 @@ class OnlineLobby(relay.Lobby):
         self.streams = {}        # virtual address -> the player's open NEX streams (writers)
         self.handshakes = collections.Counter()   # address -> its TCP connections not known yet
         self.pairs = {}          # (PAIR_LOG) (from, to, from port, to port) -> packets
+        self.bracket = bracket.Bracket(o.state)   # (tools/bracket.py: its HTTP shares the NEX streams' port)
 
     def part_of(self, ip):
         c = self.by_ip.get(ip_int(ip))
@@ -182,7 +184,11 @@ class OnlineLobby(relay.Lobby):
                 if self.handshakes[peer[0]] <= 0:
                     del self.handshakes[peer[0]]
         try:
-            head = await asyncio.wait_for(reader.readexactly(16), HANDSHAKE_TIME)
+            head = await asyncio.wait_for(reader.readexactly(4), HANDSHAKE_TIME)
+            if head in (b"GET ", b"POST"):
+                await bracket.serve_http(self.bracket, reader, writer, head, HANDSHAKE_TIME)
+                return
+            head += await asyncio.wait_for(reader.readexactly(12), HANDSHAKE_TIME)
             if head[:8] != PREFACE:
                 return
             vip, vport, port = struct.unpack(">IHH", head[8:])
@@ -285,6 +291,8 @@ async def main(o):
     relay.Lobby.say(f"SSBU netplay lobby with Online on UDP and TCP {o.bind}:{port} "
                     f"(protocol {relay.PROTOCOL}; NEX at 10.13.0.1)")
     relay.say_more(o, lobby)
+    relay.Lobby.say(f"Arena bracket: http://<this address>:{port}/bracket (organizer: ?key={lobby.bracket.key}, "
+                    f"also in {os.path.join(o.state, 'bracket.key')})")
     task = asyncio.ensure_future(lobby.run())
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
