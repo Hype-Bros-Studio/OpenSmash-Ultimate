@@ -27,6 +27,8 @@ NO_REPLY = {
 class Services:
     def __init__(self, nex):
         self.nex = nex
+        from .tournament import Tourney
+        self.tourney = Tourney(nex)
         r = nex.register
         r(110, 7, self.get_integer_settings)
         r(110, 9, self.utility_9)
@@ -82,9 +84,9 @@ class Services:
         return out.get()
 
     # Utility.GetGameEvents(param {u32, String locale}) -> List<GameEvent> (208-byte objects; parser
-    # main+0x25ed70): online events and their banners - none.
+    # main+0x25ed70): online events and their banners - the Online Tourney (tournament.py).
     def get_game_events(self, conn, s):
-        return u32(0)
+        return self.tourney.game_events()
 
     # DataStore.GetMeta(DataStoreGetMetaParam {u64 data id, PersistenceTarget {PID owner, u16 slot},
     # u32 result option, u64 access password}): nothing is stored yet - NotFound, as for a new player.
