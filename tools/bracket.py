@@ -47,6 +47,7 @@ BYE = None          # a side that is a bye (no player)
 MAX_BODY = 16384
 MAX_PLAYERS = 64
 MAX_NAME = 40
+POOL_NAMES = "ABCDEFGH"
 FINALS = ("Final", "Winners final", "Losers final", "Grand final", "Grand final reset")   # (build's labels)
 
 
@@ -123,6 +124,54 @@ def build(players, fmt="double"):
     return m
 
 
+def round_robin(n):
+    """Everyone of n plays everyone once, in rounds where nobody plays twice (the circle method):
+    [[(i, j), ...], ...]."""
+    ids = list(range(n)) + ([None] if n % 2 else [])
+    rounds = []
+    for _ in range(len(ids) - 1):
+        rounds.append([(ids[i], ids[-1 - i]) for i in range(len(ids) // 2)
+                       if ids[i] is not None and ids[-1 - i] is not None])
+        ids = [ids[0], ids[-1]] + ids[1:-1]
+    return rounds
+
+
+def build_pools(n, pools, advance, fmt="double"):
+    """Round-robin pools, then a bracket of the pools' top finishers: (matches, {pool: [seeds]}).
+    Seeds snake into the pools (1 2 3 4 / 8 7 6 5 / ...). Pool matches are "P<pool>-<n>" with a
+    "pool"; the bracket is build()'s, its sides {"pool": name, "place": i} (0-based) or {"bye": True},
+    seeded by place, then pool (A1 B1 ... A2 B2 ...): 1 v last puts a pool winner against another
+    pool's runner-up, so pool-mates don't meet again straight away."""
+    if not 2 <= pools <= len(POOL_NAMES):
+        raise ValueError(f"{pools} pools: 2 to {len(POOL_NAMES)}")
+    groups = [[] for _ in range(pools)]
+    for i in range(n):
+        r, c = divmod(i, pools)
+        groups[c if r % 2 == 0 else pools - 1 - c].append(i)
+    if min(len(g) for g in groups) < 2:
+        raise ValueError(f"{n} players in {pools} pools: at least two in each")
+    if not 1 <= advance <= min(len(g) for g in groups):
+        raise ValueError(f"{advance} from each pool: 1 to {min(len(g) for g in groups)}")
+    m = {}
+    for gi, g in enumerate(groups):
+        name, k = POOL_NAMES[gi], 0
+        for rnd in round_robin(len(g)):
+            for a, b in rnd:
+                k += 1
+                mid = f"P{name}-{k}"
+                m[mid] = {"id": mid, "a": {"seed": g[a]}, "b": {"seed": g[b]}, "label": f"Pool {name}", "pool": name}
+    entrants = advance * pools
+    places = [(POOL_NAMES[gi], p) for p in range(advance) for gi in range(pools)]
+    bracket = build([""] * entrants, fmt)
+    for x in bracket.values():
+        for s in ("a", "b"):
+            if "seed" in x[s]:
+                j = x[s]["seed"]
+                x[s] = {"pool": places[j][0], "place": places[j][1]} if j < entrants else {"bye": True}
+    m.update(bracket)
+    return m, {POOL_NAMES[gi]: g for gi, g in enumerate(groups)}
+
+
 class Bracket:
     def __init__(self, folder=None, clock=time.monotonic, wall=time.time):
         self.folder = folder
@@ -157,19 +206,29 @@ class Bracket:
             json.dump(self.state, f, indent=1)
         os.replace(tmp, path)
 
-    def setup(self, players, fmt="double", arena=None, owner=None, best=1, finals_best=None):
+    def setup(self, players, fmt="double", arena=None, owner=None, best=1, finals_best=None, pools=0, advance=2):
+        """A new bracket. pools (2 or more): round-robin pools first, the top `advance` of each
+        going on to the fmt bracket (build_pools)."""
         players = [p.strip() for p in players if p and p.strip()]
         if len(players) > MAX_PLAYERS or any(len(p) > MAX_NAME for p in players):
             raise ValueError("too many players or a name too long")
         if len({norm(p) for p in players}) != len(players):
             raise ValueError("two players with the same name")
+        if fmt not in ("double", "single"):
+            raise ValueError(f"format {fmt!r}: double or single")
         best = best_of(best)
         finals_best = best if finals_best in (None, "") else best_of(finals_best)
-        matches = build(players, fmt)
+        pools, advance = int(pools or 0), int(advance or 2)
+        if pools:
+            matches, groups = build_pools(len(players), pools, advance, fmt)
+            entrants = pools * advance
+            groups = {g: [players[i] for i in seeds] for g, seeds in groups.items()}
+        else:
+            matches, groups, entrants = build(players, fmt), {}, len(players)
         for m in matches.values():
             m["best_of"] = finals_best if m["label"] in FINALS else best
-        self.state.update(players=players, format=fmt if len(players) > 2 else "single", matches=matches, results={},
-                          games={})
+        self.state.update(players=players, format=fmt if entrants > 2 else "single", matches=matches, results={},
+                          games={}, pools=groups, advance=advance if pools else 0)
         if arena is not None:
             self.state["arena"] = str(arena).strip()[:32]
         if owner is not None:
@@ -196,15 +255,74 @@ class Bracket:
         def d(mid):
             if mid not in depth:
                 depth[mid] = 0   # (no cycles; this only stops a bad file from recursing forever)
-                depth[mid] = 1 + max((d(s[t]) for s in (ms[mid]["a"], ms[mid]["b"])
-                                      for t in ("winner", "loser") if t in s and s[t] in ms), default=0)
+                depth[mid] = 1 + max((d(x) for x in self.sources(mid)), default=0)
             return depth[mid]
-        kind = lambda mid: {"W": 0, "L": 1}.get(mid[0], 2)   # noqa: E731
+        kind = lambda mid: {"P": -1, "W": 0, "L": 1}.get(mid[0], 2)   # noqa: E731
         num = lambda mid: [int(x) for x in mid[1:].replace("-", " ").split() if x.isdigit()]  # noqa: E731
         return sorted(ms, key=lambda mid: (d(mid), kind(mid), num(mid)))
 
+    def sources(self, mid):
+        """The matches whose results a match's players come from: the winner/loser sides', and a
+        pool place's whole pool."""
+        ms = self.state["matches"]
+        out = []
+        for s in (ms[mid]["a"], ms[mid]["b"]):
+            out += [s[t] for t in ("winner", "loser") if t in s and s[t] in ms]
+            if "pool" in s:
+                out += [x for x, m in ms.items() if m.get("pool") == s["pool"]]
+        return out
+
+    def standings(self, pool):
+        """(rows, done) for a pool: rows best first, {"name", "wins", "losses", "games_won",
+        "games_lost"}; done once all its matches have results. Ranked by sets won, then (among
+        those level) sets won against each other, then games won minus lost, then games won,
+        then seed."""
+        ms, res = self.state["matches"], self.state["results"]
+        names = self.state.get("pools", {}).get(pool, [])
+        mine = [x for x, m in ms.items() if m.get("pool") == pool]
+        row = {norm(p): {"name": p, "wins": 0, "losses": 0, "games_won": 0, "games_lost": 0} for p in names}
+        beat = set()
+        for x in mine:
+            r = res.get(x)
+            if not r:
+                continue
+            w, lo = row.get(norm(r["winner"])), row.get(norm(r["loser"]))
+            if not w or not lo:
+                continue
+            if "score" in r:
+                gw, gl = r["score"]
+            else:
+                games = self.games(x)
+                gw = max(sum(g["winner"] == r["winner"] for g in games), ms[x].get("best_of", 1) // 2 + 1)
+                gl = sum(g["winner"] == r["loser"] for g in games)
+            w["wins"] += 1
+            lo["losses"] += 1
+            w["games_won"] += gw
+            w["games_lost"] += gl
+            lo["games_won"] += gl
+            lo["games_lost"] += gw
+            beat.add((norm(r["winner"]), norm(r["loser"])))
+        seed = {norm(p): i for i, p in enumerate(self.state["players"])}
+        rows = sorted(row.values(), key=lambda q: -q["wins"])
+        out, i = [], 0
+        while i < len(rows):   # (each run of players on the same wins: head to head, games, seed)
+            j = i
+            while j < len(rows) and rows[j]["wins"] == rows[i]["wins"]:
+                j += 1
+            level = {norm(q["name"]) for q in rows[i:j]}
+            h2h = lambda q: sum((norm(q["name"]), o) in beat for o in level)   # noqa: E731
+            out += sorted(rows[i:j], key=lambda q: (-h2h(q), q["games_lost"] - q["games_won"], -q["games_won"],
+                                                      seed.get(norm(q["name"]), 0)))
+            i = j
+        return out, bool(mine) and all(x in res for x in mine)
+
     def side(self, src):
         """The player (name) on a side, BYE, or "" while it isn't known yet."""
+        if src.get("bye"):
+            return BYE
+        if "pool" in src:
+            rows, done = self.standings(src["pool"])
+            return rows[src["place"]]["name"] if done and src["place"] < len(rows) else ""
         if "seed" in src:
             i = src["seed"]
             return self.state["players"][i] if i < len(self.state["players"]) else BYE
@@ -377,8 +495,8 @@ class Bracket:
         out, todo = set(), [mid]
         while todo:
             x = todo.pop()
-            for y, m in self.state["matches"].items():
-                if y not in out and any(s.get("winner") == x or s.get("loser") == x for s in (m["a"], m["b"])):
+            for y in self.state["matches"]:
+                if y not in out and x in self.sources(y):
                     out.add(y)
                     todo.append(y)
         return out
@@ -447,6 +565,8 @@ class Bracket:
             if mid == cur and mid in self.disputed:
                 st = "disputed"
             row = {"id": mid, "label": m["label"], "a": a or "", "b": b or "", "state": st}
+            if "pool" in m:
+                row["pool"] = m["pool"]
             if m.get("best_of", 1) > 1:   # the set: its length, the games' winners and the score (a's, b's)
                 games = [x["winner"] for x in self.games(mid)]
                 row.update(best_of=m["best_of"], games=games)
@@ -461,8 +581,15 @@ class Bracket:
             if mid in self.reports:
                 row["reports"] = {k: v["winner"] for k, v in self.reports[mid].items()}
             rows.append(row)
-        return {"players": self.state["players"], "format": self.state["format"], "arena": self.state.get("arena", ""),
-                "owner": self.state.get("owner", ""), "current": cur, "champion": self.champion(), "matches": rows}
+        out = {"players": self.state["players"], "format": self.state["format"], "arena": self.state.get("arena", ""),
+               "owner": self.state.get("owner", ""), "current": cur, "champion": self.champion(), "matches": rows}
+        if self.state.get("pools"):
+            out["advance"] = self.state.get("advance", 0)
+            out["pools"] = []
+            for g in self.state["pools"]:
+                st, done = self.standings(g)
+                out["pools"].append({"name": g, "standings": st, "done": done})
+        return out
 
 
 # --- HTTP --------------------------------------------------------------------------------------
@@ -500,7 +627,8 @@ def route(b, method, target, body):
             act = data.get("action")
             if act == "setup":
                 b.setup(list(data.get("players") or []), data.get("format", "double"), data.get("arena"), data.get("owner"),
-                        data.get("best_of") or 1, data.get("finals_best_of"))
+                        data.get("best_of") or 1, data.get("finals_best_of"), data.get("pools") or 0,
+                        data.get("advance") or 2)
             elif act == "result":
                 b.admin_result(str(data.get("match", "")), data.get("winner"))
             elif act == "game":
@@ -579,15 +707,21 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:var(--dim);margin-bottom:16px}
 button{background:var(--line);color:var(--text);border:0;border-radius:5px;padding:2px 8px;cursor:pointer;font:inherit;font-size:12px}
 textarea,input,select{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px;font:inherit;width:100%}
 .admin{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:20px;max-width:520px}
+table.st{border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;min-width:220px}
+table.st td,table.st th{padding:4px 8px;text-align:left;font-size:13px}table.st th{color:var(--dim);font-weight:500}
+table.st tr.go td{color:var(--win);font-weight:600}
 .admin label{display:block;margin:8px 0 4px;color:var(--dim);font-size:13px}.err{color:var(--bad)}
 </style></head><body>
 <h1 id="title">Bracket</h1><div class="sub" id="sub"></div>
 <div class="now" id="now"></div>
+<div class="cols" id="pooltab"></div>
 <div class="cols" id="cols"></div>
 <div class="admin" id="admin" hidden>
  <b>Organizer</b>
  <label>Players, best seed first, one per line (their online names)</label><textarea id="players" rows="8"></textarea>
  <label>Format</label><select id="fmt"><option value="double">Double elimination</option><option value="single">Single elimination</option></select>
+ <label>Pools first (round robin; the top of each pool go on to the bracket)</label><select id="pools"><option value="0">No pools</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select>
+ <label>Players going on from each pool</label><select id="adv"><option>1</option><option selected>2</option><option>3</option><option>4</option></select>
  <label>Sets: best of</label><select id="bo"><option>1</option><option>3</option><option>5</option><option>7</option><option>9</option></select>
  <label>Finals (the final; winners, losers and grand finals): best of</label><select id="fbo"><option value="">the same</option><option>1</option><option>3</option><option>5</option><option>7</option><option>9</option></select>
  <label>Arena ID</label><input id="arena">
@@ -600,11 +734,12 @@ const $=id=>document.getElementById(id);
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 async function admin(body){const r=await fetch("/bracket/admin",{method:"POST",body:JSON.stringify(Object.assign({key:KEY},body))});
  const j=await r.json();$("msg").textContent=j.error||"";if(j.bracket)draw(j.bracket);}
-function col(m){return m.id.startsWith("W")?"Winners "+m.id.split("-")[0].slice(1):m.id.startsWith("L")?"Losers "+m.id.split("-")[0].slice(1):"Finals"}
+function col(m){return m.pool?"Pool "+m.pool:m.id.startsWith("W")?"Winners "+m.id.split("-")[0].slice(1):m.id.startsWith("L")?"Losers "+m.id.split("-")[0].slice(1):"Finals"}
 function draw(b){
- $("sub").textContent=b.source==="tourney"?"Online Tourney · single elimination"+(b.one_at_a_time?", one match at a time":"")+", "+b.players.length+" players":(b.arena?"Arena ID "+b.arena:"No arena ID yet")+(b.owner?" · owner "+b.owner:"")+" · "+(b.format==="double"?"double":"single")+" elimination, "+b.players.length+" players";
+ $("sub").textContent=b.source==="tourney"?"Online Tourney · single elimination"+(b.one_at_a_time?", one match at a time":"")+", "+b.players.length+" players":(b.arena?"Arena ID "+b.arena:"No arena ID yet")+(b.owner?" · owner "+b.owner:"")+" · "+(b.format==="double"?"double":"single")+" elimination, "+b.players.length+" players"+(b.pools?" · "+b.pools.length+" pools, top "+b.advance+" go on":"");
  const cur=b.matches.find(m=>m.id===b.current);
  $("now").innerHTML=b.champion?"Champion: <b>"+esc(b.champion)+"</b>":cur?"Now playing ("+esc(cur.label)+(cur.best_of?", game "+cur.game+" of best of "+cur.best_of:"")+")<br><b>"+esc(cur.a)+"</b> vs <b>"+esc(cur.b)+"</b>"+(cur.score?" &nbsp;"+cur.score.join("–"):"")+(cur.state==="disputed"?' <span class="err">(reports disagree: the organizer decides)</span>':""):b.players.length?"Waiting":"No bracket yet";
+ $("pooltab").innerHTML=(b.pools||[]).map(g=>'<div class="col"><h2>Pool '+esc(g.name)+(g.done?" · final":"")+'</h2><table class="st"><tr><th></th><th>Player</th><th>Sets</th><th>Games</th></tr>'+g.standings.map((r,i)=>'<tr class="'+(g.done&&i<b.advance?"go":"")+'"><td>'+(i+1)+"</td><td>"+esc(r.name)+"</td><td>"+r.wins+"–"+r.losses+"</td><td>"+r.games_won+"–"+r.games_lost+"</td></tr>").join("")+"</table></div>").join("");
  const groups={};for(const m of b.matches)(groups[col(m)]=groups[col(m)]||[]).push(m);
  $("cols").innerHTML=Object.entries(groups).map(([t,ms])=>'<div class="col"><h2>'+esc(t)+"</h2>"+ms.map(m=>{
   const cls=p=>m.winner?(m.winner===p?"w":"l"):"";
@@ -616,7 +751,7 @@ function draw(b){
 }
 document.addEventListener("click",e=>{const t=e.target;if(t.dataset&&t.dataset.m)admin({action:t.dataset.a,match:t.dataset.m,winner:t.dataset.w})});
 if(ADMIN){$("admin").hidden=false;
- $("setup").onclick=()=>{if(confirm("Start a new bracket? Results so far are cleared."))admin({action:"setup",players:$("players").value.split("\n"),format:$("fmt").value,arena:$("arena").value,owner:$("owner").value,best_of:+$("bo").value,finals_best_of:$("fbo").value?+$("fbo").value:null})};
+ $("setup").onclick=()=>{if(confirm("Start a new bracket? Results so far are cleared."))admin({action:"setup",players:$("players").value.split("\n"),format:$("fmt").value,arena:$("arena").value,owner:$("owner").value,pools:+$("pools").value,advance:+$("adv").value,best_of:+$("bo").value,finals_best_of:$("fbo").value?+$("fbo").value:null})};
  $("savearena").onclick=()=>admin({action:"arena",arena:$("arena").value,owner:$("owner").value});}
 async function load(){try{draw(await (await fetch("/bracket.json",{cache:"no-store"})).json())}catch(e){}}
 load();setInterval(load,3000);

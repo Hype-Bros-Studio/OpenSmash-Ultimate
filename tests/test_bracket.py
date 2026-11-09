@@ -117,6 +117,88 @@ class Build(unittest.TestCase):
             b.setup(["A", "B"], "swiss")
 
 
+class Pools(unittest.TestCase):
+    def test_round_robin_everyone_meets_once(self):
+        for n in range(2, 10):
+            pairs = [frozenset(x) for r in B.round_robin(n) for x in r]
+            self.assertEqual(len(pairs), n * (n - 1) // 2)
+            self.assertEqual(len(set(pairs)), len(pairs))
+            for r in B.round_robin(n):   # nobody twice in a round
+                flat = [i for x in r for i in x]
+                self.assertEqual(len(flat), len(set(flat)))
+
+    def test_snake_seeding_and_bad_setups(self):
+        _m, groups = B.build_pools(8, 2, 2)
+        self.assertEqual(groups, {"A": [0, 3, 4, 7], "B": [1, 2, 5, 6]})
+        for n, pools, adv in ((3, 2, 1), (8, 1, 2), (8, 9, 1), (8, 2, 5), (8, 2, 0)):
+            with self.assertRaises(ValueError):
+                B.build_pools(n, pools, adv)
+
+    def test_pools_then_bracket(self):
+        for fmt in ("single", "double"):
+            for n, pools, adv in ((8, 2, 2), (10, 3, 2), (16, 4, 2), (9, 2, 3), (6, 2, 1), (12, 4, 1)):
+                with self.subTest(fmt=fmt, n=n, pools=pools, adv=adv):
+                    b = B.Bracket()
+                    b.setup(NAMES[:n], fmt, pools=pools, advance=adv)
+                    played = play_out(b, lambda a, c: min(a, c, key=seed_of))
+                    self.assertEqual(b.champion(), "P1")
+                    ids = [p[0] for p in played]
+                    first_bracket = next(i for i, x in enumerate(ids) if not x.startswith("P"))
+                    self.assertTrue(all(x.startswith("P") for x in ids[:first_bracket]))
+                    self.assertFalse(any(x.startswith("P") for x in ids[first_bracket:]))
+                    v = b.view()
+                    self.assertEqual(len(v["pools"]), pools)
+                    self.assertTrue(all(g["done"] for g in v["pools"]))
+                    went_on = {p for x in played[first_bracket:] for p in x[1:3]}
+                    tops = {r["name"] for g in v["pools"] for r in g["standings"][:adv]}
+                    self.assertEqual(went_on, tops)
+
+    def test_bracket_waits_for_the_pool(self):
+        b = B.Bracket()
+        b.setup(NAMES[:8], "double", pools=2, advance=2)
+        self.assertTrue(b.current().startswith("PA"))
+        first = [r for r in b.view()["matches"] if not r["id"].startswith("P")]
+        self.assertTrue(all(r["a"] == "" and r["b"] == "" for r in first))
+        self.assertTrue(all(r.get("pool") for r in b.view()["matches"] if r["id"].startswith("P")))
+
+    def test_tie_broken_head_to_head_then_games(self):
+        b = B.Bracket()
+        b.setup(["A", "B", "C", "D"], "single", pools=2, advance=1)   # pools: A,D / B,C
+        rows, done = b.standings("A")
+        self.assertFalse(done)
+        self.assertEqual([r["name"] for r in rows], ["A", "D"])        # (seed before any results)
+        b.admin_result("PA-1", "D")
+        rows, done = b.standings("A")
+        self.assertTrue(done)
+        self.assertEqual([r["name"] for r in rows], ["D", "A"])
+        self.assertIn("D", b.players_of("W1-1"))      # pool A is done: its winner is in the final
+        self.assertIn("", b.players_of("W1-1"))       # (pool B isn't)
+
+    def test_three_way_tie_on_games(self):
+        b = B.Bracket()
+        b.state.update(players=["A", "B", "C"], pools={"A": ["A", "B", "C"]}, results={}, games={},
+                       matches={"PA-1": {"a": {"seed": 0}, "b": {"seed": 1}, "pool": "A", "label": "Pool A"},
+                                "PA-2": {"a": {"seed": 1}, "b": {"seed": 2}, "pool": "A", "label": "Pool A"},
+                                "PA-3": {"a": {"seed": 2}, "b": {"seed": 0}, "pool": "A", "label": "Pool A"}})
+        # a cycle: A beat B, B beat C, C beat A, but C won 2-0 and A only 2-1
+        for mid, w, lo, sc in (("PA-1", "A", "B", [2, 1]), ("PA-2", "B", "C", [2, 1]), ("PA-3", "C", "A", [2, 0])):
+            b.state["results"][mid] = {"winner": w, "loser": lo, "score": sc}
+        rows, done = b.standings("A")
+        self.assertTrue(done)
+        self.assertEqual([r["name"] for r in rows], ["C", "B", "A"])   # games +1, 0, -1
+        self.assertEqual((rows[0]["games_won"], rows[0]["games_lost"]), (3, 2))
+
+    def test_route_setup_with_pools(self):
+        b = B.Bracket()
+        b.key = "k"
+        st, _ct, body = B.route(b, "POST", "/bracket/admin", json.dumps(
+            {"key": "k", "action": "setup", "players": NAMES[:8], "pools": 2, "advance": 2}).encode())
+        self.assertEqual(st, 200, body)
+        v = json.loads(B.route(b, "GET", "/bracket.json", b"")[2])
+        self.assertEqual([g["name"] for g in v["pools"]], ["A", "B"])
+        self.assertEqual(v["advance"], 2)
+
+
 class Reports(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
