@@ -23,14 +23,19 @@
  *   swap    the same scene in place of the current one (request, then end the current one)
  *   room    the current scene ended: the room comes back off the stack, or is asked for when the stack is empty
  *   <name>  that scene in place of the current one
- * The current scene's name and the stack's depth are logged whenever they change. */
+ * The current scene's name and the stack's depth are logged whenever they change.
+ *
+ * With SSBU_ARENA_BRACKET=1 (and not SSBU_TOURNEY_UI=0) the table also comes and goes by itself, from the
+ * lobby's bracket (tui_auto, below); the file is then optional. */
 #define _CRT_SECURE_NO_WARNINGS
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #include "host.h"
+#include "net.h"
 
 #define SEQ_UPDATE 0x23797c0      /* OnlineMeleeRoomSequenceScene, per frame */
 #define REGISTRY_ADD 0x3723a90
@@ -50,6 +55,8 @@
 
 static GuestFn *tui_orig;
 static const char *tui_path;
+static int tui_bracket;           /* SSBU_ARENA_BRACKET=1 (and not SSBU_TOURNEY_UI=0): the table from the lobby's bracket */
+static const char *tui_text;      /* the bracket lines for the request being made (NULL: the file's) */
 static long long tui_seen;
 static int tui_polled;
 static double tui_next;
@@ -162,14 +169,15 @@ static struct {
     char name[MAX_EVENTS][48];
 } br;
 
-static int read_bracket(void) {
-    FILE *f = fopen(tui_path, "r");
-    if (!f) return 0;
+static int parse_bracket(const char *text) {
     memset(&br, 0, sizeof br);
     br.cls = 1;
     br.local = -1;
     char line[256];
-    while (fgets(line, sizeof line, f)) {
+    for (const char *s = text; *s;) {
+        size_t len = strcspn(s, "\n");
+        snprintf(line, sizeof line, "%.*s", (int)(len < sizeof line - 1 ? len : sizeof line - 1), s);
+        s += len + (s[len] == '\n');
         int r, m, w, k = 0, n = 0;
         if (sscanf(line, "name %d %n", &r, &n) == 1 && n > 0 && r >= 0 && r < MAX_EVENTS) {
             snprintf(br.name[r], sizeof br.name[r], "%s", line + n);
@@ -187,9 +195,191 @@ static int read_bracket(void) {
         if (r + 1 > br.rounds) br.rounds = r + 1;
         if (m + 1 > br.count[r]) br.count[r] = m + 1;
     }
-    fclose(f);
     if (br.events > MAX_EVENTS) br.events = MAX_EVENTS;
     return br.rounds > 0 && br.events > 0;
+}
+
+static int read_bracket(void) {
+    static char text[16384];
+    FILE *f = tui_path ? fopen(tui_path, "r") : NULL;
+    if (!f) return 0;
+    size_t n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[n] = 0;
+    return parse_bracket(text);
+}
+
+/* ---- the table from the lobby's bracket (SSBU_ARENA_BRACKET=1) -------------------------------
+ * GET /bracket.json (tools/bracket.py's view: "players" in seed order, "format", "current", and
+ * "matches" rows with "id" and, once decided, "winner"; rows with a bye left out) made into the lines
+ * above, for this player. The game draws fixed trees (main+0x239d810's classes); the 1v1 ones are 8, 16
+ * and 32 entrants with 3, 4 and 5 rounds. The winners side goes in the last rounds of the smallest one it
+ * fits, each of its seats under a chain of matches already decided, at the top of its own subtree's
+ * slots; the other slots are blank entrants, and byes are blank entrants that lose. While a double
+ * elimination plays its losers side or grand finals, and once the bracket is over, there is no table.
+ * (tools/bracket_tui.py makes the same from bracket.json, for SSBU_TOURNEY_UI_FILE.) */
+static const char *json_ws(const char *p) { while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++; return p; }
+
+static const char *json_str(const char *p, char *out, int cap) {   /* p at '"'; returns past it (NULL: bad) */
+    int n = 0;
+    for (p++; *p && *p != '"'; p++) {
+        u32 ch = (u8)*p;
+        if (ch == '\\') {
+            ch = (u8)*++p;
+            if (ch == 'u') {
+                unsigned v;
+                if (sscanf(p + 1, "%4x", &v) != 1) return NULL;
+                ch = v;
+                p += 4;
+            } else ch = ch == 'n' || ch == 'r' || ch == 't' ? ' ' : ch;
+            if (ch < 0x20) ch = ' ';
+            char u[3];
+            int k = ch < 0x80 ? 0 : ch < 0x800 ? 1 : 2;
+            if (!k) u[0] = (char)ch;
+            else if (k == 1) { u[0] = (char)(0xc0 | ch >> 6); u[1] = (char)(0x80 | (ch & 0x3f)); }
+            else { u[0] = (char)(0xe0 | ch >> 12); u[1] = (char)(0x80 | ((ch >> 6) & 0x3f)); u[2] = (char)(0x80 | (ch & 0x3f)); }
+            for (int i = 0; i <= k; i++) if (n < cap - 1) out[n++] = u[i];
+        } else if (n < cap - 1) out[n++] = (char)ch;
+    }
+    if (cap) out[n] = 0;
+    return *p == '"' ? p + 1 : NULL;
+}
+
+static const char *json_skip(const char *p) {   /* past one value */
+    p = json_ws(p);
+    if (*p == '"') return json_str(p, NULL, 0);
+    if (*p == '{' || *p == '[') {
+        char end = *p == '{' ? '}' : ']';
+        p = json_ws(p + 1);
+        while (p && *p && *p != end) {
+            if (end == '}') {
+                p = json_str(p, NULL, 0);
+                if (!p || *(p = json_ws(p)) != ':') return NULL;
+                p++;
+            }
+            p = json_skip(p);
+            if (p && *(p = json_ws(p)) == ',') p = json_ws(p + 1);
+        }
+        return p && *p == end ? p + 1 : NULL;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']') p++;
+    return p;
+}
+
+static const char *json_get(const char *obj, const char *key) {   /* an object member's value, or NULL */
+    char k[24];
+    const char *p = json_ws(obj);
+    if (*p != '{') return NULL;
+    for (p = json_ws(p + 1); p && *p == '"';) {
+        p = json_str(p, k, sizeof k);
+        if (!p || *(p = json_ws(p)) != ':') return NULL;
+        p = json_ws(p + 1);
+        if (!strcmp(k, key)) return p;
+        p = json_skip(p);
+        if (p && *(p = json_ws(p)) == ',') p = json_ws(p + 1);
+    }
+    return NULL;
+}
+
+static int same_name(const char *a, const char *b) {   /* (bracket.py's norm: no case, no surrounding spaces) */
+    while (*a == ' ') a++;
+    while (*b == ' ') b++;
+    size_t la = strlen(a), lb = strlen(b);
+    while (la && a[la - 1] == ' ') la--;
+    while (lb && b[lb - 1] == ' ') lb--;
+    if (la != lb || !la) return 0;
+    for (size_t i = 0; i < la; i++)
+        if (tolower((u8)a[i]) != tolower((u8)b[i])) return 0;
+    return 1;
+}
+
+#define VIEW_SEATS 32
+static int table_from_view(const char *js, const char *me, char *out, int cap) {
+    static const int classes[][2] = {{3, 1}, {4, 3}, {5, 5}};   /* 1v1 classes: rounds, class */
+    static char name[MAX_EVENTS][48], won[MAX_ROUNDS][VIEW_SEATS / 2][48];
+    char fmt[16] = "", cur[24] = "", id[24];
+    int n = 0;
+    memset(won, 0, sizeof won);
+    const char *p = json_get(js, "players");
+    if (!p || *p != '[') return 0;
+    for (p = json_ws(p + 1); p && *p == '"' && n < VIEW_SEATS + 1;) {
+        p = json_str(p, name[n++], sizeof name[0]);
+        if (p && *(p = json_ws(p)) == ',') p = json_ws(p + 1);
+    }
+    if (!p || n < 2 || n > VIEW_SEATS) return 0;
+    if ((p = json_get(js, "format")) && *p == '"') json_str(p, fmt, sizeof fmt);
+    if ((p = json_get(js, "current")) && *p == '"') json_str(p, cur, sizeof cur);
+    if (cur[0] ? cur[0] != 'W' : strcmp(fmt, "single")) return 0;   /* (a double elimination's losers side, or its end) */
+    if ((p = json_get(js, "matches")) && *p == '[')
+        for (p = json_ws(p + 1); p && *p == '{';) {
+            const char *row = p, *v;
+            int r, i;
+            id[0] = 0;
+            if ((v = json_get(row, "id")) && *v == '"') json_str(v, id, sizeof id);
+            if (sscanf(id, "W%d-%d", &r, &i) == 2 && r >= 1 && r <= MAX_ROUNDS && i >= 1 && i <= VIEW_SEATS / 2 &&
+                (v = json_get(row, "winner")) && *v == '"')
+                json_str(v, won[r - 1][i - 1], sizeof won[0][0]);
+            p = json_skip(row);
+            if (p && *(p = json_ws(p)) == ',') p = json_ws(p + 1);
+        }
+
+    int k = 1, size = 2;
+    while (size < n) size *= 2, k++;
+    int order[VIEW_SEATS] = {1}, len = 1;   /* seeds in bracket order (bracket.py's seed_order) */
+    while (len < size) {
+        for (int i = len - 1; i >= 0; i--) { order[2 * i + 1] = 2 * len + 1 - order[i]; order[2 * i] = order[i]; }
+        len *= 2;
+    }
+    int local = -1;   /* the seats: round 1's sides in order */
+    static char seat[MAX_EVENTS][48];
+    memset(seat, 0, sizeof seat);
+    for (int s = 0; s < size; s++) {
+        if (order[s] - 1 < n) snprintf(seat[s], sizeof seat[s], "%s", name[order[s] - 1]);
+        if (same_name(seat[s], me)) local = s;
+    }
+    int rounds = 0, cls = 0;
+    for (int c = 0; c < 3 && !rounds; c++)
+        if (classes[c][0] >= k) rounds = classes[c][0], cls = classes[c][1];
+    if (!rounds) return 0;
+    /* The table draws entrant E in its slot E (of the class's 1 << rounds), so seat S is entrant S << off,
+     * at the top of its own subtree; the other entrants are blank. */
+    int off = rounds - k, events = 1 << rounds, win[MAX_ROUNDS][MAX_MATCHES];
+    if (local >= 0) local <<= off;
+    for (int g = 0; g < rounds; g++)
+        for (int i = 0; i < 1 << (rounds - 1 - g); i++) {
+            if (g < off) {   /* a chain of decided matches above a seat, or above a blank entrant */
+                win[g][i] = g ? win[g - 1][2 * i] : 2 * i;
+                continue;
+            }
+            const char *w = won[g - off][i];
+            win[g][i] = -1;
+            for (int s = 0; w[0] && s < size; s++)
+                if (same_name(seat[s], w)) win[g][i] = s << off;
+            if (!w[0] && g == off && !seat[2 * i][0] != !seat[2 * i + 1][0])   /* (a bye: the other side goes on) */
+                win[g][i] = (seat[2 * i][0] ? 2 * i : 2 * i + 1) << off;
+        }
+    /* With the final decided the table goes on to its champion screen (main+0x18bafc0), which reads the
+     * winner's fighter and its player's slot (main+0x239b2a0): these entrants have neither, and it crashes. */
+    if (win[rounds - 1][0] >= 0) return 0;
+    int now = rounds - 1, mine = 0;   /* the round being played: the first with a match open */
+    for (int g = rounds - 1; g >= 0; g--)
+        for (int i = 0; i < 1 << (rounds - 1 - g); i++)
+            if (win[g][i] < 0) now = g;
+    for (int i = 0; i < 1 << (rounds - 1 - now); i++) {
+        int a = now ? win[now - 1][2 * i] : 2 * i, b = now ? win[now - 1][2 * i + 1] : off ? -2 : 2 * i + 1;
+        if (local >= 0 && (local == a || local == b)) mine = i;
+    }
+    int o = snprintf(out, (size_t)cap, "class %d\nevents %d\nlocal %d\nme %d\n", cls, events, local, mine);
+    for (int g = 0; g < rounds; g++)
+        for (int i = 0; i < 1 << (rounds - 1 - g); i++) {
+            o += snprintf(out + o, (size_t)(cap > o ? cap - o : 0), "match %d %d %d", g, i, win[g][i]);
+            if (g == 0 && off) o += snprintf(out + o, (size_t)(cap > o ? cap - o : 0), " %d", 2 * i);
+            else if (g == 0) o += snprintf(out + o, (size_t)(cap > o ? cap - o : 0), " %d %d", 2 * i, 2 * i + 1);
+            o += snprintf(out + o, (size_t)(cap > o ? cap - o : 0), "\n");
+        }
+    for (int s = 0; s < size; s++)
+        if (seat[s][0]) o += snprintf(out + o, (size_t)(cap > o ? cap - o : 0), "name %d %s\n", s << off, seat[s]);
+    return o < cap;
 }
 
 /* A player's name in an entrant: {FNV hash of the UTF-16, length, UTF-16 (10 at most) and its end}. */
@@ -334,8 +524,8 @@ static void tui_request(Cpu *c, u64 seq, const char *word) {
     if (table) {
         int fresh = !*P(u64, base + HOLDER);
         if (!make_holder(c, sp)) return;
-        if (fresh && read_bracket()) fill_bracket(c, sp);
-        else if (fresh) fprintf(stderr, "[tourney-ui] no bracket in %s\n", tui_path);
+        if (fresh && (tui_text ? parse_bracket(tui_text) : read_bracket())) fill_bracket(c, sp);
+        else if (fresh) fprintf(stderr, "[tourney-ui] no bracket in %s\n", tui_text ? "the lobby's" : tui_path);
     }
     if (!strcmp(target, TABLE_NAME) && tui_registered != seq) {
         strcpy(P(char, str), target);
@@ -359,6 +549,44 @@ static void tui_request(Cpu *c, u64 seq, const char *word) {
     fflush(stderr);
 }
 
+/* With SSBU_ARENA_BRACKET=1: the table over the room each time hle_online.c fetches the bracket for it
+ * (this player first placed in a bracket, a match it played decided), and the room back once the
+ * assignment has moved on since (the next place request), after TABLE_SHOWN s at least. */
+#define TABLE_SHOWN 6.0
+long online_arena_table(long have, char *out, int cap, long *after);   /* (hle_online.c) */
+long online_arena_assignment(int *place, char *role, int rcap);
+static void tui_auto(Cpu *c, u64 seq, double now) {
+    static char js[64 * 1024], text[8192];
+    static long seen, after, shown_after;
+    static double shown;
+    int place;
+    char role[8];
+    long aseq = online_arena_assignment(&place, role, sizeof role);
+    if (shown && !strcmp(tui_cur, TABLE_NAME)) {
+        if (aseq != shown_after && now >= shown + TABLE_SHOWN) {
+            shown = 0;
+            tui_request(c, seq, "room");
+        }
+        return;
+    }
+    shown = 0;
+    if (strcmp(tui_cur, ROOM_NAME) || tui_depth || *P(u64, rt_module_main.base + HOLDER)) return;   /* (over the room alone) */
+    long s = online_arena_table(seen, js, sizeof js, &after);
+    if (s == seen) return;
+    seen = s;
+    const char *me = net_player_name();
+    if (!table_from_view(js, me ? me : "", text, sizeof text)) {
+        fprintf(stderr, "[tourney-ui] no table for the lobby's bracket now (a losers round, the bracket over, or no 1v1 class fits)\n");
+        fflush(stderr);
+        return;
+    }
+    tui_text = text;
+    tui_request(c, seq, "table");
+    tui_text = NULL;
+    shown = now;
+    shown_after = after;
+}
+
 static void tui_update(Cpu *c) {
     u64 seq = c->x[0];
     tui_orig(c);
@@ -377,6 +605,8 @@ static void tui_update(Cpu *c) {
     double now = rt_now_ns() / 1e9;
     if (now < tui_next) return;
     tui_next = now + 0.25;
+    if (tui_bracket) tui_auto(c, seq, now);
+    if (!tui_path) return;
     struct stat st;
 #ifdef _WIN32
     long long m = stat(tui_path, &st) ? -1 : (long long)st.st_mtime * 1000000ll + st.st_size;
@@ -402,9 +632,13 @@ void tourney_ui_install(void) {
     if (done) return;
     done = 1;
     tui_path = getenv("SSBU_TOURNEY_UI_FILE");
-    if (!tui_path || !*tui_path) return;
+    if (tui_path && !*tui_path) tui_path = NULL;
+    const char *b = getenv("SSBU_ARENA_BRACKET"), *off = getenv("SSBU_TOURNEY_UI");
+    tui_bracket = b && !strcmp(b, "1") && !(off && !strcmp(off, "0"));
+    if (!tui_path && !tui_bracket) return;
     u64 orig = rt_hook_function(rt_module_main.base + SEQ_UPDATE, rt_native(tui_update, "SSBU_TOURNEY_UI_FILE hook"));
     if (orig) tui_orig = rt_lookup(orig);
-    fprintf(stderr, "[tourney-ui] Arena sequence %s\n", orig ? "hooked" : "not found");
+    fprintf(stderr, "[tourney-ui] Arena sequence %s%s\n", orig ? "hooked" : "not found",
+            tui_bracket ? " (the table from the lobby's bracket)" : "");
     fflush(stderr);
 }

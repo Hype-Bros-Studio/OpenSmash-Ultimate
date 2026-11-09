@@ -7,9 +7,13 @@ NAME is this game's player (their online name); OUT gets "table" and the bracket
 
 The game draws fixed trees (main+0x239d810's classes); the 1v1 ones are 8, 16 and 32 entrants with
 3, 4 and 5 rounds. The bracket's winners side goes in the last rounds of the smallest one it fits, each
-of its seats under a chain of matches already decided, filled out with blank entrants: the table wants
+of its seats under a chain of matches already decided, at the top of its own subtree's slots, the rest
+filled out with blank entrants: the table wants
 an entrant in each first-round match and a winner in each match below the one being played. Byes are
-blank entrants that lose."""
+blank entrants that lose.
+
+With SSBU_ARENA_BRACKET=1 the game makes the same table itself from GET /bracket.json
+(runtime/hle_tourney_ui.c, table_from_view); this one is for SSBU_TOURNEY_UI_FILE and for checking it."""
 import json
 import os
 import sys
@@ -36,36 +40,33 @@ def table(state, me):
     size = 1 << k
 
     # the seats (entrants 0..size-1): round 1's sides in order
-    names = []
+    # the table draws entrant E in its slot E (of the class's 1 << rounds): seat S is entrant S << off,
+    # at the top of its own subtree, and the other entrants are blank
+    names = [""] * (1 << rounds)
     for s in range(size):
         src = ms[f"W1-{s // 2 + 1}"]["a" if s % 2 == 0 else "b"]
         p = b.side(src)
-        names.append("" if p is BYE or p is None else p)
-    seat = {norm(p): s for s, p in enumerate(names) if p}
+        names[s << off] = "" if p is BYE or p is None else p
+    seat = {norm(p): e for e, p in enumerate(names) if p}
     local = seat.get(norm(me), -1)
 
     match = {}      # (round, index) -> (winner, entrants)
     for g in range(rounds):
         for i in range(1 << (rounds - 1 - g)):
-            if g < off:
-                depth = off - 1 - g          # rounds left before the seat's own
-                if g == 0:
-                    if i % (1 << depth) == 0:
-                        e = i >> depth
-                    else:
-                        e = len(names)
-                        names.append("")
-                    match[g, i] = (e, [e])
-                else:
-                    match[g, i] = (match[g - 1, 2 * i][0], [])
+            if g < off:     # a chain of decided matches above a seat, or above a blank entrant
+                match[g, i] = (2 * i, [2 * i]) if g == 0 else (match[g - 1, 2 * i][0], [])
                 continue
             mid = f"W{g - off + 1}-{i + 1}"
             r = b.outcome(mid) if mid in ms else None
             w = seat.get(norm(r[0]), -1) if r and r[0] is not BYE else -1
             match[g, i] = (w, [2 * i, 2 * i + 1] if g == 0 else [])
 
+    # (with the final decided the table goes on to its champion screen, which needs the winner's
+    # fighter and player slot: these entrants have neither, and it crashes)
+    if match[rounds - 1, 0][0] >= 0:
+        raise ValueError("the bracket is over: the table's champion screen isn't supported")
     # this player's match in the round being played (the first with one open)
-    cur = next((g for g in range(rounds) if any(match[g, i][0] < 0 for i in range(1 << (rounds - 1 - g)))), rounds - 1)
+    cur = next(g for g in range(rounds) if any(match[g, i][0] < 0 for i in range(1 << (rounds - 1 - g))))
     mine = 0
     for i in range(1 << (rounds - 1 - cur)):
         sides = match[cur, i][1] if cur == 0 else [match[cur - 1, 2 * i][0], match[cur - 1, 2 * i + 1][0]]
