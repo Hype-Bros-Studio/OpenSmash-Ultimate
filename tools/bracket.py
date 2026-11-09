@@ -8,21 +8,26 @@ HTTP, on the lobby's TCP port (the lobby hands over any connection that starts w
 "POST"):
 
   GET  /arena/assignment?name=N  {"match": id|null, "opponent": name, "owner": bool, "plus": bool,
-                                  "arena": arena ID, "place": 0|1|3, "role": ""|"start"|"join"}.
+                                  "arena": arena ID, "place": 0|1|3, "role": ""|"start"|"join",
+                                  "game": n}.
                                  "plus": N owns the arena and a match is ready. "place": where N's
                                  icon goes while a match is on (1 the ring, 3 the Spectator Stands,
                                  0 not in the bracket or nothing on); "role": the match's two players
-                                 press + in turn, "start" first, then "join" (runtime/hle_trace.c).
-  POST /arena/result             {"match", "winner", "loser", "reporter", "stocks"?, "percent"?}
-                                 -> {"ok", "state": "pending"|"confirmed"|"disputed"}; 409 when the
-                                 match isn't being played.
+                                 press + in turn, "start" first, then "join" (runtime/hle_trace.c);
+                                 "game": for those two, the game of the set being played (from 1).
+  POST /arena/result             {"match", "winner", "loser", "reporter", "game"?, "stocks"?,
+                                 "percent"?} -> {"ok", "state": "pending"|"confirmed"|"disputed"};
+                                 409 when the match (or that game of it) isn't being played.
   GET  /bracket.json             the whole bracket, for the in-game overlay and the page.
   GET  /bracket                  the page (with ?key=K: the organizer's controls).
-  POST /bracket/admin            {"key", "action": "setup"|"result"|"clear"|"arena", ...}
+  POST /bracket/admin            {"key", "action": "setup"|"result"|"game"|"clear"|"arena", ...}
 
-A result is confirmed when both players report the same winner, or when one report has stood for
-CONFIRM_AFTER seconds without the other player disagreeing. Reports that disagree leave the match
-"disputed" until the organizer enters the result.
+Each match is a set, best of 1, 3, 5, 7 or 9 games (setup's "best_of", and "finals_best_of" for the
+finals: the single elimination's final, and the double's winners, losers and grand finals). Each game
+is reported as above; the set goes to whoever has won more than half. A game is confirmed when both
+players report the same winner, or when one report has stood for CONFIRM_AFTER seconds without the
+other player disagreeing. Reports that disagree leave the match "disputed" until the organizer enters
+that game ("game") or the whole set ("result").
 
 Formats: "double" (double elimination, with a grand-final reset) and "single". Any number of
 players from 2: the bracket is filled to a power of two with byes, seeded the usual way (1 v 8,
@@ -42,10 +47,18 @@ BYE = None          # a side that is a bye (no player)
 MAX_BODY = 16384
 MAX_PLAYERS = 64
 MAX_NAME = 40
+FINALS = ("Final", "Winners final", "Losers final", "Grand final", "Grand final reset")   # (build's labels)
 
 
 def norm(name):
     return (name or "").strip().casefold()
+
+
+def best_of(n):
+    n = int(n)
+    if n not in (1, 3, 5, 7, 9):
+        raise ValueError(f"best of {n}: 1, 3, 5, 7 or 9")
+    return n
 
 
 def seed_order(size):
@@ -114,7 +127,8 @@ class Bracket:
     def __init__(self, folder=None, clock=time.monotonic, wall=time.time):
         self.folder = folder
         self.clock, self.wall = clock, wall
-        self.state = {"players": [], "format": "double", "matches": {}, "results": {}, "arena": "", "owner": ""}
+        self.state = {"players": [], "format": "double", "matches": {}, "results": {}, "games": {}, "arena": "",
+                      "owner": ""}
         self.reports = {}        # match -> {reporter: {"winner", "loser", "at", ...}}
         self.disputed = set()
         self.key = None
@@ -143,14 +157,19 @@ class Bracket:
             json.dump(self.state, f, indent=1)
         os.replace(tmp, path)
 
-    def setup(self, players, fmt="double", arena=None, owner=None):
+    def setup(self, players, fmt="double", arena=None, owner=None, best=1, finals_best=None):
         players = [p.strip() for p in players if p and p.strip()]
         if len(players) > MAX_PLAYERS or any(len(p) > MAX_NAME for p in players):
             raise ValueError("too many players or a name too long")
         if len({norm(p) for p in players}) != len(players):
             raise ValueError("two players with the same name")
+        best = best_of(best)
+        finals_best = best if finals_best in (None, "") else best_of(finals_best)
         matches = build(players, fmt)
-        self.state.update(players=players, format=fmt if len(players) > 2 else "single", matches=matches, results={})
+        for m in matches.values():
+            m["best_of"] = finals_best if m["label"] in FINALS else best
+        self.state.update(players=players, format=fmt if len(players) > 2 else "single", matches=matches, results={},
+                          games={})
         if arena is not None:
             self.state["arena"] = str(arena).strip()[:32]
         if owner is not None:
@@ -226,6 +245,14 @@ class Bracket:
             return a, BYE
         return None
 
+    def games(self, mid):
+        """The set's games decided so far: [{"winner", "loser", "how", "when", ...}]."""
+        return self.state.setdefault("games", {}).get(mid, [])
+
+    def game(self, mid):
+        """The number of the set's game being played (from 1)."""
+        return len(self.games(mid)) + 1
+
     def ready(self, mid):
         if mid in self.state["results"] or not self.needed(mid):
             return False
@@ -259,16 +286,16 @@ class Bracket:
         mid = self.current()
         owner = bool(me) and me == norm(self.state.get("owner"))
         out = {"match": None, "opponent": "", "owner": owner, "plus": False, "arena": self.state.get("arena", ""),
-               "place": 0, "role": ""}
+               "place": 0, "role": "", "game": 0}
         if mid:
             a, b = self.players_of(mid)
             out["plus"] = owner
             if me and me in (norm(p) for p in self.state["players"]):
                 out["place"] = 3
             if me == norm(a):
-                out.update(match=mid, opponent=b, place=1, role="start")
+                out.update(match=mid, opponent=b, place=1, role="start", game=self.game(mid))
             elif me == norm(b):
-                out.update(match=mid, opponent=a, place=1, role="join")
+                out.update(match=mid, opponent=a, place=1, role="join", game=self.game(mid))
         return out
 
     # --- results -----------------------------------------------------------------------------
@@ -278,9 +305,14 @@ class Bracket:
         return a if n == norm(a) else b if n == norm(b) else None
 
     def report(self, mid, winner, loser, reporter, extra=None):
-        """A player's report. Returns (http status, state)."""
+        """A player's report of a game ("game" in extra: which one; the one being played without).
+        Returns (http status, state)."""
         self.tick()
-        if mid != self.current():
+        g = extra.get("game") if extra else None
+        g = g if isinstance(g, int) and not isinstance(g, bool) else None
+        if g is not None and mid in self.state["matches"] and 1 <= g <= len(self.games(mid)):
+            return 200, "confirmed"     # (a late report of a game decided already)
+        if mid != self.current() or g is not None and g != self.game(mid):
             return 409, "not being played"
         w, lo, by = self._name_in(winner, mid), self._name_in(loser, mid), self._name_in(reporter, mid)
         if not w or not lo or w == lo:
@@ -299,7 +331,7 @@ class Bracket:
             return 200, "disputed"
         self.disputed.discard(mid)
         if len(mine) == 2:
-            self._decide(mid, w, lo, "players", rep)
+            self._game(mid, w, lo, "players", rep)
             return 200, "confirmed"
         return 200, "pending"
 
@@ -310,13 +342,32 @@ class Bracket:
                 continue
             (rep,) = mine.values()
             if now - rep["at"] >= CONFIRM_AFTER:
-                self._decide(mid, rep["winner"], rep["loser"], "one report", rep)
+                self._game(mid, rep["winner"], rep["loser"], "one report", rep)
+
+    def _game(self, mid, winner, loser, how, rep=None):
+        """A game of the set decided, and the set once its winner has won more than half."""
+        g = {"winner": winner, "loser": loser, "how": how, "when": self.wall()}
+        for k in ("stocks", "percent"):
+            if rep and k in rep:
+                g[k] = rep[k]
+        games = self.state.setdefault("games", {}).setdefault(mid, [])
+        games.append(g)
+        won = sum(x["winner"] == winner for x in games)
+        if won > self.state["matches"][mid].get("best_of", 1) // 2:
+            self._decide(mid, winner, loser, how, rep)
+        else:
+            self.reports.pop(mid, None)
+            self.disputed.discard(mid)
+            self.save()
 
     def _decide(self, mid, winner, loser, how, rep=None):
         r = {"winner": winner, "loser": loser, "how": how, "when": self.wall()}
         for k in ("stocks", "percent"):
             if rep and k in rep:
                 r[k] = rep[k]
+        if self.state["matches"][mid].get("best_of", 1) > 1:
+            won = sum(x["winner"] == winner for x in self.games(mid))
+            r["score"] = [won, len(self.games(mid)) - won]
         self.state["results"][mid] = r
         self.reports.pop(mid, None)
         self.disputed.discard(mid)
@@ -348,11 +399,27 @@ class Bracket:
             self.clear(mid, keep_self=True)
         self._decide(mid, w, b if w == a else a, "organizer")
 
+    def admin_game(self, mid, winner):
+        """The organizer's winner of the game being played in a set not decided yet (a disputed
+        one, say)."""
+        if mid not in self.state["matches"]:
+            raise ValueError(f"no match {mid}")
+        if mid in self.state["results"]:
+            raise ValueError(f"{mid} is decided: clear it, or give the set's winner")
+        if not self.ready(mid):
+            raise ValueError(f"{mid}: its players aren't known yet")
+        a, b = self.players_of(mid)
+        w = a if norm(winner) == norm(a) else b if norm(winner) == norm(b) else None
+        if not w:
+            raise ValueError(f"{winner!r} doesn't play {mid}")
+        self._game(mid, w, b if w == a else a, "organizer")
+
     def clear(self, mid, keep_self=False):
         if mid not in self.state["matches"]:
             raise ValueError(f"no match {mid}")
         for x in self.dependents(mid) | (set() if keep_self else {mid}):
             self.state["results"].pop(x, None)
+            self.state.setdefault("games", {}).pop(x, None)
             self.reports.pop(x, None)
             self.disputed.discard(x)
         self.save()
@@ -380,6 +447,11 @@ class Bracket:
             if mid == cur and mid in self.disputed:
                 st = "disputed"
             row = {"id": mid, "label": m["label"], "a": a or "", "b": b or "", "state": st}
+            if m.get("best_of", 1) > 1:   # the set: its length, the games' winners and the score (a's, b's)
+                games = [x["winner"] for x in self.games(mid)]
+                row.update(best_of=m["best_of"], games=games, score=[games.count(a), games.count(b)])
+            if not res:
+                row["game"] = self.game(mid)
             if res:
                 row.update({k: res[k] for k in ("winner", "how", "stocks", "percent") if k in res})
             if mid in self.reports:
@@ -423,9 +495,12 @@ def route(b, method, target, body):
         try:
             act = data.get("action")
             if act == "setup":
-                b.setup(list(data.get("players") or []), data.get("format", "double"), data.get("arena"), data.get("owner"))
+                b.setup(list(data.get("players") or []), data.get("format", "double"), data.get("arena"), data.get("owner"),
+                        data.get("best_of") or 1, data.get("finals_best_of"))
             elif act == "result":
                 b.admin_result(str(data.get("match", "")), data.get("winner"))
+            elif act == "game":
+                b.admin_game(str(data.get("match", "")), data.get("winner"))
             elif act == "clear":
                 b.clear(str(data.get("match", "")))
             elif act == "arena":
@@ -509,6 +584,8 @@ textarea,input,select{background:var(--card);color:var(--text);border:1px solid 
  <b>Organizer</b>
  <label>Players, best seed first, one per line (their online names)</label><textarea id="players" rows="8"></textarea>
  <label>Format</label><select id="fmt"><option value="double">Double elimination</option><option value="single">Single elimination</option></select>
+ <label>Sets: best of</label><select id="bo"><option>1</option><option>3</option><option>5</option></select>
+ <label>Finals (the final; winners, losers and grand finals): best of</label><select id="fbo"><option value="">the same</option><option>3</option><option>5</option><option>7</option></select>
  <label>Arena ID</label><input id="arena">
  <label>Arena owner (online name; presses + to start)</label><input id="owner">
  <p><button id="setup">Start a new bracket</button> <button id="savearena">Save arena only</button> <span id="msg" class="err"></span></p>
@@ -523,17 +600,19 @@ function col(m){return m.id.startsWith("W")?"Winners "+m.id.split("-")[0].slice(
 function draw(b){
  $("sub").textContent=b.source==="tourney"?"Online Tourney · single elimination"+(b.one_at_a_time?", one match at a time":"")+", "+b.players.length+" players":(b.arena?"Arena ID "+b.arena:"No arena ID yet")+(b.owner?" · owner "+b.owner:"")+" · "+(b.format==="double"?"double":"single")+" elimination, "+b.players.length+" players";
  const cur=b.matches.find(m=>m.id===b.current);
- $("now").innerHTML=b.champion?"Champion: <b>"+esc(b.champion)+"</b>":cur?"Now playing ("+esc(cur.label)+")<br><b>"+esc(cur.a)+"</b> vs <b>"+esc(cur.b)+"</b>"+(cur.state==="disputed"?' <span class="err">(reports disagree: the organizer decides)</span>':""):b.players.length?"Waiting":"No bracket yet";
+ $("now").innerHTML=b.champion?"Champion: <b>"+esc(b.champion)+"</b>":cur?"Now playing ("+esc(cur.label)+(cur.best_of?", game "+cur.game+" of best of "+cur.best_of:"")+")<br><b>"+esc(cur.a)+"</b> vs <b>"+esc(cur.b)+"</b>"+(cur.score?" &nbsp;"+cur.score.join("–"):"")+(cur.state==="disputed"?' <span class="err">(reports disagree: the organizer decides)</span>':""):b.players.length?"Waiting":"No bracket yet";
  const groups={};for(const m of b.matches)(groups[col(m)]=groups[col(m)]||[]).push(m);
  $("cols").innerHTML=Object.entries(groups).map(([t,ms])=>'<div class="col"><h2>'+esc(t)+"</h2>"+ms.map(m=>{
   const cls=p=>m.winner?(m.winner===p?"w":"l"):"";
-  const btn=p=>ADMIN&&p?' <button data-m="'+esc(m.id)+'" data-w="'+esc(p)+'">win</button>':"";
-  return '<div class="m '+m.state+'"><div class="p '+cls(m.a)+'"><span>'+esc(m.a||"—")+"</span>"+btn(m.a)+'</div><div class="p '+cls(m.b)+'"><span>'+esc(m.b||"—")+"</span>"+btn(m.b)+'</div><div class="tag">'+esc(m.label)+(m.how?" · "+esc(m.how):"")+(m.state==="playing"?" · now":"")+(m.state==="disputed"?" · disputed":"")+"</div></div>"}).join("")+"</div>").join("");
+  const b1=(p,a,t)=>' <button data-a="'+a+'" data-m="'+esc(m.id)+'" data-w="'+esc(p)+'">'+t+"</button>";
+  const btn=p=>!ADMIN||!p?"":m.best_of&&!m.winner?b1(p,"game","game")+b1(p,"result","set"):b1(p,"result","win");
+  const sc=i=>m.score?"<span>"+m.score[i]+"</span>":"";
+  return '<div class="m '+m.state+'"><div class="p '+cls(m.a)+'"><span>'+esc(m.a||"—")+"</span>"+sc(0)+btn(m.a)+'</div><div class="p '+cls(m.b)+'"><span>'+esc(m.b||"—")+"</span>"+sc(1)+btn(m.b)+'</div><div class="tag">'+esc(m.label)+(m.best_of?" · best of "+m.best_of:"")+(m.how?" · "+esc(m.how):"")+(m.state==="playing"&&m.best_of?" · game "+m.game:"")+(m.state==="playing"?" · now":"")+(m.state==="disputed"?" · disputed":"")+"</div></div>"}).join("")+"</div>").join("");
  if(ADMIN&&!$("players").value){$("players").value=b.players.join("\n");$("fmt").value=b.format;$("arena").value=b.arena;$("owner").value=b.owner}
 }
-document.addEventListener("click",e=>{const t=e.target;if(t.dataset&&t.dataset.m)admin({action:"result",match:t.dataset.m,winner:t.dataset.w})});
+document.addEventListener("click",e=>{const t=e.target;if(t.dataset&&t.dataset.m)admin({action:t.dataset.a,match:t.dataset.m,winner:t.dataset.w})});
 if(ADMIN){$("admin").hidden=false;
- $("setup").onclick=()=>{if(confirm("Start a new bracket? Results so far are cleared."))admin({action:"setup",players:$("players").value.split("\n"),format:$("fmt").value,arena:$("arena").value,owner:$("owner").value})};
+ $("setup").onclick=()=>{if(confirm("Start a new bracket? Results so far are cleared."))admin({action:"setup",players:$("players").value.split("\n"),format:$("fmt").value,arena:$("arena").value,owner:$("owner").value,best_of:+$("bo").value,finals_best_of:$("fbo").value?+$("fbo").value:null})};
  $("savearena").onclick=()=>admin({action:"arena",arena:$("arena").value,owner:$("owner").value});}
 async function load(){try{draw(await (await fetch("/bracket.json",{cache:"no-store"})).json())}catch(e){}}
 load();setInterval(load,3000);

@@ -524,11 +524,12 @@ void online_rb_counts(long long *back, long long *left_out, long long *differ) {
 /* ---- the arena bracket (tools/bracket.py) ---------------------------------------------------
  * With SSBU_ARENA_BRACKET=1, a thread asks the lobby (its HTTP shares the lobby's port) where this
  * player goes in the Battle Arena every 2 s: GET /arena/assignment?name=<this player>, of which it
- * keeps "match", "place" and "role". online_arena_assignment hands the latest out, with a number
- * that changes when the answer does (runtime/hle_trace.c turns it into a place request). */
+ * keeps "match", "place", "role" and "game". online_arena_assignment hands the latest out, with a
+ * number that changes when the answer does (runtime/hle_trace.c turns it into a place request): in a
+ * best-of set the same match comes again with the next game, so its two players start it again. */
 static SRWLOCK ab_lock = SRWLOCK_INIT;
 static long ab_seq;
-static int ab_place;
+static int ab_place, ab_game;
 static char ab_role[8], ab_match[24], ab_opponent[48];
 
 static int http_request(const char *method, const char *path, const char *body, char *out, int cap) {
@@ -585,22 +586,28 @@ static int json_member(const char *js, const char *key, char *out, int cap) {
 /* ---- the tourney table (runtime/hle_tourney_ui.c) -------------------------------------------
  * The bracket as GET /bracket.json has it, fetched when the table should show: when this player is
  * first placed in a bracket, and once a result it reported is decided ("confirmed" in the answer, or
- * else asked again every 2 s until the match is "done"). online_arena_table hands the latest out with
+ * else asked again every 2 s until the match is "done", or its set has gone on to the next game: no
+ * table then). online_arena_table hands the latest out with
  * a number that changes each time, and the assignment's number from before it (the table goes again
  * once the assignment has moved on: the next place request). */
 #define TABLE_JSON (64 * 1024)
 static char *at_json;
 static long at_seq, at_after;
 
-static int arena_table_fetch(long after, const char *match) {
+/* 1 fetched; 0 not (yet); 2 not, for good: the match's set is past game GAME and goes on. */
+static int arena_table_fetch(long after, const char *match, int game) {
     char *js = malloc(TABLE_JSON);
     if (!js) return 0;
     int ok = http_request("GET", "/bracket.json", NULL, js, TABLE_JSON) > 0;
-    if (ok && match) {   /* (its row: {"id": M, "label", "a", "b", "state", ...}) */
+    if (ok && match) {   /* (its row: {"id": M, "label", "a", "b", "state", ..., "game": N while not done}) */
         char pat[48];
         snprintf(pat, sizeof pat, "\"id\": \"%s\"", match);
         const char *row = strstr(js, pat), *st = row ? strstr(row, "\"state\": \"") : NULL;
         ok = st && !strncmp(st + 10, "done\"", 5);
+        if (!ok && st && game) {
+            const char *next = strstr(st, "\"id\": "), *g = strstr(st, "\"game\": ");
+            if (g && (!next || g < next) && atoi(g + 8) > game) { free(js); return 2; }
+        }
     }
     if (!ok) { free(js); return 0; }
     AcquireSRWLockExclusive(&ab_lock);
@@ -635,24 +642,26 @@ static DWORD WINAPI arena_bracket_thread(void *arg) {
                                                                      : snprintf(enc + e, sizeof enc - e, "%%%02X", *c);
         enc[e] = 0;
         snprintf(path, sizeof path, "/arena/assignment?name=%s", enc);
-        char place[8] = "", role[8] = "", match[24] = "", opponent[48] = "";
+        char place[8] = "", role[8] = "", match[24] = "", opponent[48] = "", game[8] = "";
         if (http_request("GET", path, NULL, buf, sizeof buf) > 0 && json_member(buf, "place", place, sizeof place)) {
             json_member(buf, "role", role, sizeof role);
             json_member(buf, "match", match, sizeof match);
             json_member(buf, "opponent", opponent, sizeof opponent);
+            json_member(buf, "game", game, sizeof game);
             if (!strcmp(match, "null")) match[0] = 0;
             long placed = -1;   /* (the number before this player's first place in a bracket) */
             AcquireSRWLockExclusive(&ab_lock);
-            if (atoi(place) != ab_place || strcmp(role, ab_role) || strcmp(match, ab_match)) {
+            if (atoi(place) != ab_place || strcmp(role, ab_role) || strcmp(match, ab_match) || atoi(game) != ab_game) {
                 if (!ab_place && atoi(place)) placed = ab_seq;
                 ab_place = atoi(place);
+                ab_game = atoi(game);
                 snprintf(ab_role, sizeof ab_role, "%s", role);
                 snprintf(ab_match, sizeof ab_match, "%s", match);
                 snprintf(ab_opponent, sizeof ab_opponent, "%s", opponent);
                 ab_seq++;
             }
             ReleaseSRWLockExclusive(&ab_lock);
-            if (placed >= 0) arena_table_fetch(placed, NULL);
+            if (placed >= 0) arena_table_fetch(placed, NULL, 0);
         }
         Sleep(2000);
     }
@@ -680,10 +689,11 @@ long online_arena_assignment(int *place, char *role, int rcap) {
     return seq;
 }
 
-/* This player's result of the match it was assigned (won or lost), to POST /arena/result: once,
- * from a thread of its own; 0 when there is no match to report. Then the bracket for the tourney
- * table, once the match is decided (2 minutes at most: bracket.py takes a lone report after 60 s). */
-typedef struct { char body[512], match[24]; long after; } ArenaReport;
+/* This player's result of the match (the set's game) it was assigned (won or lost), to POST
+ * /arena/result: once, from a thread of its own; 0 when there is no match to report. Then the
+ * bracket for the tourney table, once the match is decided (2 minutes at most: bracket.py takes a
+ * lone report after 60 s). */
+typedef struct { char body[512], match[24]; long after; int game; } ArenaReport;
 static DWORD WINAPI arena_report_thread(void *arg) {
     ArenaReport *r = arg;
     char out[2048], state[16] = "";
@@ -691,11 +701,11 @@ static DWORD WINAPI arena_report_thread(void *arg) {
     fprintf(stderr, "[arena] result %s: %s -> %s\n", r->body, ok ? "sent" : "not taken", ok ? out : "");
     fflush(stderr);
     if (ok) json_member(out, "state", state, sizeof state);
-    if (ok && !strcmp(state, "confirmed")) arena_table_fetch(r->after, r->match);
+    if (ok && !strcmp(state, "confirmed")) arena_table_fetch(r->after, r->match, r->game);
     else if (ok)
         for (int i = 0; i < 60; i++) {
             Sleep(2000);
-            if (arena_table_fetch(r->after, r->match)) break;
+            if (arena_table_fetch(r->after, r->match, r->game)) break;
         }
     free(r);
     return 0;
@@ -711,12 +721,14 @@ static void json_escape(char *out, int cap, const char *in) {
     out[n] = 0;
 }
 int online_arena_report(int won) {
-    char match[24], opp[48], me[48], m[64], o[112], i[112];
+    char match[24], opp[48], me[48], m[64], o[112], i[112], g[24] = "";
     long after;
+    int game;
     AcquireSRWLockExclusive(&ab_lock);
     snprintf(match, sizeof match, "%s", ab_match);
     snprintf(opp, sizeof opp, "%s", ab_opponent);
     after = ab_seq;
+    game = ab_game;
     ReleaseSRWLockExclusive(&ab_lock);
     snprintf(me, sizeof me, "%s", net_player_name() ? net_player_name() : "");
     if (!match[0] || !opp[0] || !me[0]) return 0;
@@ -725,10 +737,12 @@ int online_arena_report(int won) {
     json_escape(i, sizeof i, me);
     ArenaReport *r = malloc(sizeof *r);
     if (!r) return 0;
-    snprintf(r->body, sizeof r->body, "{\"match\": \"%s\", \"winner\": \"%s\", \"loser\": \"%s\", \"reporter\": \"%s\"}",
-             m, won ? i : o, won ? o : i, i);
+    if (game > 0) snprintf(g, sizeof g, ", \"game\": %d", game);
+    snprintf(r->body, sizeof r->body, "{\"match\": \"%s\", \"winner\": \"%s\", \"loser\": \"%s\", \"reporter\": \"%s\"%s}",
+             m, won ? i : o, won ? o : i, i, g);
     snprintf(r->match, sizeof r->match, "%s", match);
     r->after = after;
+    r->game = game;
     HANDLE t = CreateThread(NULL, 0, arena_report_thread, r, 0, NULL);
     if (!t) { free(r); return 0; }
     CloseHandle(t);
