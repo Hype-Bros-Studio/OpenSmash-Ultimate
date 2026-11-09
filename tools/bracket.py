@@ -311,7 +311,7 @@ class Bracket:
         g = extra.get("game") if extra else None
         g = g if isinstance(g, int) and not isinstance(g, bool) else None
         if g is not None and mid in self.state["matches"] and 1 <= g <= len(self.games(mid)):
-            return 200, "confirmed"     # (a late report of a game decided already)
+            return 200, "confirmed"     # (a late report of a game decided already: the game stands, whoever it names)
         if mid != self.current() or g is not None and g != self.game(mid):
             return 409, "not being played"
         w, lo, by = self._name_in(winner, mid), self._name_in(loser, mid), self._name_in(reporter, mid)
@@ -365,7 +365,7 @@ class Bracket:
         for k in ("stocks", "percent"):
             if rep and k in rep:
                 r[k] = rep[k]
-        if self.state["matches"][mid].get("best_of", 1) > 1:
+        if self.state["matches"][mid].get("best_of", 1) > 1 and how != "organizer":   # (the organizer's set: no score)
             won = sum(x["winner"] == winner for x in self.games(mid))
             r["score"] = [won, len(self.games(mid)) - won]
         self.state["results"][mid] = r
@@ -449,7 +449,11 @@ class Bracket:
             row = {"id": mid, "label": m["label"], "a": a or "", "b": b or "", "state": st}
             if m.get("best_of", 1) > 1:   # the set: its length, the games' winners and the score (a's, b's)
                 games = [x["winner"] for x in self.games(mid)]
-                row.update(best_of=m["best_of"], games=games, score=[games.count(a), games.count(b)])
+                row.update(best_of=m["best_of"], games=games)
+                if not res:
+                    row["score"] = [games.count(a), games.count(b)]
+                elif "score" in res:
+                    row["score"] = res["score"] if res["winner"] == a else res["score"][::-1]
             if not res:
                 row["game"] = self.game(mid)
             if res:
@@ -584,8 +588,8 @@ textarea,input,select{background:var(--card);color:var(--text);border:1px solid 
  <b>Organizer</b>
  <label>Players, best seed first, one per line (their online names)</label><textarea id="players" rows="8"></textarea>
  <label>Format</label><select id="fmt"><option value="double">Double elimination</option><option value="single">Single elimination</option></select>
- <label>Sets: best of</label><select id="bo"><option>1</option><option>3</option><option>5</option></select>
- <label>Finals (the final; winners, losers and grand finals): best of</label><select id="fbo"><option value="">the same</option><option>3</option><option>5</option><option>7</option></select>
+ <label>Sets: best of</label><select id="bo"><option>1</option><option>3</option><option>5</option><option>7</option><option>9</option></select>
+ <label>Finals (the final; winners, losers and grand finals): best of</label><select id="fbo"><option value="">the same</option><option>1</option><option>3</option><option>5</option><option>7</option><option>9</option></select>
  <label>Arena ID</label><input id="arena">
  <label>Arena owner (online name; presses + to start)</label><input id="owner">
  <p><button id="setup">Start a new bracket</button> <button id="savearena">Save arena only</button> <span id="msg" class="err"></span></p>
