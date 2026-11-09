@@ -143,6 +143,9 @@ static void drop_holder(Cpu *c, u64 sp) {
  *   local E                 this player's entrant
  *   me M                    this player's match in the round being played
  *   match R M W E...        round R's match M: winner entrant W (-1: not played), then (round 0) its entrants
+ *   name E TEXT             entrant E's name (UTF-8, up to 10 UTF-16 units shown)
+ * Every round-0 match needs an entrant, and every match up to the round being played needs its children's
+ * winners: the table's bracket (main+0x1d07780) does .at(0) on them.
  * Matches are made as the tourney's sequence makes them (main+0x237ee50, at 0x237f3c0): 0x60 bytes, owned by
  * shared_ptrs (control blocks {vtable 0x50b9a40, owners - 1, weak, match}) from their round's vector at
  * T+8+R*0x18 and their parent's children at +0x10, and holding their parent at +0x28. */
@@ -150,10 +153,13 @@ static void drop_holder(Cpu *c, u64 sp) {
 #define MAX_ROUNDS 5
 #define MAX_MATCHES 32
 #define MAX_ENTRANTS 8
+#define MAX_EVENTS 64
+#define PLAYER_INIT 0x17abd00     /* an entrant's player settings (+0x28 and +0x1f0), as the builder makes them */
 typedef struct { int winner, n, e[MAX_ENTRANTS]; u64 m, ctrl; } TuiMatch;
 static struct {
     int cls, events, local, me, rounds, count[MAX_ROUNDS];
     TuiMatch match[MAX_ROUNDS][MAX_MATCHES];
+    char name[MAX_EVENTS][48];
 } br;
 
 static int read_bracket(void) {
@@ -165,6 +171,11 @@ static int read_bracket(void) {
     char line[256];
     while (fgets(line, sizeof line, f)) {
         int r, m, w, k = 0, n = 0;
+        if (sscanf(line, "name %d %n", &r, &n) == 1 && n > 0 && r >= 0 && r < MAX_EVENTS) {
+            snprintf(br.name[r], sizeof br.name[r], "%s", line + n);
+            br.name[r][strcspn(br.name[r], "\r\n")] = 0;
+            continue;
+        }
         if (sscanf(line, "class %d", &br.cls) == 1 || sscanf(line, "events %d", &br.events) == 1 ||
             sscanf(line, "local %d", &br.local) == 1 || sscanf(line, "me %d", &br.me) == 1) continue;
         if (sscanf(line, "match %d %d %d%n", &r, &m, &w, &n) < 3 || r < 0 || r >= MAX_ROUNDS || m < 0 || m >= MAX_MATCHES)
@@ -177,7 +188,29 @@ static int read_bracket(void) {
         if (m + 1 > br.count[r]) br.count[r] = m + 1;
     }
     fclose(f);
+    if (br.events > MAX_EVENTS) br.events = MAX_EVENTS;
     return br.rounds > 0 && br.events > 0;
+}
+
+/* A player's name in an entrant: {FNV hash of the UTF-16, length, UTF-16 (10 at most) and its end}. */
+static void put_name16(u64 rec, const char *s) {
+    u32 h = 0x811c9dc5u, n = 0;
+    const u8 *p = (const u8 *)s;
+    while (*p && n < 10) {
+        u32 ch = *p++;
+        if (ch >= 0xc0) {   /* (UTF-8: the BMP only) */
+            int more = ch >= 0xf0 ? 3 : ch >= 0xe0 ? 2 : 1;
+            ch &= 0x3f >> more;
+            for (; more && (*p & 0xc0) == 0x80; more--) ch = (ch << 6) | (*p++ & 0x3f);
+            if (ch > 0xffff) ch = '?';
+        }
+        *P(u16, rec + 0xc + n * 2) = (u16)ch;
+        h = (h * 0x89) ^ ch;
+        n++;
+    }
+    *P(u16, rec + 0xc + n * 2) = 0;
+    *P(u32, rec + 4) = h;
+    *P(u32, rec + 8) = n;
 }
 
 static u64 vec_alloc(Cpu *c, u64 at, u64 n, u64 size, u64 sp) {   /* a vector's begin/end/cap at `at` */
@@ -196,8 +229,17 @@ static void fill_bracket(Cpu *c, u64 sp) {
     *P(u32, t + 0x98) = shape[0];
     u64 ev = vec_alloc(c, t + 0x80, br.events, 0x820, sp);
     for (int i = 0; i < br.events; i++) {
-        *P(u32, ev + i * 0x820 + 0x81c) = i + 1;   /* (stands for the player's id) */
-        *P(u8, ev + i * 0x820 + 0x810) = i == br.local;
+        u64 e = ev + i * 0x820;
+        for (int k = 0; k < 2; k++) {              /* its two players (the second for teams), at +0 and +0x1c8 */
+            u64 rec = e + k * 0x1c8;
+            *P(u8, rec) = 0xff;
+            put_name16(rec, k ? "" : br.name[i]);
+            *P(u32, rec + 0x24) = 1;
+            call4(c, base + PLAYER_INIT, rec + 0x28, 0, 0, 0, sp);
+        }
+        *P(u32, e + 0x814) = br.name[i][0] != 0;   /* its players (main+0x239dd10 loads each one's fighter); 0: a bye */
+        *P(u32, e + 0x81c) = i + 1;   /* (stands for the player's id) */
+        *P(u8, e + 0x810) = i == br.local;
     }
     for (int r = 0; r < br.rounds; r++)
         for (int m = 0; m < br.count[r]; m++) {
