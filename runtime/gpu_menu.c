@@ -89,6 +89,7 @@ enum {
     R_LOBBY, R_MATCH_FIND, R_MATCH_CANCEL, R_ROOMS,
     R_LANGUAGE, R_VOLUME, R_RESTART, R_QUIT, R_REMAP_BACK, R_MODS_STATE, R_MOD_CODE, R_MODS_OFF, R_LAN_ROOMS,
     R_KEYS, R_KEYS_BACK, R_KEYS_RESET, R_RENDERER, R_ROOMS_PREV, R_ROOMS_NEXT, R_ROOMS_GAME_PAGE, R_RUNAHEAD, R_NET_ROLLBACK,
+    R_NET_HOST_MODS_DL,
     R_ROOM_FIRST = 60,    /* + the room's place on the page of rooms shown (ROOM_PAGE at most) */
     R_REMAP_FIRST = 100,  /* + console button */
     R_MOD_FIRST = 200,    /* + the mod's place in mods.json (MENU_MODS at most) */
@@ -138,7 +139,7 @@ static volatile LONG osk_state;
 static char osk_title[96], osk_text[64];
 static int osk_max = 32;
 
-static struct { int mode; char custom[128], code[40], name[40]; int direct, protocol, rollback; } net;
+static struct { int mode; char custom[128], code[40], name[40]; int direct, protocol, rollback, host_mods_dl; } net;
 enum { NET_PUBLIC, NET_PRIVATE, NET_CUSTOM, NET_OFFLINE, NET_LAN, NET_MODE_COUNT };
 static const char *const NET_MODES[NET_MODE_COUNT] = {"public lobby", "private lobby (a code)", "your own server", "offline",
                                                       "this network (LAN)"};
@@ -161,6 +162,8 @@ static void net_load(void) {
     char protocol[16] = "";   /* (net_relay.c reads it the same way) */
     int v = settings_line_read(config_path(CONFIG_ONLINE_PROTOCOL), protocol, sizeof protocol) ? atoi(protocol) : 0;
     net.protocol = v == NET_PROTOCOL || v == NET_PROTOCOL_V3 ? v : NET_PROTOCOL_DEFAULT;
+    char dl[16] = "";   /* (hle_hostmods.c's download_wanted reads it the same way: off unless "on") */
+    net.host_mods_dl = settings_line_read(config_path(CONFIG_ONLINE_HOST_MODS_DOWNLOAD), dl, sizeof dl) && !_strnicmp(dl, "on", 2);
 }
 
 static void net_save_server(void) {
@@ -777,6 +780,11 @@ static void build(void) {
             else if (!settings_online()) snprintf(rows[i].note, sizeof rows[i].note, "for Play SSBU");
         }
         add_protocol_row();   /* (read with any lobby: no launcher's note) */
+        r = add(R_NET_HOST_MODS_DL, K_CHOICE, W_RESTART, "Download host's mods",
+                "On: when a host shares their mods with you (SSBU_HOST_MODS) and allows it (hostmods.py serve --open), they are "
+                "saved into your mods/ folder, turned off until you enable them. A host's sealed mods are never saved.");
+        snprintf(r->value, sizeof r->value, "%s", on_off(net.host_mods_dl));
+        note_env(r, "SSBU_HOST_MODS_DOWNLOAD");
         if (restart_pending) add(R_RESTART, K_ACTION, W_NONE, "Restart now", "Starts the game again, with the changes. A match in progress is lost.");
         break;
     }
@@ -1010,6 +1018,10 @@ static void change(const Row *row, int dir) {
     case R_NET_ROLLBACK:
         net.rollback = !net.rollback;
         settings_line_write(config_path(CONFIG_ONLINE_ROLLBACK), net.rollback ? "on" : "off");
+        break;
+    case R_NET_HOST_MODS_DL:
+        net.host_mods_dl = !net.host_mods_dl;
+        settings_line_write(config_path(CONFIG_ONLINE_HOST_MODS_DOWNLOAD), net.host_mods_dl ? "on" : "off");
         break;
     case R_NET_PROTOCOL:
         net.protocol = net.protocol == NET_PROTOCOL_V3 ? NET_PROTOCOL : NET_PROTOCOL_V3;

@@ -39,10 +39,15 @@
 void skyline_load_plugins(Cpu *c) { (void)c; }
 void native_mods_load(void) {}   /* (hle_native_mods.c: no mods here) */
 void select_screen_install(void) {}   /* (hle_select_screen.c: no game here) */
+void trace_install(void) {}   /* (hle_trace.c: no research tracer here) */
 int skyline_provides(const char *path) { (void)path; return 0; }
 void skyline_mods_mounted(void) {}
 u64 rt_symbol(const char *name) { (void)name; return 0; }
 int kernel_rb_switch(void) { return 0; }   /* (kernel.c: rollback's savestates, off) */
+int hostmods_on(void) { return 0; }   /* (hle_hostmods.c: no host mods here) */
+void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n, const u8 **map, u64 *map_len, const u8 **overlay, u64 *overlay_len) {
+    (void)vanilla_map; (void)sources; (void)n; (void)map; (void)map_len; (void)overlay; (void)overlay_len;
+}
 void rb_guest_writing(void *p, u64 n) { (void)p; (void)n; }   /* (hle_rb_state.c: the state map, off) */
 u64 rt_native(GuestFn *fn, const char *name) { (void)fn; (void)name; return 0; }
 u64 rt_hook_function(u64 target, u64 replace) { (void)target; (void)replace; return 0; }

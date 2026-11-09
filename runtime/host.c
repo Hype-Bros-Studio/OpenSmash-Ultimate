@@ -15,6 +15,7 @@
 #include <stdlib.h>
 
 #include "host.h"
+#include "memdll.h"
 #include "clock.h"
 #include "display.h"
 #include "hookable.h"
@@ -871,20 +872,29 @@ int kernel_rb_switch(void);                 /* (kernel.c: SSBU_RB, rollback netp
 void rb_mem_note(u64 at, u64 size);         /* (kernel.c: memory a rollback savestate copies whole) */
 
 /* Map module m's image at its guest address and make its code reachable. */
+static const u8 *extra_image_of(const RtModule *mod, u64 *len);
+
 static void map_module(u32 m, const char *dir) {
     const RtModule *mod = modules[m];
     char path[1024];
     snprintf(path, sizeof path, "%s/%s.reloc.bin", dir, mod->name);
-    FILE *f = fopen(path, "rb");
-    if (!f) rt_fatal("cannot open %s", path);
+    u64 mem_len = 0;
+    const u8 *mem = extra_image_of(mod, &mem_len);   /* (a host's plugin: its image in the pack, hle_hostmods.c) */
+    FILE *f = mem ? NULL : fopen(path, "rb");
+    if (!f && !mem) rt_fatal("cannot open %s", path);
     u64 size = (mod->image_size + 0xFFFF) & ~0xFFFFull, text = (mod->text_size + 0xFFF) & ~0xFFFull;
     u8 *image = VirtualAlloc(G2H(mod->base), size, MEM_COMMIT, PAGE_READWRITE);   /* inside its reservation (NROs) */
     /* (rollback netplay, SSBU_RB: modules' writes are watched, so a savestate copies only the pages written) */
     if (image != G2H(mod->base))
         image = VirtualAlloc(G2H(mod->base), size, MEM_RESERVE | MEM_COMMIT | (kernel_rb_switch() ? MEM_WRITE_WATCH : 0), PAGE_READWRITE);
     if (image != G2H(mod->base)) rt_fatal("cannot map %s at %#llx", mod->name, mod->base);
-    if (fread(image, 1, mod->image_size, f) < mod->text_size) rt_fatal("%s is truncated", path);
-    fclose(f);
+    if (mem) {
+        if (mem_len < mod->text_size || mem_len > mod->image_size) rt_fatal("host mods: %s's image isn't its size", mod->name);
+        memcpy(image, mem, mem_len);
+    } else {
+        if (fread(image, 1, mod->image_size, f) < mod->text_size) rt_fatal("%s is truncated", path);
+        fclose(f);
+    }
     /* code, read-only data, data: as the console maps them (plugins find a module's sections with
      * QueryMemory, hle_rtld.c). An NRO's header says where; the boot modules' are 13.0.5's. */
     u64 ro = text, data = text;
@@ -1020,7 +1030,18 @@ static void load(const char *dir) {
  * has linked in is left to that copy. */
 #define MAX_EXTRA_NROS 64
 static const RtModule *extra_nros[MAX_EXTRA_NROS];
+static const u8 *extra_image[MAX_EXTRA_NROS];   /* (a host's plugin's image, in memory; else NULL: the file) */
+static u64 extra_image_len[MAX_EXTRA_NROS];
 static u32 extra_nro_count;
+
+static const u8 *extra_image_of(const RtModule *mod, u64 *len) {
+    for (u32 k = 0; k < extra_nro_count; k++)
+        if (extra_nros[k] == mod && extra_image[k]) { *len = extra_image_len[k]; return extra_image[k]; }
+    return NULL;
+}
+
+int hostmods_on(void);   /* (hle_hostmods.c) */
+const char *hostmods_plugin(u32 i, const u8 **lib, u64 *lib_len, const u8 **image, u64 *image_len);
 
 static u32 nro_count_all(void) { return rt_nro_count + extra_nro_count; }
 static const RtModule *nro_by_index(u32 k) {
@@ -1034,7 +1055,38 @@ static int nro_linked(const RtModule *mod) {
     return 0;
 }
 
+/* Host mods (hle_hostmods.c): the host's plugins from its pack, loaded from memory (hle_memdll.c),
+ * in place of this tree's own. */
+static void load_host_plugins(void) {
+#ifdef _WIN32
+    const u8 *lib, *image;
+    u64 lib_len, image_len;
+    const char *name;
+    for (u32 i = 0; (name = hostmods_plugin(i, &lib, &lib_len, &image, &image_len)) && extra_nro_count < MAX_EXTRA_NROS; i++) {
+        char why[256];
+        MemDll *dll = memdll_load(lib, (size_t)lib_len, why, sizeof why);
+        if (!dll) rt_fatal("host mods: the host's plugin %s didn't load: %s", name, why);
+        void (*bind)(GuestFn *(*)(u64), GuestFn *(*)(u64, RtCache *), void (*)(Cpu *, u64, const char *)) =
+            (void *)memdll_proc(dll, "ssbu_plugin_bind");
+        const RtModule *(*modfn)(void) = (void *)memdll_proc(dll, "ssbu_plugin_module");
+        if (!bind || !modfn) rt_fatal("host mods: the host's plugin %s has no plugin entry", name);
+        bind(rt_lookup, rt_lookup_cached, rt_trap);
+        const RtModule *mod = modfn();
+        if (!mod || strcmp(mod->name, name)) rt_fatal("host mods: the host's plugin %s isn't the module it says", name);
+        if (nro_linked(mod)) {   /* (this game has it built in: that copy runs) */
+            fprintf(stderr, "[plugins] %s (host mods): this game's own copy runs\n", name);
+            continue;
+        }
+        extra_image[extra_nro_count] = image;
+        extra_image_len[extra_nro_count] = image_len;
+        extra_nros[extra_nro_count++] = mod;
+        fprintf(stderr, "[plugins] %s will load from the host's mods (memory only)\n", name);
+    }
+#endif
+}
+
 static void load_plugin_dlls(void) {
+    if (hostmods_on()) { load_host_plugins(); return; }   /* (the host's plugins, not this tree's) */
 #ifdef _WIN32
     char list[1200], line[1200], root[1024];
     snprintf(list, sizeof list, "%s/../skyline/plugin_dlls.txt", rt_data_dir);

@@ -23,6 +23,7 @@ enum ConfigFile {
     CONFIG_ONLINE_DIRECT,   /* online_direct.txt */
     CONFIG_ONLINE_PROTOCOL, /* online_protocol.txt (net_relay.c: the netplay version) */
     CONFIG_ONLINE_ROLLBACK, /* online_rollback.txt (net_relay.c: "off" turns rollback netplay's default off) */
+    CONFIG_ONLINE_HOST_MODS_DOWNLOAD,   /* online_host_mods_download.txt (hle_hostmods.c: "on" saves an open host pack's mods) */
     CONFIG_FILES
 };
 

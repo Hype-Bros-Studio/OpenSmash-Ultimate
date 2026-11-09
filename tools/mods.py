@@ -2621,7 +2621,7 @@ def _apply(tree, image, lines, state, on, log):
     replace_file(tree.cfg + ".tmp", tree.cfg)
     written = disk_size(overlay_path)
     summary = {"mods": on, "files": changed, "added": added, "merged": merged, "skipped": skipped, "kept_shared": kept_shared,
-               "bytes": written}
+               "bytes": written, "csk": csk.digest(csk_entries)}
     with open(os.path.join(tree.work, "applied.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1)
     log(f"{len(on)} mod(s), {changed} files changed ({unshared} unshared, {reshared} reshared), {sum(len(v) for v in added.values())} added, "

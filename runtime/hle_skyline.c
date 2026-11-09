@@ -50,8 +50,10 @@ HLE(getRegionAddress) {
 
 /* Every hook target, "<module> <offset>" a line in <data dir>/../skyline/hooks.txt: the next build
  * makes the ones the game also calls directly reach their hooks too (tools/recomp.py hookable). */
+int hostmods_on(void);   /* (hle_hostmods.c: a host's mods run here - nothing of theirs is written to this tree) */
 static void note_hook_target(u64 target) {
     char where[96], line[128], path[1200];
+    if (hostmods_on()) return;
     rt_describe(target, where, sizeof where);
     char *plus = strchr(where, '+');
     if (!plus || strncmp(plus, "+0x", 3)) return;
@@ -68,6 +70,7 @@ static void note_hook_target(u64 target) {
 
 static void note_inline_point(u64 at) {
     char where[96], line[128], path[1200], have[128];
+    if (hostmods_on()) return;
     rt_describe(at, where, sizeof where);
     char *plus = strchr(where, '+');
     if (!plus || strncmp(plus, "+0x", 3)) return;
@@ -1125,7 +1128,7 @@ static int csk_loaded;   /* (the plugins' mains have run: each entry from now on
 /* csk.json: what is written so far, closed as a list - if it changed (then the mods need applying again) */
 static SRWLOCK csk_lock = SRWLOCK_INIT;
 static void csk_publish(void) {
-    if (!csk) return;
+    if (!csk || hostmods_on()) return;
     AcquireSRWLockExclusive(&csk_lock);
     fflush(csk);
     FILE *in = fopen(csk_tmp, "rb");
@@ -1470,19 +1473,56 @@ static void fighter_setup(Cpu *c) {
 }
 
 /* ---- loading ----------------------------------------------------------------------- */
+int hostmods_on(void);                      /* (hle_hostmods.c) */
+const char *hostmods_plugin_list(void);
+
+/* The plugin list (plugins.txt) as text: the host's with host mods (its pack of version 2), else
+ * this tree's file; NULL if there is none. */
+static char *plugin_list_text(const char *path) {
+    const char *host = hostmods_on() ? hostmods_plugin_list() : NULL;
+    if (host) {
+        size_t n = strlen(host) + 1;
+        char *t = malloc(n);
+        if (t) memcpy(t, host, n);
+        return t;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = 4096, n = 0, got;
+    char *t = malloc(cap);
+    while (t && (got = fread(t + n, 1, cap - n - 1, f))) {
+        n += got;
+        if (n + 1 == cap) t = realloc(t, cap *= 2);
+    }
+    fclose(f);
+    if (t) t[n] = 0;
+    return t;
+}
+
+/* The next line of that text into line (cut at its size); 0 after the last. */
+static int list_line(const char **at, char *line, size_t size) {
+    if (!**at) return 0;
+    size_t k = strcspn(*at, "\n"), m = k < size - 1 ? k : size - 1;
+    memcpy(line, *at, m);
+    line[m] = 0;
+    *at += k + ((*at)[k] == '\n');
+    return 1;
+}
+
 void skyline_load_plugins(Cpu *c) {
     static int done;
     if (done++) return;
     char path[1200], line[256];
     snprintf(path, sizeof path, "%s/../skyline/plugins.txt", rt_data_dir);
-    FILE *f = fopen(path, "r");
-    if (!f && bench_on()) {   /* (no plugins: the bench's own hooks) */
+    char *list = plugin_list_text(path);
+    const char *at = list;
+    if (!list && bench_on()) {   /* (no plugins: the bench's own hooks) */
         fighter_setup_original = rt_hook_function(MAIN_BASE + FIGHTER_SETUP, rt_native(fighter_setup, "bench fighter set-up"));
         pre_battle_original = rt_hook_function(MAIN_BASE + PRE_BATTLE, rt_native(pre_battle, "csk pre-battle"));
         ui_path_original = rt_hook_function(MAIN_BASE + UI_PATH, rt_native(ui_path, "csk portrait paths"));
         return;
     }
-    if (!f) return;
+    if (!list) return;
     const char *q = getenv("SSBU_SKYLINE_LOG");
     quiet = q && *q == '0';
     u64 saved[31];
@@ -1499,8 +1539,8 @@ void skyline_load_plugins(Cpu *c) {
     /* The real Smashline among the plugins (a standard plugin, tools/skyline.py): it hooks what the
      * native one would, so the native one stays out */
     int real_smashline = 0;
-    while (fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n#")] = 0; if (!strcmp(line, "smashline")) real_smashline = 1; }
-    rewind(f);
+    while (list_line(&at, line, sizeof line)) { line[strcspn(line, "\r\n#")] = 0; if (!strcmp(line, "smashline")) real_smashline = 1; }
+    at = list;
     if (real_smashline) LOG("the real Smashline is listed: the native one is left out");
     for (u32 k = 0; k < NFACTORIES && !real_smashline; k++) {
         factory_original[k] = rt_hook_function(MAIN_BASE + FACTORIES[k].offset, rt_native(factory_hooks[k], "smashline create_agent"));
@@ -1517,7 +1557,13 @@ void skyline_load_plugins(Cpu *c) {
     }
     snprintf(csk_path, sizeof csk_path, "%s/../skyline/csk.json", rt_data_dir);
     snprintf(csk_tmp, sizeof csk_tmp, "%s.tmp", csk_path);
-    csk = fopen(csk_tmp, "w");
+#ifdef _WIN32
+#define NULL_DEVICE "NUL"
+#else
+#define NULL_DEVICE "/dev/null"
+#endif
+    /* (a host's mods: its pack already carries the entries - they're still read, for the costume redirects, but not saved) */
+    csk = fopen(hostmods_on() ? NULL_DEVICE : csk_tmp, "w");
     if (csk) fprintf(csk, "[\n");
     if (!real_smashline) {
     static_data_original = rt_hook_function(MAIN_BASE + STATIC_FIGHTER_DATA, rt_native(static_data, "smashline fighter articles"));
@@ -1539,7 +1585,7 @@ void skyline_load_plugins(Cpu *c) {
     static char names[64][128];
     static u64 bases[64];
     int count = 0, missing = 0;
-    while (fgets(line, sizeof line, f) && count < 64) {
+    while (list_line(&at, line, sizeof line) && count < 64) {
         line[strcspn(line, "\r\n#")] = 0;
         if (!*line) continue;
         u64 base = rt_load_nro_named(c, line);
@@ -1547,7 +1593,7 @@ void skyline_load_plugins(Cpu *c) {
         snprintf(names[count], sizeof names[count], "%s", line);
         bases[count++] = base;
     }
-    fclose(f);
+    free(list);
     if (missing && getenv("SSBU_SKYLINE_PROBE")) {
         fprintf(stderr, "[skyline] probe failed: %d plugins could not load\n", missing);
         fflush(stderr);

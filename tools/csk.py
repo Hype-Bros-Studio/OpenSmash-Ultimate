@@ -54,6 +54,12 @@ def load(tree):
     return [e for e in entries if e.get("plugin") not in off_modules]
 
 
+def digest(entries):
+    """A short hash of the entries (tools/mods.py records the applied ones' in applied.json)."""
+    import hashlib
+    return hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def targets(entries):
     """The database files the entries change."""
     return sorted({KINDS[e["kind"]][1] for e in entries if e.get("kind") in KINDS})

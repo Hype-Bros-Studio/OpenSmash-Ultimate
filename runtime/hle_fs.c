@@ -52,6 +52,8 @@ static struct {
     HANDLE file;
     u64 base;           /* plain: where the RomFS image starts in the NCA */
     HANDLE sources[ROM_SOURCES];   /* layered: the files the layers come from */
+    const u8 *mem[ROM_SOURCES];    /* layered: a source in memory instead (host mods' overlay: hle_hostmods.c) */
+    u64 mem_size[ROM_SOURCES];
     RomLayer *layers;
     u32 nlayers;
     u64 size;           /* layered: the image's size */
@@ -93,7 +95,12 @@ static int rom_read(u64 at, void *buf, u64 size) {
         u64 end = k + 1 < rom.nlayers ? rom.layers[k + 1].at : rom.size;
         u64 n = end - at < size ? end - at : size;
         if (l->src == LAYER_ZERO) memset(p, 0, n);
-        else if (!pread_all(rom.sources[l->src], l->off + (at - l->at), p, n)) return 0;
+        else if (rom.mem[l->src]) {
+            u64 from = l->off + (at - l->at);
+            if (from > rom.mem_size[l->src] || n > rom.mem_size[l->src] - from) return 0;
+            rb_guest_writing(p, n);
+            memcpy(p, rom.mem[l->src] + from, n);
+        } else if (!pread_all(rom.sources[l->src], l->off + (at - l->at), p, n)) return 0;
         p += n; at += n; size -= n;
     }
     return 1;
@@ -106,11 +113,28 @@ static HANDLE rom_file_open(const char *path) {
 }
 
 /* romfs.cfg: "<file>\n<byte offset>\n" (the image in place in one file), or "layered\n<layer
- * map>\n<source 0>\n<source 1>...\n" (tools/update.py). */
+ * map>\n<source 0>\n<source 1>...\n" (tools/update.py).
+ *
+ * With host mods (SSBU_HOST_MODS, hle_hostmods.c) the game's own data (romfs_vanilla.cfg, else
+ * romfs.cfg) is read through the host's modded layer map, its overlay a source in memory. */
+int hostmods_on(void);
+int hostmods_mods_entry(const char *rest, const u8 **data, u64 *size);
+int hostmods_mods_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx);
+void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n, const u8 **map, u64 *map_len,
+                    const u8 **overlay, u64 *overlay_len);
 static void rom_open(void) {
     char cfg[1024], path[1024];
-    snprintf(cfg, sizeof cfg, "%s/romfs.cfg", rt_data_dir);
-    FILE *f = fopen(cfg, "r");
+    static char source_paths[ROM_SOURCES][1024];
+    int host = hostmods_on();
+    FILE *f = NULL;
+    if (host) {
+        snprintf(cfg, sizeof cfg, "%s/romfs_vanilla.cfg", rt_data_dir);
+        f = fopen(cfg, "r");
+    }
+    if (!f) {
+        snprintf(cfg, sizeof cfg, "%s/romfs.cfg", rt_data_dir);
+        f = fopen(cfg, "r");
+    }
     if (!f || !fgets(path, sizeof path, f)) rt_fatal("cannot read %s", cfg);
     path[strcspn(path, "\r\n")] = 0;
     if (!strcmp(path, "layered")) {
@@ -120,21 +144,44 @@ static void rom_open(void) {
         u32 n = 0;
         while (n < ROM_SOURCES && fgets(path, sizeof path, f)) {
             path[strcspn(path, "\r\n")] = 0;
-            if (path[0]) rom.sources[n++] = rom_file_open(path);
+            if (path[0]) {
+                snprintf(source_paths[n], sizeof source_paths[n], "%s", path);
+                rom.sources[n++] = rom_file_open(path);
+            }
         }
-        HANDLE m = rom_file_open(map);
         u8 head[24];
-        if (!pread_all(m, 0, head, sizeof head) || memcmp(head, "SSBUROM1", 8)) rt_fatal("%s: not a layer map", map);
-        memcpy(&rom.size, head + 8, 8);
-        memcpy(&rom.nlayers, head + 16, 4);
-        rom.layers = malloc(sizeof *rom.layers * rom.nlayers);
-        if (!rom.nlayers || !pread_all(m, sizeof head, rom.layers, sizeof *rom.layers * rom.nlayers))
-            rt_fatal("%s: cannot read its %u layers", map, rom.nlayers);
-        CloseHandle(m);
+        if (host) {   /* the host's layer map, over this game's sources and the overlay (in memory) */
+            const u8 *hmap, *overlay;
+            u64 hmap_len, overlay_len;
+            if (n >= ROM_SOURCES) rt_fatal("%s: %u sources, and host mods need one more", cfg, n);
+            hostmods_romfs(map, (const char (*)[1024])source_paths, n, &hmap, &hmap_len, &overlay, &overlay_len);
+            rom.mem[n] = overlay;
+            rom.mem_size[n] = overlay_len;
+            n++;
+            if (hmap_len < sizeof head || memcmp(hmap, "SSBUROM1", 8)) rt_fatal("host mods: the host's layer map isn't one");
+            memcpy(head, hmap, sizeof head);
+            memcpy(&rom.size, head + 8, 8);
+            memcpy(&rom.nlayers, head + 16, 4);
+            if (!rom.nlayers || hmap_len != sizeof head + sizeof *rom.layers * (u64)rom.nlayers)
+                rt_fatal("host mods: the host's layer map is cut short");
+            rom.layers = malloc(sizeof *rom.layers * rom.nlayers);
+            memcpy(rom.layers, hmap + sizeof head, sizeof *rom.layers * rom.nlayers);
+            snprintf(map, sizeof map, "the host's layer map");
+        } else {
+            HANDLE m = rom_file_open(map);
+            if (!pread_all(m, 0, head, sizeof head) || memcmp(head, "SSBUROM1", 8)) rt_fatal("%s: not a layer map", map);
+            memcpy(&rom.size, head + 8, 8);
+            memcpy(&rom.nlayers, head + 16, 4);
+            rom.layers = malloc(sizeof *rom.layers * rom.nlayers);
+            if (!rom.nlayers || !pread_all(m, sizeof head, rom.layers, sizeof *rom.layers * rom.nlayers))
+                rt_fatal("%s: cannot read its %u layers", map, rom.nlayers);
+            CloseHandle(m);
+        }
         for (u32 k = 0; k < rom.nlayers; k++)
             if (rom.layers[k].src != LAYER_ZERO && rom.layers[k].src >= n) rt_fatal("%s: layer %u names source %u of %u", map, k, rom.layers[k].src, n);
         fprintf(stderr, "[fs] RomFS: %llu bytes in %u layers from %u files (%s)\n", rom.size, rom.nlayers, n, cfg);
     } else {
+        if (host) rt_fatal("host mods: this game's data isn't read through a layer map (%s): run the installer again", cfg);
         if (fscanf(f, "%llu", &rom.base) != 1) rt_fatal("cannot read %s", cfg);
         rom.file = rom_file_open(path);
     }
@@ -190,9 +237,12 @@ typedef struct Handle {
     u32 mount;                /* the mount's id */
     HANDLE host;              /* host file */
     u64 offset, size;         /* rom file: data offset in the RomFS image and length */
+    const u8 *mem;            /* a file in memory (the host's mods:/ under host mods): its bytes, `size` long */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
 } Handle;
 static Handle handles[512];
+/* Under host mods mods:/ is the host's mods (hle_hostmods.c), not this game's own. */
+static int host_mods_mount(const struct Mount *m) { return !strcmp(m->name, "mods") && hostmods_on(); }
 static CRITICAL_SECTION lock;      /* the mount and handle tables */
 static CRITICAL_SECTION jlock;     /* save mounts' working state (taken before `lock`, never after) */
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -345,7 +395,9 @@ static void host_path(char *out, size_t n, struct Mount *m, const char *rest) {
         const char *sub = rest + 13 + (rest[13] == '/'), *end = strchr(sub, '/');
         size_t len = end ? (size_t)(end - sub) : strlen(sub);
         const char *root = len ? mod_root_named(sub, len) : NULL;
-        if (root) snprintf(out, n, "%s/../../mods/%s%s", rt_data_dir, root, end ? end : "");
+        if (hostmods_on())   /* (a host's mods run: this tree's own mods aren't on the SD card) */
+            snprintf(out, n, "%s/../skyline/sd/ultimate/no-mod/%s", rt_data_dir, rest);
+        else if (root) snprintf(out, n, "%s/../../mods/%s%s", rt_data_dir, root, end ? end : "");
         else snprintf(out, n, "%s/../../mods%s", rt_data_dir, rest + 13);
     } else
         snprintf(out, n, "%s/%s", m->root, rest);
@@ -1161,6 +1213,12 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
         LeaveCriticalSection(&jlock);
         if (r || !type) { c->x[0] = r ? r : R_PATH_NOT_FOUND; return; }
         st32(c->x[0], type == 2 ? DIR_ENTRY : FILE_ENTRY);
+    } else if (host_mods_mount(m)) {
+        const u8 *data;
+        u64 size;
+        int e = hostmods_mods_entry(rest, &data, &size);
+        if (!e) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        st32(c->x[0], e == 2 ? DIR_ENTRY : FILE_ENTRY);
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
@@ -1204,6 +1262,18 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         st64(c->x[0], v);
         c->x[0] = 0;
         return;
+    } else if (host_mods_mount(m)) {
+        const u8 *data;
+        u64 size;
+        if (hostmods_mods_entry(rest, &data, &size) != 1) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        if (mode & OPEN_WRITE) { c->x[0] = R_UNSUPPORTED; return; }
+        if (!data && size) {   /* (a big file: the pack has its name, not its bytes) */
+            fprintf(stderr, "[fs] mods:/%s: the host's pack doesn't carry this file's bytes\n", rest + strspn(rest, "/"));
+            c->x[0] = R_PATH_NOT_FOUND;
+            return;
+        }
+        h.mem = data;
+        h.size = size;
     } else {
         char path[1024];
         host_path(path, sizeof path, m, rest);
@@ -1229,6 +1299,7 @@ static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     if (offset < 0 || (u64)offset > total) return ~0ull;
     if (size > total - (u64)offset) size = total - (u64)offset;
     if (!size) return 0;
+    if (h->mem) { rb_guest_writing(buf, size); memcpy(buf, h->mem + offset, size); return size; }
     int ok = h->host ? pread_all(h->host, (u64)offset, buf, size) : rom_read(h->offset + (u64)offset, buf, size);
     return ok ? size : ~0ull;
 }
@@ -1356,6 +1427,12 @@ static void listing_free(Handle *h) {
     free(h->names); free(h->types); free(h->sizes);
 }
 
+typedef struct { Handle *h; int mode; } ModsListing;
+static void mods_list_add(void *p, const char *name, size_t len, int dir, u64 size) {   /* (hostmods_mods_list) */
+    ModsListing *ctx = p;
+    if (ctx->mode & (dir ? LIST_DIRS : LIST_FILES)) listing_add(ctx->h, name, len, dir ? DIR_ENTRY : FILE_ENTRY, size);
+}
+
 HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path, mode) */
     const char *rest;
     ready();
@@ -1376,12 +1453,15 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
                 listing_add(&h, rom_file(k)->name, rom_file(k)->name_len, FILE_ENTRY, rom_file(k)->size);
     } else if (!strcmp(m->name, "sd") && !_strnicmp(rest + strspn(rest, "/"), "ultimate/mods", 13) &&
                (!rest[strspn(rest, "/") + 13] || !strcmp(rest + strspn(rest, "/") + 13, "/"))) {
-        load_mods_list();   /* (the turned-on mods only) */
+        load_mods_list();   /* (the turned-on mods only; none of this tree's under a host's mods) */
         char flat[4200];
-        for (int i = 0; i < mods_count && (mode & LIST_DIRS); i++) {
+        for (int i = 0; i < mods_count && (mode & LIST_DIRS) && !hostmods_on(); i++) {
             mod_folder_name(flat, sizeof flat, mods_list[i]);
             listing_add(&h, flat, strlen(flat), DIR_ENTRY, 0);
         }
+    } else if (host_mods_mount(m)) {
+        ModsListing ctx = {&h, mode};
+        if (!hostmods_mods_list(rest, mods_list_add, &ctx)) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
     } else if (!strcmp(m->name, "mods")) {
         /* every turned-on mod's files as one tree: a later mod's entry over an earlier one's */
         load_mods_list();
