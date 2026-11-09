@@ -117,8 +117,11 @@ HLE(A64HookFunction) {
  * with the registers to read and change. Recompiled code has that call only where the build put it:
  * the address goes into hooks.txt as an inline point (tools/recomp.py inline_points), and the next
  * build calls rt_inline_hook there. */
+void fight_test_plugins_loaded(void);   /* (hle_fight_test.c) */
 typedef void InlineNative(Cpu *c, u64 arg);
-static struct { u64 at, callback; InlineNative *native; u64 arg; } inline_hooks[512];
+/* Plugins together set well over 512 (the CSK Collection alone sets hundreds), and one dropped
+ * here never runs: a full table once left CSK's fighter map empty and hung the random pick. */
+static struct { u64 at, callback; InlineNative *native; u64 arg; } inline_hooks[4096];
 static u32 inline_n;
 static void note_inline_point(u64 at);
 static u64 cave_site(u64 at);
@@ -128,6 +131,10 @@ static void add_inline_hook(u64 at, u64 callback, InlineNative *native, u64 arg)
         inline_hooks[inline_n].at = at; inline_hooks[inline_n].callback = callback;
         inline_hooks[inline_n].native = native; inline_hooks[inline_n].arg = arg;
         __atomic_store_n(&inline_n, inline_n + 1, __ATOMIC_RELEASE);
+    } else {
+        char a[96], b[96];
+        LOG("inline hook table full (%u): dropped the hook at %s -> %s", inline_n,
+            rt_describe(at, a, sizeof a), rt_describe(callback, b, sizeof b));
     }
     note_inline_point(at);
 }
@@ -1571,5 +1578,6 @@ void skyline_load_plugins(Cpu *c) {
     fprintf(stderr, "[skyline] plugins installed %u acmd scripts, %u status scripts, %u line callbacks\n", acmd_n, status_n, line_n);
     u64 csk_add = rt_symbol("add_chara_db_entry_info");
     if (csk_add && !csk_add_original) csk_add_original = rt_hook_function(csk_add, rt_native(csk_add_traced, "csk add_chara_db_entry_info"));
+    fight_test_plugins_loaded();   /* (hle_fight_test.c: SSBU_DEBUG_MATCH's picks, ahead of the plugins' hooks) */
     memcpy(c->x, saved, sizeof saved);
 }

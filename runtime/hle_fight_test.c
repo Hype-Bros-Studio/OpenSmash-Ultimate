@@ -303,6 +303,37 @@ static void record_after(Cpu *c, const u64 args[8], void *ctx) {
             ld8(rec + 0xa), ld8(rec + 0x19), ld8(rec + 0x79));
 }
 
+/* The select screens' writer of a player's pick (SELECTED_FIGHTER: records, x1 the player, x2 the
+ * pick, which is the panel state + 0x70: +0x8 its type, 3 none, +0x18 its ui_chara). A plugin that
+ * adds characters (the Clone Engine) turns a pick into its fighter kind there, which the record
+ * builder above is too late for: the record of a character no table of the game's has says kind 0.
+ * So with a debug match the pick a screen makes is changed to the match's character before it is
+ * written, and the plugin sees that one. Hooked once the plugins are in (the last hook on a
+ * function runs first); with SSBU_LINUX_DETOURS=1 on Linux unless the build made it an indirect
+ * call (hooks.txt). */
+static u64 selected_original;
+static void selected_fighter(Cpu *c) {
+    int idx = (int)c->x[1];
+    u64 pick = c->x[2];
+    if (pick && idx >= 0 && idx < 4 && match.name[idx][0] && ld32(pick + 0x8) != 3) {
+        char nm[64];
+        snprintf(nm, sizeof nm, "ui_chara_%s", match.name[idx]);
+        u64 want = 0xc100000000000000ull | fight_hash40(nm), have = ld64(pick + 0x18);
+        if ((have & 0xffffffffffull) != (want & 0xffffffffffull)) {
+            st64(pick + 0x18, want);
+            fprintf(stderr, "[fight] debug match: player %d's pick on the select screen %llx -> %llx (%s)\n", idx,
+                    (unsigned long long)have, (unsigned long long)want, match.name[idx]);
+        }
+    }
+    rt_call(c, selected_original);
+}
+void fight_test_plugins_loaded(void) {
+    if (!match_on || selected_original) return;
+    selected_original = rt_hook_function(GAME_ADDR(SELECTED_FIGHTER), rt_native(selected_fighter, "debug match pick"));
+    fprintf(stderr, "[fight] debug match: the select screens' picks go through the match's characters%s\n",
+            selected_original ? "" : " (NOT hooked)");
+}
+
 /* ---- SSBU_DEBUG_END --------------------------------------------------------------------- */
 static long long end_limit, shown;
 static int fights;

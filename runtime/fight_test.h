@@ -237,6 +237,10 @@ static inline uint32_t dm_player(const DebugMatch *m, int idx, uint8_t *st, uint
     }
     if (idx >= 0 && idx < 2 && m->name[idx][0] && type_was != 3) {
         dm_chara(st, m->name[idx]);
+        /* The screen's colour was for whatever it had picked; a character a plugin adds can have
+         * fewer than eight, and a colour it lacks loads no model (its articles' too). So costume 0
+         * unless c1/c2 say otherwise. */
+        st[0x90] = 0;
         if (idx == 1 && m->p2type >= 0) fight_put32(st + 0x78, (uint32_t)m->p2type);
         if (m->cpu > 0 && fight_get32(st + 0x78) == 1) { st[0x91] = (uint8_t)m->cpu; fight_put32(st + 0x224, 0xffffffffu); }
     }

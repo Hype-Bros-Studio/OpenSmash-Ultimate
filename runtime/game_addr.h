@@ -57,6 +57,7 @@
 #define GAME_ADDRESSES(X) \
     X(FRAME_END,             0x710386fc30, 0x71038701e0)   /* code */ \
     X(PLAYER_RECORD_BUILDER, 0x7101788260, 0x71017880c0)   /* code */ \
+    X(SELECTED_FIGHTER,      0x7103311190, 0x7103311740)   /* code */ \
     X(SCRIPT_RNG_ROOT,       0x71052c25b0, 0x71052c35b0)   /* data */ \
     X(MATCH_BLOCK,           0x71052c41b0, 0x71052c51b0)   /* data */ \
     X(STAGE_CHOICES,         0x71053097c0, 0x710530a7c0)   /* data */ \
