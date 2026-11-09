@@ -1,6 +1,6 @@
 """tools/bracket.py: the arena bracket the online lobby keeps. Brackets of every size from 2 to 16
 played out (single and double elimination, byes, the grand-final reset), players' reports (agreeing,
-disagreeing, one left alone), the organizer's fixes, the saved file, and the HTTP the players' games
+disagreeing, one left alone), best-of sets, the organizer's fixes, the saved file, and the HTTP the players' games
 and the page use, over loopback. Made-up names only."""
 import asyncio
 import json
@@ -126,12 +126,12 @@ class Reports(unittest.TestCase):
     def test_assignment(self):
         b = self.b
         self.assertEqual(b.assignment(" ann "), {"match": "W1-1", "opponent": "Di", "owner": True, "plus": True, "arena": "12345",
-                                                 "place": 1, "role": "start"})
+                                                 "place": 1, "role": "start", "game": 1})
         self.assertEqual(b.assignment("DI")["opponent"], "Ann")
         self.assertEqual((b.assignment("DI")["place"], b.assignment("DI")["role"]), (1, "join"))
         self.assertEqual((b.assignment("Zed")["place"], b.assignment("Zed")["role"]), (0, ""))
         self.assertEqual(b.assignment("Bo"), {"match": None, "opponent": "", "owner": False, "plus": False, "arena": "12345",
-                                              "place": 3, "role": ""})
+                                              "place": 3, "role": "", "game": 0})
         self.assertFalse(b.assignment("")["owner"])
 
     def test_owner_not_playing_still_presses_plus(self):
@@ -203,6 +203,96 @@ class Reports(unittest.TestCase):
         self.assertEqual(b.current(), "W1-1")
 
 
+class Sets(unittest.TestCase):
+    """Best-of sets: each game reported as a match was, the set to whoever won more than half."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.b = B.Bracket(clock=self.clock)
+        self.b.setup(["Ann", "Bo", "Cy", "Di"], "single", best=3, finals_best=5)
+
+    def game(self, mid, w, lo, g=None):
+        extra = {"game": g} if g is not None else None
+        self.assertEqual(self.b.report(mid, w, lo, w, extra), (200, "pending"))
+        return self.b.report(mid, w, lo, lo, extra)
+
+    def test_lengths(self):
+        self.assertEqual({k: m["best_of"] for k, m in self.b.state["matches"].items()}, {"W1-1": 3, "W1-2": 3, "W2-1": 5})
+        b = B.Bracket()
+        b.setup(NAMES[:4], "double", best=1, finals_best=3)
+        self.assertEqual({k for k, m in b.state["matches"].items() if m["best_of"] == 3}, {"W2-1", "L2-1", "GF", "GF2"})
+        self.assertTrue(all(m["label"] in B.FINALS for m in b.state["matches"].values() if m["best_of"] == 3))
+        for n in (0, 2, 11, "x"):
+            with self.assertRaises(ValueError):
+                b.setup(NAMES[:4], best=n)
+
+    def test_set_over_at_two_of_three(self):
+        b = self.b
+        self.assertEqual(self.game("W1-1", "Ann", "Di"), (200, "confirmed"))
+        self.assertEqual((b.current(), b.assignment("Di")["game"]), ("W1-1", 2))
+        row = b.view()["matches"][0]
+        self.assertEqual((row["state"], row["game"], row["games"], row["score"]), ("playing", 2, ["Ann"], [1, 0]))
+        self.game("W1-1", "Di", "Ann", 2)
+        self.assertEqual(b.assignment("Ann")["game"], 3)
+        self.game("W1-1", "Ann", "Di", 3)
+        self.assertEqual(b.state["results"]["W1-1"]["winner"], "Ann")
+        self.assertEqual(b.state["results"]["W1-1"]["score"], [2, 1])
+        self.assertEqual(b.current(), "W1-2")
+        self.assertEqual(b.view()["matches"][0]["score"], [2, 1])
+
+    def test_late_and_future_game_reports(self):
+        b = self.b
+        self.game("W1-1", "Ann", "Di", 1)
+        self.assertEqual(b.report("W1-1", "Ann", "Di", "Di", {"game": 1}), (200, "confirmed"))   # late: game 1 stands
+        self.assertEqual(b.report("W1-1", "Di", "Ann", "Di", {"game": 1}), (200, "confirmed"))
+        self.assertEqual(b.games("W1-1")[0]["winner"], "Ann")
+        self.assertEqual(b.report("W1-1", "Ann", "Di", "Ann", {"game": 3})[0], 409)              # not on yet
+        self.assertNotIn("W1-1", b.reports)
+        self.assertEqual(b.report("W1-1", "Ann", "Di", "Ann", {"game": 2}), (200, "pending"))
+        self.clock.t += B.CONFIRM_AFTER
+        self.assertEqual(b.current(), "W1-2")                                                     # one report stood
+        self.assertEqual(b.state["results"]["W1-1"]["how"], "one report")
+
+    def test_organizer_game_and_set(self):
+        b = self.b
+        self.game("W1-1", "Ann", "Di")
+        b.report("W1-1", "Di", "Ann", "Di")
+        self.assertEqual(b.report("W1-1", "Ann", "Di", "Ann"), (200, "disputed"))
+        b.admin_game("W1-1", "Di")
+        self.assertEqual((b.current(), b.game("W1-1")), ("W1-1", 3))
+        self.assertNotIn("W1-1", b.disputed)
+        with self.assertRaises(ValueError):
+            b.admin_game("W2-1", "Ann")      # players not known
+        b.admin_result("W1-1", "Ann")        # the organizer's set at 1-1: no score
+        self.assertNotIn("score", b.state["results"]["W1-1"])
+        row = b.view()["matches"][0]
+        self.assertEqual((row["winner"], row["games"]), ("Ann", ["Ann", "Di"]))
+        self.assertNotIn("score", row)
+        with self.assertRaises(ValueError):
+            b.admin_game("W1-1", "Ann")      # decided
+
+    def test_clear_drops_games(self):
+        b = self.b
+        self.game("W1-1", "Ann", "Di")
+        self.game("W1-1", "Ann", "Di")
+        self.game("W1-2", "Bo", "Cy")
+        b.clear("W1-1")
+        self.assertEqual((b.games("W1-1"), b.current(), b.game("W1-1")), ([], "W1-1", 1))
+        self.assertEqual(len(b.games("W1-2")), 1)          # (not a dependent)
+
+    def test_final_best_of_five(self):
+        b = self.b
+        for mid in ("W1-1", "W1-2"):
+            a, c = b.players_of(mid)
+            b.admin_result(mid, a)
+        for g, w in enumerate(["Ann", "Bo", "Ann", "Bo"], 1):
+            lo = "Bo" if w == "Ann" else "Ann"
+            self.game("W2-1", w, lo, g)
+            self.assertIsNone(b.champion())
+        self.game("W2-1", "Bo", "Ann", 5)
+        self.assertEqual((b.champion(), b.state["results"]["W2-1"]["score"]), ("Bo", [3, 2]))
+
+
 class Saved(unittest.TestCase):
     def test_survives_a_restart(self):
         with tempfile.TemporaryDirectory() as d:
@@ -258,7 +348,7 @@ class Http(unittest.TestCase):
         st, _, body = self.get("/arena/assignment?name=Bo")
         self.assertEqual(st, 200)
         self.assertEqual(json.loads(body), {"match": "W1-2", "opponent": "Cy", "owner": False, "plus": False, "arena": "4242",
-                                            "place": 1, "role": "start"})
+                                            "place": 1, "role": "start", "game": 1})
         st, _, body = self.post("/arena/result", {"match": "W1-2", "winner": "Cy", "loser": "Bo", "reporter": "Bo"})
         self.assertEqual((st, json.loads(body)), (200, {"ok": True, "state": "pending"}))
         st, _, body = self.post("/arena/result", {"match": "W1-2", "winner": "Cy", "loser": "Bo", "reporter": "Cy"})
