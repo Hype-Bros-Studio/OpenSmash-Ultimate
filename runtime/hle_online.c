@@ -583,6 +583,94 @@ static int json_member(const char *js, const char *key, char *out, int cap) {
     return 1;
 }
 
+/* The value of member `key` of the object js starts with (not of the objects inside it), or NULL. */
+static const char *json_key(const char *js, const char *key) {
+    size_t kl = strlen(key);
+    int depth = 0;
+    for (const char *p = js; *p; p++) {
+        if (*p == '"') {
+            const char *s = ++p;
+            while (*p && *p != '"') p += p[0] == '\\' && p[1] ? 2 : 1;
+            if (!*p) return NULL;
+            if (depth == 1 && (size_t)(p - s) == kl && !strncmp(s, key, kl)) {
+                const char *v = p + 1;
+                while (*v == ' ') v++;
+                if (*v == ':') { for (v++; *v == ' '; v++) {} return v; }
+            }
+        } else if (*p == '{' || *p == '[') depth++;
+        else if ((*p == '}' || *p == ']') && --depth <= 0) return NULL;
+    }
+    return NULL;
+}
+/* A JSON string value's text (escapes taken as the character after the backslash); "" for any other. */
+static void json_text(const char *v, char *out, int cap) {
+    int n = 0;
+    if (v && *v == '"')
+        for (v++; *v && *v != '"' && n < cap - 1; v++) {
+            if (*v == '\\' && v[1]) v++;
+            out[n++] = *v;
+        }
+    out[n] = 0;
+}
+
+/* ---- stage striking (tools/bracket.py's "stages") ---------------------------------------------
+ * The assignment's "stage" (the stage chosen for the game being played, "" until it is) and, while
+ * its "stages" says striking goes on, whose turn it is: kept apart from the place request's number,
+ * which a strike does not change. With SSBU_ARENA_STRIKE=1 (the test bots) this player takes its
+ * turns itself: POST /arena/stage with the first stage still open, as many times as its turn has. */
+static char as_stage[48], as_phase[8], as_turn[48];
+static int as_on;
+
+/* Takes "stages" from an answer (the assignment, or POST /arena/stage's). */
+static void arena_stages_take(const char *js) {
+    const char *st = json_key(js, "stages");
+    char stage[48] = "", phase[8] = "", turn[48] = "";
+    if (st && *st == '{') {
+        json_text(json_key(st, "stage"), stage, sizeof stage);
+        json_text(json_key(st, "phase"), phase, sizeof phase);
+        json_text(json_key(st, "turn"), turn, sizeof turn);
+    }
+    AcquireSRWLockExclusive(&ab_lock);
+    int was = as_on, changed = strcmp(stage, as_stage) || strcmp(phase, as_phase) || strcmp(turn, as_turn);
+    as_on = st && *st == '{';
+    snprintf(as_stage, sizeof as_stage, "%s", stage);
+    snprintf(as_phase, sizeof as_phase, "%s", phase);
+    snprintf(as_turn, sizeof as_turn, "%s", turn);
+    ReleaseSRWLockExclusive(&ab_lock);
+    if (as_on && (changed || !was)) {
+        fprintf(stderr, "[arena] stages: %s%s%s%s%s\n", phase, turn[0] ? ", " : "", turn, stage[0] ? ", stage " : "", stage);
+        fflush(stderr);
+    }
+}
+
+static void json_escape(char *out, int cap, const char *in);
+/* (the bracket thread, after taking the assignment js) */
+static void arena_strike(const char *js, const char *me, const char *match, int game) {
+    static int on = -1;
+    if (on < 0) on = getenv("SSBU_ARENA_STRIKE") && !strcmp(getenv("SSBU_ARENA_STRIKE"), "1");
+    static char buf[4096];
+    char body[256], m[64], i[112], first[48];
+    for (int k = 0; k < 8; k++, js = buf) {   /* (a turn is 2 at most; an answer that never moves on stops after 8) */
+        AcquireSRWLockExclusive(&ab_lock);
+        int mine = on && as_on && as_turn[0] && !_stricmp(as_turn, me) && strcmp(as_phase, "done");
+        ReleaseSRWLockExclusive(&ab_lock);
+        if (!mine) return;
+        const char *st = json_key(js, "stages");
+        const char *opt = st ? json_key(st, "options") : NULL;
+        first[0] = 0;
+        if (opt && *opt == '[') json_text(opt + 1, first, sizeof first);
+        if (!first[0]) return;
+        json_escape(m, sizeof m, match);
+        json_escape(i, sizeof i, me);
+        snprintf(body, sizeof body, "{\"match\": \"%s\", \"player\": \"%s\", \"stage\": \"%s\", \"game\": %d}", m, i, first, game);
+        int ok = http_request("POST", "/arena/stage", body, buf, sizeof buf) > 0;
+        fprintf(stderr, "[arena] stages: %s %s\n", body, ok ? "taken" : "not taken");
+        fflush(stderr);
+        if (!ok) return;
+        arena_stages_take(buf);
+    }
+}
+
 /* ---- the tourney table (runtime/hle_tourney_ui.c) -------------------------------------------
  * The bracket as GET /bracket.json has it, fetched when the table should show: when this player is
  * first placed in a bracket, and once a result it reported is decided ("confirmed" in the answer, or
@@ -662,6 +750,8 @@ static DWORD WINAPI arena_bracket_thread(void *arg) {
             }
             ReleaseSRWLockExclusive(&ab_lock);
             if (placed >= 0) arena_table_fetch(placed, NULL, 0);
+            arena_stages_take(buf);
+            if (match[0]) arena_strike(buf, name ? name : "", match, atoi(game));
         }
         Sleep(2000);
     }
@@ -687,6 +777,17 @@ long online_arena_assignment(int *place, char *role, int rcap) {
     snprintf(role, (size_t)rcap, "%s", ab_role);
     ReleaseSRWLockExclusive(&ab_lock);
     return seq;
+}
+
+/* Stage striking for the match this player is assigned: 0 when it has none (no match, or the bracket
+ * strikes no stages); else the stage chosen for its game into stage ("" while it is not chosen yet)
+ * and 1, or 2 while striking goes on. */
+int online_arena_stage(char *stage, int cap) {
+    AcquireSRWLockExclusive(&ab_lock);
+    int r = !as_on ? 0 : strcmp(as_phase, "done") ? 2 : 1;
+    snprintf(stage, (size_t)cap, "%s", r ? as_stage : "");
+    ReleaseSRWLockExclusive(&ab_lock);
+    return r;
 }
 
 /* This player's result of the match (the set's game) it was assigned (won or lost), with its fighter
