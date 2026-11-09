@@ -77,8 +77,12 @@ long seq_poll(Seq *s, SeqStepsFn *steps, long draws, SeqSeenFn *seen, SeqLogFn *
 int input_seq_on(void);
 /* Any thread: something the sequence can wait for happened (@<what>). "movie" when a movie's
  * stream is opened (hle_movie_skip.c), "module:<name>" when the game has loaded that module
- * (host.c: the name its "[ro] loaded" line gives). */
+ * (host.c: the name its "[ro] loaded" line gives), "scene:<name>" when that scene becomes one of the
+ * current ones (hle_scene_watch.c). */
 void input_seq_mark(const char *what);
+/* 1 while the scene named is one of the current ones (hle_scene_watch.c: on with SSBU_INPUT_LIVE,
+ * SSBU_SEQ or SSBU_SCENE_LOG; otherwise always 0). */
+int scene_current(const char *name);
 /* The hook the sequence asks at each of player 1's polls for the ticks to move on by (seq_poll);
  * NULL, the default, is 1 a poll. */
 void input_seq_set_steps(SeqStepsFn *steps_per_poll);

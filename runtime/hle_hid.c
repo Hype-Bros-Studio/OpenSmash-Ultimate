@@ -191,15 +191,32 @@ static u64 scripted_buttons(i32 *lx, i32 *ly) {
     u64 buttons = 0;
     /* SSBU_INPUT_LIVE=<file>: presses appended to that file while the game runs, one per line,
      * "[<n>*]<button>[/<hold seconds>]" (n times), pressed one after another as they come (for
-     * driving a test run from outside). */
+     * driving a test run from outside). Two kinds of line wait, holding back the lines after them:
+     *   @<seconds>                       a pause after the presses before it
+     *   @scene:<name>[/<limit seconds>]  until the presses before it are over and the scene named is
+     *                                    one of the current ones (hle_scene_watch.c logs them as
+     *                                    "[scene] now ..."); past the limit, if given, it gives up
+     * Each wait is logged ("[live] ..."), so the test's log says where a run stopped. */
     static const char *live_path;
     static int live_init;
     static long live_off;
     static double live_next, live_check;
     static struct { double at, hold; int button; } live[64];
     static int live_n;
+    static char live_wait[48];          /* the scene an @scene: line waits for ("": none) */
+    static double live_wait_since, live_wait_limit;
     if (!live_init) { live_init = 1; live_path = getenv("SSBU_INPUT_LIVE"); }
-    if (live_path && now >= live_check) {
+    if (live_wait[0] && now >= live_next) {
+        if (scene_current(live_wait)) {
+            fprintf(stderr, "[live] scene %s after %.2f s\n", live_wait, now - live_wait_since);
+            live_wait[0] = 0;
+        } else if (live_wait_limit > 0 && now - live_wait_since > live_wait_limit) {
+            fprintf(stderr, "[live] no scene %s in %.0f s: going on without it\n", live_wait, live_wait_limit);
+            live_wait[0] = 0;
+        }
+        if (!live_wait[0]) { live_check = 0; fflush(stderr); }
+    }
+    if (live_path && !live_wait[0] && now >= live_check) {
         live_check = now + 0.05;
         FILE *f = fopen(live_path, "rb");
         if (f) {
@@ -213,6 +230,22 @@ static u64 scripted_buttons(i32 *lx, i32 *ly) {
                     size_t len = strlen(line);
                     if (!len || line[len - 1] != '\n') break;   /* (a line still being written) */
                     live_off += (long)len;
+                    if (line[0] == '@') {
+                        line[strcspn(line, "\r\n")] = 0;
+                        double secs = 0;
+                        if (!strncmp(line, "@scene:", 7)) {
+                            char *limit = strchr(line, '/');
+                            if (limit) *limit++ = 0;
+                            snprintf(live_wait, sizeof live_wait, "%s", line + 7);
+                            live_wait_limit = limit ? atof(limit) : 0;
+                            live_wait_since = now;
+                            fprintf(stderr, "[live] waiting for scene %s\n", live_wait);
+                            fflush(stderr);
+                            break;
+                        }
+                        if (sscanf(line + 1, "%lf", &secs) == 1 && secs > 0) live_next = (live_next > now ? live_next : now) + secs;
+                        continue;
+                    }
                     char name[16] = {0};
                     double hold = 0.15;
                     int times = 1, n = 0;

@@ -72,7 +72,7 @@ What the step machine does (tested offline on made-up sequences):
 What the runtime does around it (not yet run with the game):
 
 - **Player 1 is the sequence's.** Player 1's pad is not read, and player 1 is connected as a Pro Controller throughout. The keyboard plays for nobody unless `SSBU_SEQ_KEYBOARD=1`. Players 2-8 keep their pads, so unplug them for a run that has to repeat exactly.
-- **Marks:** `movie` when a movie's stream is opened, `module:<name>` when the game has loaded that module (the name its `[ro] loaded` log line gives), and `fight` at the first battle frame when `SSBU_FIGHT_HASH` or `SSBU_DETERMINISTIC` is set. Up to 512 different marks are kept; past that the log says a mark was not kept, and a step waiting for it waits forever.
+- **Marks:** `movie` when a movie's stream is opened, `module:<name>` when the game has loaded that module (the name its `[ro] loaded` log line gives), `scene:<name>` when that scene becomes one of the current ones ([below](#scenes-and-ssbu_input_live-waits)), and `fight` at the first battle frame when `SSBU_FIGHT_HASH` or `SSBU_DETERMINISTIC` is set. Up to 512 different marks are kept; past that the log says a mark was not kept, and a step waiting for it waits forever.
 - **Draw counts** are the draw calls the GPU ran for each frame shown. They are not the same numbers as ssbu-recomp's, which counted at a higher level, so its ranges don't carry over: use `SSBU_SEQ_LOG` to find yours. With `SSBU_GPU_THREAD=0` they are approximate.
 - **The log** has one line per press and per wait that ends: `[seq] poll 812: tick 812, step 3 (60:A): keys for 8 ticks`.
 
@@ -82,6 +82,21 @@ Not yet checked in a run:
 - that the `movie` and `module:<name>` marks appear;
 - that `SSBU_SEQ_LOG`'s draw counts are steady on a still screen;
 - that a pad in slot 0 and the keyboard are ignored.
+
+## Scenes, and `SSBU_INPUT_LIVE` waits
+
+The game's screens are *scenes*, run by scene managers. A sequence scene runs a manager of its own, so the current scenes form a path from the root down, such as `MenuSequenceScene > MainMenuScene` or `OnlineMeleeRoomSequenceScene > OnlineMeleeRoomScene`. Once a frame, [`hle_scene_watch.c`](../runtime/hle_scene_watch.c) reads that path from the game's memory. It is on when `SSBU_INPUT_LIVE`, `SSBU_SEQ` or `SSBU_SCENE_LOG=1` is set. Each change is logged as `[scene] now A > B at 47.78 s`, and each scene that comes into the path raises the mark `scene:<name>`.
+
+A test can then wait for a screen instead of guessing how long it takes to come. `SSBU_INPUT_LIVE=<file>` takes presses appended to the file while the game runs, one per line, as `[<n>*]<button>[/<hold seconds>]`. It also takes two kinds of wait line, which hold back the lines after them:
+
+| Line | Meaning |
+| :--- | :--- |
+| `@<seconds>` | A pause after the presses before it. |
+| `@scene:<Name>[/<limit>]` | Wait until the presses before it are over and the scene named is one of the current ones. If a limit in seconds is given, it gives up after that long and goes on. |
+
+The log says `[live] waiting for scene X` and then `[live] scene X after 1.20 s`, or that it gave up. A scene is a whole screen, so steps within one (the Battle Arenas menu and the arena ID search are all `OnlineMeleeRoomTopScene`) still need pauses. The test folder's `menubot.sh` has shell helpers that wait on a game's log the same way (`wait_scene`, `press_until`). `setup4_scene.sh` uses them to bring three games into one Arena, and it stops and names the game and menu at the first screen a game does not reach.
+
+Seen in runs on Linux: boot (`BootSequenceScene`), the title (`TitleScene`), the main menu (`MainMenuScene`), the Battle Arenas list (`OnlineMeleeRoomTopScene`) and an Arena's room (`OnlineMeleeRoomScene`).
 
 ## `SSBU_SKIP_MOVIES`
 
