@@ -61,12 +61,12 @@ def table(state, me):
             w = seat.get(norm(r[0]), -1) if r and r[0] is not BYE else -1
             match[g, i] = (w, [2 * i, 2 * i + 1] if g == 0 else [])
 
-    # (with the final decided the table goes on to its champion screen, which needs the winner's
-    # fighter and player slot: these entrants have neither, and it crashes)
-    if match[rounds - 1, 0][0] >= 0:
-        raise ValueError("the bracket is over: the table's champion screen isn't supported")
-    # this player's match in the round being played (the first with one open)
-    cur = next(g for g in range(rounds) if any(match[g, i][0] < 0 for i in range(1 << (rounds - 1 - g))))
+    # (with the final decided the table moves on past it, which the runtime keeps on the final: a
+    # 5-round class has no room for that)
+    if match[rounds - 1, 0][0] >= 0 and rounds == 5:
+        raise ValueError("the bracket is over: a 32-entrant table can't show its end")
+    # this player's match in the round being played (the first with one open; the final once it's over)
+    cur = next((g for g in range(rounds) if any(match[g, i][0] < 0 for i in range(1 << (rounds - 1 - g)))), rounds - 1)
     mine = 0
     for i in range(1 << (rounds - 1 - cur)):
         sides = match[cur, i][1] if cur == 0 else [match[cur - 1, 2 * i][0], match[cur - 1, 2 * i + 1][0]]

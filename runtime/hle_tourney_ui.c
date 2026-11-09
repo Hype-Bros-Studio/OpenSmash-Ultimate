@@ -54,6 +54,7 @@
 #define T_LOAD_PARAMS 0x2385bf0   /* the tourney sequence's vfunc +0x50: loads the tourney param file into T+0xe0..0x2c8 */
 
 static GuestFn *tui_orig;
+static GuestFn *show_match_orig;   /* (table_show_match's) */
 static const char *tui_path;
 static int tui_bracket;           /* SSBU_ARENA_BRACKET=1 (and not SSBU_TOURNEY_UI=0): the table from the lobby's bracket */
 static const char *tui_text;      /* the bracket lines for the request being made (NULL: the file's) */
@@ -216,7 +217,8 @@ static int read_bracket(void) {
  * and 32 entrants with 3, 4 and 5 rounds. The winners side goes in the last rounds of the smallest one it
  * fits, each of its seats under a chain of matches already decided, at the top of its own subtree's
  * slots; the other slots are blank entrants, and byes are blank entrants that lose. While a double
- * elimination plays its losers side or grand finals, and once the bracket is over, there is no table.
+ * elimination plays its losers side or grand finals, or once it is over, there is no table; a single
+ * elimination's end shows its final decided (but not with 32 entrants: table_show_match).
  * (tools/bracket_tui.py makes the same from bracket.json, for SSBU_TOURNEY_UI_FILE.) */
 static const char *json_ws(const char *p) { while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++; return p; }
 
@@ -358,9 +360,9 @@ static int table_from_view(const char *js, const char *me, char *out, int cap) {
             if (!w[0] && g == off && !seat[2 * i][0] != !seat[2 * i + 1][0])   /* (a bye: the other side goes on) */
                 win[g][i] = (seat[2 * i][0] ? 2 * i : 2 * i + 1) << off;
         }
-    /* With the final decided the table goes on to its champion screen (main+0x18bafc0), which reads the
-     * winner's fighter and its player's slot (main+0x239b2a0): these entrants have neither, and it crashes. */
-    if (win[rounds - 1][0] >= 0) return 0;
+    /* With the final decided the table moves on past it (fill_bracket's after_final, table_show_match), which
+     * a 5-round class has no room for. */
+    if (win[rounds - 1][0] >= 0 && (rounds == MAX_ROUNDS || !show_match_orig)) return 0;
     int now = rounds - 1, mine = 0;   /* the round being played: the first with a match open */
     for (int g = rounds - 1; g >= 0; g--)
         for (int i = 0; i < 1 << (rounds - 1 - g); i++)
@@ -447,6 +449,21 @@ static void fill_bracket(Cpu *c, u64 sp) {
             u64 e = vec_alloc(c, x->m + 0x38, x->n, 4, sp);
             for (int k = 0; k < x->n; k++) *P(i32, e + k * 4) = x->e[k];
         }
+    /* The final's parent: once the match in view is decided the table moves on to its parent's (main+0x18bafc0,
+     * scene+0x1d0 += 1 and +0x1d4 = the parent's +8), and the final has none. This one, with no owners, is
+     * match 0 of the round after the last, which has no matches (with 5 rounds that vector would be the
+     * entrants': table_from_view shows no table then). */
+    static u64 after_final;
+    if (!after_final) after_final = galloc(c, 0x60, sp);
+    for (int r = br.rounds; r < MAX_ROUNDS; r++) vec_alloc(c, t + 8 + r * 0x18, 0, 0x10, sp);
+    if (after_final && br.rounds < MAX_ROUNDS && br.count[br.rounds - 1]) {
+        for (int k = 0; k < 0x60; k += 8) *P(u64, after_final + k) = 0;
+        *P(u32, after_final + 4) = br.rounds;
+        *P(i32, after_final + 0x50) = -1;
+        *P(i32, after_final + 0x58) = -1;
+        *P(u64, br.match[br.rounds - 1][0].m + 0x28) = after_final;
+        *P(u64, br.match[br.rounds - 1][0].m + 0x30) = 0;
+    }
     for (int r = 0; r < br.rounds; r++) {
         u64 v = vec_alloc(c, t + 8 + r * 0x18, br.count[r], 0x10, sp);
         for (int m = 0; m < br.count[r]; m++) {
@@ -587,6 +604,21 @@ static void tui_auto(Cpu *c, u64 seq, double now) {
     shown_after = after;
 }
 
+/* The Table scene's state that shows the match in view (main+0x18bafc0, a state handler the scene calls
+ * through a pointer): once that match is decided it moves the view on to the match's parent (scene+0x1d0
+ * round, +0x1d4 match). Past the final that is fill_bracket's after_final, in a round the table has no
+ * places for (its next state asks the bracket view for them, and .at() aborts): back on the final it
+ * stays, the winner's line lit up to the trophy. */
+#define TABLE_SHOW_MATCH 0x18bafc0
+static void table_show_match(Cpu *c) {
+    u64 scene = c->x[0];
+    show_match_orig(c);
+    if (tui_holder && br.rounds && *P(u32, scene + 0x1d0) >= (u32)br.rounds) {
+        *P(u32, scene + 0x1d0) = (u32)br.rounds - 1;
+        *P(u32, scene + 0x1d4) = 0;
+    }
+}
+
 static void tui_update(Cpu *c) {
     u64 seq = c->x[0];
     tui_orig(c);
@@ -638,6 +670,9 @@ void tourney_ui_install(void) {
     if (!tui_path && !tui_bracket) return;
     u64 orig = rt_hook_function(rt_module_main.base + SEQ_UPDATE, rt_native(tui_update, "SSBU_TOURNEY_UI_FILE hook"));
     if (orig) tui_orig = rt_lookup(orig);
+    u64 show = rt_hook_function(rt_module_main.base + TABLE_SHOW_MATCH, rt_native(table_show_match, "tourney-ui show match"));
+    if (show) show_match_orig = rt_lookup(show);
+    else fprintf(stderr, "[tourney-ui] the table's match state not found: no table once the final is decided\n");
     fprintf(stderr, "[tourney-ui] Arena sequence %s%s\n", orig ? "hooked" : "not found",
             tui_bracket ? " (the table from the lobby's bracket)" : "");
     fflush(stderr);
