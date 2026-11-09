@@ -1184,7 +1184,9 @@ def _build(mod, found, funcs, path, outdir, jobs, per_file, imports):
     slots = hookables(base, setjmp)
     from eh import landing_pads
     pads = landing_pads(mod)
-    if os.environ.get("SSBU_FLAGS_XFER") == "1":   # (a plugin: see adr_landing_pads)
+    # (a plugin: see adr_landing_pads. Smashline built with panic=unwind has an unwind table, so it
+    # is not plugin_like, but its interpreter still resumes at its own labels)
+    if os.environ.get("SSBU_FLAGS_XFER") == "1" or any(e[0] == "set_smashline_interpreter_landing" for e in mod.exports):
         for f, sites in adr_landing_pads(mod, funcs).items():
             pads.setdefault(f, []).extend(sites)
     patches = code_patches(mod, name)
