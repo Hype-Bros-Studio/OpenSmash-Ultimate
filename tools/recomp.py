@@ -1127,7 +1127,8 @@ def build(path, outdir, jobs, per_file, imports=None):
     # outliner's helpers, which a `bl` reaches and which use the caller's callee-saved registers
     # as their own: lift.py's register cache (callee-saved registers kept in C locals across a
     # call) does not hold for those. Every register in the context, as with SSBU_REGCACHE=0.
-    plain = plugin_like(mod, found, sizes_of(mod))
+    # (a plugin built with its own unwind tables is LLVM's outlined code all the same)
+    plain = plugin_like(mod, found, sizes_of(mod)) or module_key(path) in plugin_modules()
     regcache_was = os.environ.get("SSBU_REGCACHE")
     if plain:
         os.environ["SSBU_REGCACHE"] = "0"
