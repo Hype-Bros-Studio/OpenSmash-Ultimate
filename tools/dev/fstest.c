@@ -40,6 +40,7 @@ void skyline_load_plugins(Cpu *c) { (void)c; }
 void native_mods_load(void) {}   /* (hle_native_mods.c: no mods here) */
 void select_screen_install(void) {}   /* (hle_select_screen.c: no game here) */
 void trace_install(void) {}   /* (hle_trace.c: no research tracer here) */
+void tourney_ui_install(void) {}   /* (hle_tourney_ui.c: no game here) */
 int skyline_provides(const char *path) { (void)path; return 0; }
 void skyline_mods_mounted(void) {}
 u64 rt_symbol(const char *name) { (void)name; return 0; }

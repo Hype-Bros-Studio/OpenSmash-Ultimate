@@ -20,6 +20,7 @@ void skyline_load_plugins(Cpu *c) { (void)c; }
 void native_mods_load(void) {}
 void select_screen_install(void) {}
 void trace_install(void) {}
+void tourney_ui_install(void) {}
 int skyline_provides(const char *path) { (void)path; return 0; }
 void skyline_mods_mounted(void) {}
 u64 rt_symbol(const char *name) { (void)name; return 0; }
