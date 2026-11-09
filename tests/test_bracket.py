@@ -221,6 +221,98 @@ class Pools(unittest.TestCase):
         self.assertEqual(v["advance"], 2)
 
 
+class Stages(unittest.TestCase):
+    def setUp(self):
+        self.b = B.Bracket()
+        self.b.setup(["Ann", "Bo"], "single", best=3, stages=True)
+        self.mid = self.b.current()
+
+    def act(self, who, stage, **kw):
+        return self.b.stage_act(self.mid, who, stage, **kw)
+
+    def test_game_one_strikes_one_two_one(self):
+        st = self.b.stages(self.mid)
+        self.assertEqual((st["phase"], st["turn"], st["left"]), ("strike", "Ann", 1))
+        self.assertEqual(self.act("Bo", "end")[0], 403)                  # (not Bo's turn)
+        self.assertEqual(self.act("Ann", "nowhere")[0], 409)
+        self.assertEqual(self.act("Ann", "end")[0], 200)
+        st = self.b.stages(self.mid)
+        self.assertEqual((st["turn"], st["left"]), ("Bo", 2))
+        self.assertEqual(self.act("Bo", "end")[0], 409)                  # (struck already)
+        self.act("Bo", "battle_field_s")
+        self.act("Bo", "poke_stadium2")
+        self.assertEqual(self.b.stages(self.mid)["turn"], "Ann")
+        self.act("Ann", "animal_village")
+        st = self.b.stages(self.mid)
+        self.assertEqual((st["phase"], st["stage"]), ("done", "battle_field"))
+        self.assertEqual(self.b.assignment("Bo")["stage"], "battle_field")
+        self.assertEqual(self.act("Ann", "end")[0], 409)
+
+    def test_later_games_ban_then_pick_and_record_the_stage(self):
+        for who, s in (("Ann", "end"), ("Bo", "battle_field_s"), ("Bo", "poke_stadium2"), ("Ann", "animal_village")):
+            self.act(who, s)
+        self.b.report(self.mid, "Ann", "Bo", "Ann")
+        self.b.report(self.mid, "Ann", "Bo", "Bo")
+        self.assertEqual(self.b.games(self.mid)[0]["stage"], "battle_field")
+        st = self.b.stages(self.mid)
+        self.assertEqual((st["game"], st["phase"], st["turn"], st["left"]), (2, "ban", "Ann", 2))
+        self.assertEqual(len(st["options"]), 8)
+        self.act("Ann", "battle_field")
+        self.act("Ann", "poke_kalos")
+        st = self.b.stages(self.mid)
+        self.assertEqual((st["phase"], st["turn"]), ("pick", "Bo"))
+        self.assertNotIn("poke_kalos", st["options"])
+        self.assertEqual(self.act("Bo", "poke_kalos")[0], 409)
+        self.act("Bo", "trail_castle")
+        self.assertEqual(self.b.stages(self.mid)["stage"], "trail_castle")
+        v = self.b.view()
+        row = next(r for r in v["matches"] if r["id"] == self.mid)
+        self.assertEqual(row["game_stages"], ["battle_field"])
+        self.assertEqual(row["stages"]["stage"], "trail_castle")
+        self.assertEqual(v["rules"]["bans"], 2)
+
+    def test_organizer_sets_or_acts(self):
+        self.assertEqual(self.b.stage_act(self.mid, "", "poke_kalos", organizer=True)[0], 200)
+        self.assertEqual(self.b.stages(self.mid)["stage"], "poke_kalos")
+        self.b.key = "k"
+        st, _ct, body = B.route(self.b, "POST", "/bracket/admin", json.dumps(
+            {"key": "k", "action": "stage", "match": self.mid, "player": "", "stage": "nowhere"}).encode())
+        self.assertEqual(st, 400, body)
+
+    def test_http_and_off_by_default(self):
+        st, _ct, body = B.route(self.b, "POST", "/arena/stage", json.dumps(
+            {"match": self.mid, "player": "Ann", "stage": "end", "game": 1}).encode())
+        self.assertEqual(st, 200, body)
+        self.assertEqual(json.loads(body)["stages"]["turn"], "Bo")
+        st, _ct, _ = B.route(self.b, "POST", "/arena/stage", json.dumps(
+            {"match": self.mid, "player": "Bo", "stage": "end", "game": 2}).encode())
+        self.assertEqual(st, 409)
+        plain = B.Bracket()
+        plain.setup(["Ann", "Bo"])
+        self.assertIsNone(plain.stages(plain.current()))
+        self.assertNotIn("stages", plain.assignment("Ann"))
+        self.assertIsNone(plain.view()["rules"])
+
+    def test_bad_rules_and_small_pools(self):
+        for rules in ({"starters": []}, {"starters": ["Bad Id"]}, {"starters": ["a", "a"]}, {"starters": ["a"], "bans": 1}):
+            with self.assertRaises(ValueError):
+                B.stage_rules(rules)
+        b = B.Bracket()
+        b.setup(["Ann", "Bo"], stages={"starters": ["only"]})
+        self.assertEqual(b.stages(b.current())["stage"], "only")
+        b.setup(["Ann", "Bo"], stages={"starters": ["x", "y", "z"]})
+        mid = b.current()
+        b.stage_act(mid, "Ann", "x")
+        self.assertEqual(b.stages(mid)["turn"], "Bo")
+        b.stage_act(mid, "Bo", "z")
+        self.assertEqual(b.stages(mid)["stage"], "y")
+
+    def test_clear_forgets_strikes(self):
+        self.act("Ann", "end")
+        self.b.clear(self.mid)
+        self.assertEqual(self.b.stages(self.mid)["steps"], [])
+
+
 class Reports(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()

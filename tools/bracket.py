@@ -20,9 +20,12 @@ HTTP, on the lobby's TCP port (the lobby hands over any connection that starts w
                                  "disputed"}; 409 when the match (or that game of it) isn't being
                                  played. "fighter": the reporter's, "0x<hash>[/<costume>]" (the
                                  hash40 of its ui_chara id, in hex), kept with the game.
+  POST /arena/stage              {"match", "player", "stage", "game"?} -> {"ok", "stages"}: the
+                                 player's strike, ban or pick (Bracket.stages); 409 out of turn, for a
+                                 stage that isn't open, or a match or game that isn't being played.
   GET  /bracket.json             the whole bracket, for the in-game overlay and the page.
   GET  /bracket                  the page (with ?key=K: the organizer's controls).
-  POST /bracket/admin            {"key", "action": "setup"|"result"|"game"|"clear"|"arena", ...}
+  POST /bracket/admin            {"key", "action": "setup"|"result"|"game"|"clear"|"arena"|"stage", ...}
 
 Each match is a set, best of 1, 3, 5, 7 or 9 games (setup's "best_of", and "finals_best_of" for the
 finals: the single elimination's final, and the double's winners, losers and grand finals). Each game
@@ -53,6 +56,30 @@ POOL_NAMES = "ABCDEFGH"
 FINALS = ("Final", "Winners final", "Losers final", "Grand final", "Grand final reset")   # (build's labels)
 FIGHTER = re.compile(r"0x[0-9a-f]{1,10}(/[0-9]{1,3})?")
 SIDES = {"W": "winners", "L": "losers", "G": "finals"}   # (a bracket match's id: its side)
+STAGE = re.compile(r"[a-z0-9_]{1,40}")
+DEFAULT_STAGES = {"starters": ["battle_field", "end", "battle_field_s", "poke_stadium2", "animal_village"],
+                  "counterpicks": ["animal_city", "poke_kalos", "trail_castle"], "bans": 2}
+
+
+def stage_rules(rules):
+    """setup's "stages", checked: None (no striking), True (DEFAULT_STAGES) or
+    {"starters": [ids], "counterpicks": [ids]?, "bans": n?}."""
+    if not rules:
+        return None
+    if rules is True:
+        rules = DEFAULT_STAGES
+    if not isinstance(rules, dict):
+        raise ValueError("stages: an object")
+    clean = lambda xs: [str(x).strip().lower() for x in (xs or []) if str(x).strip()]   # noqa: E731
+    starters, counter = clean(rules.get("starters")), clean(rules.get("counterpicks"))
+    every = starters + counter
+    if not starters or len(every) > 24 or not all(STAGE.fullmatch(x) for x in every) or len(set(every)) != len(every):
+        raise ValueError("stages: 1 to 24 different stage ids ([a-z0-9_]), at least one starter")
+    given = rules.get("bans") not in (None, "")
+    bans = int(rules["bans"]) if given else min(2, len(every) - 1)
+    if not 0 <= bans < len(every):
+        raise ValueError(f"stages: {bans} bans of {len(every)} stages")
+    return {"starters": starters, "counterpicks": counter, "bans": bans}
 
 
 def norm(name):
@@ -210,9 +237,10 @@ class Bracket:
             json.dump(self.state, f, indent=1)
         os.replace(tmp, path)
 
-    def setup(self, players, fmt="double", arena=None, owner=None, best=1, finals_best=None, pools=0, advance=2):
+    def setup(self, players, fmt="double", arena=None, owner=None, best=1, finals_best=None, pools=0, advance=2,
+              stages=None):
         """A new bracket. pools (2 or more): round-robin pools first, the top `advance` of each
-        going on to the fmt bracket (build_pools)."""
+        going on to the fmt bracket (build_pools). stages: stage striking's rules (stage_rules)."""
         players = [p.strip() for p in players if p and p.strip()]
         if len(players) > MAX_PLAYERS or any(len(p) > MAX_NAME for p in players):
             raise ValueError("too many players or a name too long")
@@ -223,6 +251,7 @@ class Bracket:
         best = best_of(best)
         finals_best = best if finals_best in (None, "") else best_of(finals_best)
         pools, advance = int(pools or 0), int(advance or 2)
+        rules = stage_rules(stages)
         if pools:
             matches, groups = build_pools(len(players), pools, advance, fmt)
             entrants = pools * advance
@@ -232,7 +261,7 @@ class Bracket:
         for m in matches.values():
             m["best_of"] = finals_best if m["label"] in FINALS else best
         self.state.update(players=players, format=fmt if entrants > 2 else "single", matches=matches, results={},
-                          games={}, pools=groups, advance=advance if pools else 0)
+                          games={}, pools=groups, advance=advance if pools else 0, rules=rules, strikes={})
         if arena is not None:
             self.state["arena"] = str(arena).strip()[:32]
         if owner is not None:
@@ -418,7 +447,85 @@ class Bracket:
                 out.update(match=mid, opponent=b, place=1, role="start", game=self.game(mid))
             elif me == norm(b):
                 out.update(match=mid, opponent=a, place=1, role="join", game=self.game(mid))
+            st = self.stages(mid) if out["match"] else None
+            if st:
+                out.update(stages=st, stage=st["stage"])
         return out
+
+    # --- stages ------------------------------------------------------------------------------
+    def stages(self, mid):
+        """Stage striking for the game being played in a match, or None (no rules, the match
+        decided or its players not known): {"game", "phase": "strike"|"ban"|"pick"|"done",
+        "turn": who acts ("" once done), "left": that player's actions left in their turn,
+        "options": the stages open, "steps": [{"by", "act", "stage"}], "stage": the one chosen
+        ("" until done)}.
+        Game 1: the starters, struck until one is left: a strikes 1, then b 2, a 2, ... (1-2-1 of 5).
+        Later games: the last game's winner bans `bans` of every stage, then its loser picks."""
+        rules = self.state.get("rules")
+        if not rules or mid not in self.state["matches"] or mid in self.state["results"] or not self.ready(mid):
+            return None
+        a, b = self.players_of(mid)
+        n = self.game(mid)
+        steps = self.state.setdefault("strikes", {}).get(mid, {}).get(str(n), [])
+        out = {"game": n, "phase": "done", "turn": "", "left": 0, "options": [], "steps": steps, "stage": ""}
+        if steps and steps[-1]["act"] == "set":
+            out["stage"] = steps[-1]["stage"]
+            return out
+        gone = {x["stage"] for x in steps}
+        if n == 1:
+            pool = rules["starters"]
+            turns = ([a] + [b if (i // 2) % 2 == 0 else a for i in range(len(pool) - 2)])[:len(pool) - 1]   # (a, b b, a a ...)
+            open_ = [x for x in pool if x not in gone]
+            if len(steps) >= len(turns):
+                out["stage"] = open_[0] if open_ else ""
+                return out
+            who = turns[len(steps)]
+            left = 1
+            while len(steps) + left < len(turns) and turns[len(steps) + left] == who:
+                left += 1
+            out.update(phase="strike", turn=who, left=left, options=open_)
+            return out
+        last = self.games(mid)[-1]
+        pool = rules["starters"] + rules["counterpicks"]
+        open_ = [x for x in pool if x not in gone]
+        bans = [x for x in steps if x["act"] == "ban"]
+        picks = [x for x in steps if x["act"] == "pick"]
+        if picks:
+            out["stage"] = picks[-1]["stage"]
+        elif len(bans) < rules["bans"]:
+            out.update(phase="ban", turn=last["winner"], left=rules["bans"] - len(bans), options=open_)
+        else:
+            out.update(phase="pick", turn=last["loser"], left=1, options=open_)
+        return out
+
+    def stage_act(self, mid, player, stage, game=None, organizer=False):
+        """A player's strike, ban or pick (whichever is theirs to do). Returns (http status, state
+        or error). organizer: acts for whoever's turn it is; player "" with organizer sets the stage."""
+        self.tick()
+        st = self.stages(mid) if mid == self.current() or organizer else None
+        if not st:
+            return 409, "no stage striking for that match now"
+        if game is not None and game != st["game"]:
+            return 409, "not that game"
+        stage = str(stage or "").strip().lower()
+        steps = self.state["strikes"].setdefault(mid, {}).setdefault(str(st["game"]), [])
+        if organizer and not player:
+            rules = self.state["rules"]
+            if stage not in rules["starters"] + rules["counterpicks"]:
+                return 400, f"no stage {stage!r} in the rules"
+            steps.append({"by": "organizer", "act": "set", "stage": stage})
+            self.save()
+            return 200, self.stages(mid)
+        if st["phase"] == "done":
+            return 409, "the stage is chosen"
+        by = self._name_in(player, mid)
+        if not by or (by != st["turn"] and not organizer):
+            return 403, f"{st['turn']}'s turn"
+        if stage not in st["options"]:
+            return 409, f"{stage!r} isn't open"
+        steps.append({"by": st["turn"], "act": st["phase"], "stage": stage})
+        self.save()
+        return 200, self.stages(mid)
 
     # --- results -----------------------------------------------------------------------------
     def _name_in(self, name, mid):
@@ -480,6 +587,9 @@ class Bracket:
         for k in ("stocks", "percent"):
             if rep and k in rep:
                 g[k] = rep[k]
+        st = self.stages(mid)
+        if st and st["stage"]:
+            g["stage"] = st["stage"]
         fighters = {by: r["fighter"] for by, r in self.reports.get(mid, {}).items() if "fighter" in r}
         if fighters:
             g["fighters"] = fighters
@@ -553,6 +663,7 @@ class Bracket:
         for x in self.dependents(mid) | (set() if keep_self else {mid}):
             self.state["results"].pop(x, None)
             self.state.setdefault("games", {}).pop(x, None)
+            self.state.setdefault("strikes", {}).pop(x, None)
             self.reports.pop(x, None)
             self.disputed.discard(x)
         self.save()
@@ -590,6 +701,11 @@ class Bracket:
             if seen:   # each player's fighter in the set's latest game they reported
                 row["fighters"] = [seen.get(a, ""), seen.get(b, "")]
                 fighters.update(seen)
+            if any("stage" in x for x in self.games(mid)):
+                row["game_stages"] = [x.get("stage", "") for x in self.games(mid)]
+            sg = self.stages(mid) if st in ("playing", "ready", "disputed") else None
+            if sg:
+                row["stages"] = sg
             if m.get("best_of", 1) > 1:   # the set: its length, the games' winners and the score (a's, b's)
                 games = [x["winner"] for x in self.games(mid)]
                 row.update(best_of=m["best_of"], games=games)
@@ -606,7 +722,8 @@ class Bracket:
             rows.append(row)
         out = {"players": self.state["players"], "format": self.state["format"], "arena": self.state.get("arena", ""),
                "owner": self.state.get("owner", ""), "current": cur, "champion": self.champion(), "matches": rows,
-               "fighters": fighters}   # (each player's latest, in the order matches are played)
+               "fighters": fighters,   # (each player's latest, in the order matches are played)
+               "rules": self.state.get("rules")}
         if self.state.get("pools"):
             out["advance"] = self.state.get("advance", 0)
             out["pools"] = []
@@ -639,6 +756,11 @@ def route(b, method, target, body):
         status, st = b.report(str(data.get("match", "")), data.get("winner"), data.get("loser"),
                               data.get("reporter"), data)
         return _json(status, {"ok": status == 200, "state": st} if status == 200 else {"ok": False, "error": st})
+    if method == "POST" and path == "/arena/stage":
+        g = data.get("game")
+        status, st = b.stage_act(str(data.get("match", "")), data.get("player"), data.get("stage"),
+                                 g if isinstance(g, int) and not isinstance(g, bool) else None)
+        return _json(status, {"ok": True, "stages": st} if status == 200 else {"ok": False, "error": st})
     if method == "GET" and path == "/bracket.json":
         return _json(200, b.view())
     if method == "GET" and path in ("/bracket", "/"):
@@ -652,7 +774,7 @@ def route(b, method, target, body):
             if act == "setup":
                 b.setup(list(data.get("players") or []), data.get("format", "double"), data.get("arena"), data.get("owner"),
                         data.get("best_of") or 1, data.get("finals_best_of"), data.get("pools") or 0,
-                        data.get("advance") or 2)
+                        data.get("advance") or 2, data.get("stages"))
             elif act == "result":
                 b.admin_result(str(data.get("match", "")), data.get("winner"))
             elif act == "game":
@@ -661,6 +783,11 @@ def route(b, method, target, body):
                 b.clear(str(data.get("match", "")))
             elif act == "arena":
                 b.set_arena(data.get("arena"), data.get("owner"))
+            elif act == "stage":
+                status, st = b.stage_act(str(data.get("match", "")), data.get("player") or "", data.get("stage"),
+                                         organizer=True)
+                if status != 200:
+                    return _json(status, {"error": st})
             else:
                 return _json(400, {"error": f"action {act!r}"})
         except (ValueError, TypeError) as e:
@@ -734,10 +861,12 @@ textarea,input,select{background:var(--card);color:var(--text);border:1px solid 
 table.st{border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;min-width:220px}
 table.st td,table.st th{padding:4px 8px;text-align:left;font-size:13px}table.st th{color:var(--dim);font-weight:500}
 table.st tr.go td{color:var(--win);font-weight:600}
+.stg{margin-top:10px}.stg button{margin:2px}.stg .x{text-decoration:line-through;color:var(--dim)}
 .admin label{display:block;margin:8px 0 4px;color:var(--dim);font-size:13px}.err{color:var(--bad)}
 </style></head><body>
 <h1 id="title">Bracket</h1><div class="sub" id="sub"></div>
 <div class="now" id="now"></div>
+<p class="sub" id="iamrow" hidden>Striking stages? You are <select id="iam" style="width:auto"></select></p>
 <div class="cols" id="pooltab"></div>
 <div class="cols" id="cols"></div>
 <div class="admin" id="admin" hidden>
@@ -748,6 +877,12 @@ table.st tr.go td{color:var(--win);font-weight:600}
  <label>Players going on from each pool</label><select id="adv"><option>1</option><option selected>2</option><option>3</option><option>4</option></select>
  <label>Sets: best of</label><select id="bo"><option>1</option><option>3</option><option>5</option><option>7</option><option>9</option></select>
  <label>Finals (the final; winners, losers and grand finals): best of</label><select id="fbo"><option value="">the same</option><option>1</option><option>3</option><option>5</option><option>7</option><option>9</option></select>
+ <label>Stage striking</label><select id="stg"><option value="">Off</option><option value="1">On</option></select>
+ <div id="stgset" hidden>
+  <label>Starters (game 1: struck until one is left), one stage id per line</label><textarea id="starters" rows="5"></textarea>
+  <label>Counterpicks (games 2 on, with the starters)</label><textarea id="counter" rows="3"></textarea>
+  <label>Bans by the last game's winner</label><select id="bans"><option>0</option><option>1</option><option selected>2</option><option>3</option></select>
+ </div>
  <label>Arena ID</label><input id="arena">
  <label>Arena owner (online name; presses + to start)</label><input id="owner">
  <p><button id="setup">Start a new bracket</button> <button id="savearena">Save arena only</button> <span id="msg" class="err"></span></p>
@@ -764,6 +899,12 @@ function draw(b){
  const cur=b.matches.find(m=>m.id===b.current);
  $("now").innerHTML=b.champion?"Champion: <b>"+esc(b.champion)+"</b>":cur?"Now playing ("+esc(cur.label)+(cur.best_of?", game "+cur.game+" of best of "+cur.best_of:"")+")<br><b>"+esc(cur.a)+"</b> vs <b>"+esc(cur.b)+"</b>"+(cur.score?" &nbsp;"+cur.score.join("–"):"")+(cur.state==="disputed"?' <span class="err">(reports disagree: the organizer decides)</span>':""):b.players.length?"Waiting":"No bracket yet";
  $("pooltab").innerHTML=(b.pools||[]).map(g=>'<div class="col"><h2>Pool '+esc(g.name)+(g.done?" · final":"")+'</h2><table class="st"><tr><th></th><th>Player</th><th>Sets</th><th>Games</th></tr>'+g.standings.map((r,i)=>'<tr class="'+(g.done&&i<b.advance?"go":"")+'"><td>'+(i+1)+"</td><td>"+esc(r.name)+"</td><td>"+r.wins+"–"+r.losses+"</td><td>"+r.games_won+"–"+r.games_lost+"</td></tr>").join("")+"</table></div>").join("");
+ const sg=cur&&cur.stages;
+ if(sg){const act={strike:"strikes",ban:"bans",pick:"picks"}[sg.phase];
+  const done=sg.steps.map(s=>'<span class="x">'+esc(s.stage)+"</span>").join(" ");
+  const can=ADMIN||(ME&&ME===sg.turn);
+  $("now").innerHTML+='<div class="stg">Game '+sg.game+" stage: "+(sg.phase==="done"?"<b>"+esc(sg.stage)+"</b>":esc(sg.turn)+" "+act+" "+sg.left+(sg.left>1?" more":"")+"<br>"+sg.options.map(o=>can?'<button data-st="'+esc(o)+'" data-m="'+esc(cur.id)+'" data-p="'+esc(sg.turn)+'">'+esc(o)+"</button>":esc(o)).join(" "))+(done?"<br>"+done:"")+"</div>"}
+ if(!ADMIN&&b.rules){$("iamrow").hidden=false;$("iam").innerHTML='<option value="">(watching)</option>'+b.players.map(p=>'<option'+(p===ME?" selected":"")+">"+esc(p)+"</option>").join("")}
  const groups={};for(const m of b.matches)(groups[col(m)]=groups[col(m)]||[]).push(m);
  $("cols").innerHTML=Object.entries(groups).map(([t,ms])=>'<div class="col"><h2>'+esc(t)+"</h2>"+ms.map(m=>{
   const cls=p=>m.winner?(m.winner===p?"w":"l"):"";
@@ -771,11 +912,16 @@ function draw(b){
   const btn=p=>!ADMIN||!p?"":m.best_of&&!m.winner?b1(p,"game","game")+b1(p,"result","set"):b1(p,"result","win");
   const sc=i=>m.score?"<span>"+m.score[i]+"</span>":"";
   return '<div class="m '+m.state+'"><div class="p '+cls(m.a)+'"><span>'+esc(m.a||"—")+"</span>"+sc(0)+btn(m.a)+'</div><div class="p '+cls(m.b)+'"><span>'+esc(m.b||"—")+"</span>"+sc(1)+btn(m.b)+'</div><div class="tag">'+esc(m.label)+(m.best_of?" · best of "+m.best_of:"")+(m.how?" · "+esc(m.how):"")+(m.state==="playing"&&m.best_of?" · game "+m.game:"")+(m.state==="playing"?" · now":"")+(m.state==="disputed"?" · disputed":"")+"</div></div>"}).join("")+"</div>").join("");
- if(ADMIN&&!$("players").value){$("players").value=b.players.join("\n");$("fmt").value=b.format;$("arena").value=b.arena;$("owner").value=b.owner}
+ if(ADMIN&&!$("players").value){$("players").value=b.players.join("\n");const R=b.rules||{starters:["battle_field","end","battle_field_s","poke_stadium2","animal_village"],counterpicks:["animal_city","poke_kalos","trail_castle"],bans:2};$("stg").value=b.rules?"1":"";$("stgset").hidden=!b.rules;$("starters").value=R.starters.join("\n");$("counter").value=R.counterpicks.join("\n");$("bans").value=R.bans;$("fmt").value=b.format;$("arena").value=b.arena;$("owner").value=b.owner}
 }
-document.addEventListener("click",e=>{const t=e.target;if(t.dataset&&t.dataset.m)admin({action:t.dataset.a,match:t.dataset.m,winner:t.dataset.w})});
+let ME="";try{ME=localStorage.getItem("bracket-me")||""}catch(e){}
+$("iam").onchange=()=>{ME=$("iam").value;try{localStorage.setItem("bracket-me",ME)}catch(e){};load()};
+async function strike(m,stage){const r=await fetch("/arena/stage",{method:"POST",body:JSON.stringify({match:m,player:ME,stage})});const j=await r.json();if(j.error)alert(j.error);load()}
+document.addEventListener("click",e=>{const t=e.target;if(t.dataset&&t.dataset.st){ADMIN?admin({action:"stage",match:t.dataset.m,player:t.dataset.p,stage:t.dataset.st}):strike(t.dataset.m,t.dataset.st);return}
+ if(t.dataset&&t.dataset.m)admin({action:t.dataset.a,match:t.dataset.m,winner:t.dataset.w})});
 if(ADMIN){$("admin").hidden=false;
- $("setup").onclick=()=>{if(confirm("Start a new bracket? Results so far are cleared."))admin({action:"setup",players:$("players").value.split("\n"),format:$("fmt").value,arena:$("arena").value,owner:$("owner").value,pools:+$("pools").value,advance:+$("adv").value,best_of:+$("bo").value,finals_best_of:$("fbo").value?+$("fbo").value:null})};
+ $("setup").onclick=()=>{if(confirm("Start a new bracket? Results so far are cleared."))admin({action:"setup",players:$("players").value.split("\n"),format:$("fmt").value,arena:$("arena").value,owner:$("owner").value,pools:+$("pools").value,advance:+$("adv").value,stages:$("stg").value?{starters:$("starters").value.split("\n"),counterpicks:$("counter").value.split("\n"),bans:+$("bans").value}:null,best_of:+$("bo").value,finals_best_of:$("fbo").value?+$("fbo").value:null})};
+ $("stg").onchange=()=>{$("stgset").hidden=!$("stg").value};
  $("savearena").onclick=()=>admin({action:"arena",arena:$("arena").value,owner:$("owner").value});}
 async function load(){try{draw(await (await fetch("/bracket.json",{cache:"no-store"})).json())}catch(e){}}
 load();setInterval(load,3000);
