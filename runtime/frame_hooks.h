@@ -30,6 +30,7 @@ enum { FRAME_HOOKS_MAX = 8 };   /* registrations a point holds */
  * saves the frame end's report as SSBU_DETERMINISTIC leaves it; rollback netplay (never on with
  * the ring: kernel_watch.h) likewise. */
 enum { FRAME_ORDER_ROLLBACK = 100,     /* (hle_rollback_ring.c) */
+       FRAME_ORDER_ARENA = 120,        /* (hle_trace.c: the bracket's stage, before netplay sends the stage on) */
        FRAME_ORDER_NETPLAY = 150,      /* (hle_rb_core.c, SSBU_RB) */
        FRAME_ORDER_FIGHT_TEST = 200 };   /* (hle_fight_test.c) */
 

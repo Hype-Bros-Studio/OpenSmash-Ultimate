@@ -13,6 +13,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "fight_test.h"
+#include "frame_hooks.h"
 #include "game_addr.h"
 #include "host.h"
 
@@ -108,7 +110,7 @@ static GuestFn *arena_orig;
  * until the next request.
  * "start" then presses + (Smash!) on player 1, as a player would, once this station has shown two
  * players in the ring for 8 s (a lone press, or one before the other stations see both, gets "Could
- * not begin the battle." and both are sent away). "join" is for the second player: it presses once
+ * not begin the battle." and both are sent away), and not while the bracket's stage striking goes on. "join" is for the second player: it presses once
  * this station's room logic has stopped for 1 s, which it does while another player's start is
  * pending. Each station sees the others' moves seconds late, so a fixed gap between the two presses
  * doesn't hold up; a second press 6 s or more after the first, or in the same frame, cancels both.
@@ -138,6 +140,7 @@ static void arena_request(int want, const char *word, const char *from, double n
 }
 long online_arena_assignment(int *place, char *role, int rcap);   /* (hle_online.c) */
 int online_arena_report(int won, const char *fighter);
+int online_arena_stage(char *stage, int cap);
 static int a_battle;     /* this station started a battle and has not reported it yet */
 static double a_back;    /* when the room came back after that battle */
 void arena_poll(void) {
@@ -175,7 +178,9 @@ void arena_poll(void) {
         bracket_seen = seq;
         arena_request(place, role, "bracket", now);
     }
-    if (a_start && a_want && a_cur == a_want && a_ring_since && now >= a_ring_since + 8.0) {   /* both in the ring, as this station sees it, for 8 s */
+    char stage[48];
+    int striking = online_arena_stage(stage, sizeof stage) == 2;   /* (the bracket's stage not chosen yet: held) */
+    if (a_start && a_want && a_cur == a_want && a_ring_since && now >= a_ring_since + 8.0 && !striking) {   /* both in the ring, as this station sees it, for 8 s */
         hid_press(10, 0.15);   /* B_PLUS */
         a_start = 0;
         a_confirm = 3;
@@ -270,6 +275,41 @@ static void arena_place(Cpu *c, u64 room) {
         fflush(stderr);
     }
 }
+/* The bracket's stage for this player's match (hle_online.c online_arena_stage: tools/bracket.py's
+ * striking), once chosen: written into the stage choice's current entry (game_addr.h STAGE_CHOICES), in
+ * its normal form, as player 1's record of a match is built (the game reads the choice right after the
+ * records). Both stations of the battle are given the same stage, so each writes the same. Only once
+ * this station has been in an arena room (the controls screen builds records too). */
+static void arena_record(Cpu *c, const u64 args[8], void *ctx) {
+    (void)ctx;
+    if ((int)args[1] != 0 || !a_room) return;
+    char stage[48], nm[64];
+    u32 cur = *P(u32, GAME_ADDR(STAGE_CHOICE_INDEX));
+    u64 sel = GAME_ADDR(STAGE_CHOICES) + 0x20ull * (cur < 3 ? cur : 0), was = *P(u64, sel);
+    int on = online_arena_stage(stage, sizeof stage);
+    if (on && stage[0]) {
+        snprintf(nm, sizeof nm, "ui_stage_%s", stage);
+        *P(u64, sel) = 0x6900000000000000ull | fight_hash40(nm);
+        *P(u32, sel + 8) = 0;
+    }
+    fprintf(stderr, "[arena] match set-up (from %#llx): stage choice %u was ui_stage %llx form %u; %s%s\n", (unsigned long long)c->x[30], cur,
+            (unsigned long long)was, *P(u32, sel + 8), !on ? "no bracket stage" : !stage[0] ? "the bracket's stage not chosen yet: the game's own"
+            : "the bracket's: ", on && stage[0] ? stage : "");
+    fflush(stderr);
+}
+/* (research) the match block's stage (+0x420) each time it changes, with the stage choice: at frame ends */
+static void arena_frame_end(Cpu *c, const u64 args[8], void *ctx) {
+    (void)c; (void)args; (void)ctx;
+    static u32 last;
+    u32 now = *P(u32, GAME_ADDR(MATCH_BLOCK) + 0x420);
+    if (now == last) return;
+    u32 cur = *P(u32, GAME_ADDR(STAGE_CHOICE_INDEX));
+    u64 sel = GAME_ADDR(STAGE_CHOICES) + 0x20ull * (cur < 3 ? cur : 0);
+    fprintf(stderr, "[arena] match block's stage %x -> %x (stage choice %u: ui_stage %llx form %u)\n", last, now, cur,
+            (unsigned long long)*P(u64, sel), *P(u32, sel + 8));
+    fflush(stderr);
+    last = now;
+}
 static void arena_room(Cpu *c) {
     static char last[1024];
     char line[1024];
@@ -309,6 +349,8 @@ void trace_install(void) {
         u64 orig = rt_hook_function(rt_module_main.base + 0x1c50320, rt_native(arena_room, "SSBU_TRACE_ARENA hook"));
         if (orig) arena_orig = rt_lookup(orig);
         fprintf(stderr, "[arena] room logic %s\n", orig ? "traced" : "not found");
+        frame_hook_add(FRAME_HOOK_RECORD, FRAME_ORDER_ARENA, arena_record, NULL, NULL);
+        frame_hook_add(FRAME_HOOK_END, FRAME_ORDER_ARENA, NULL, arena_frame_end, NULL);
     }
     if (!v || !*v) return;
     const char *l = getenv("SSBU_TRACE_FN_LIMIT");
