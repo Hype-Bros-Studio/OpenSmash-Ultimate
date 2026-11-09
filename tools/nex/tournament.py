@@ -372,6 +372,10 @@ class Tourney:
             if on and current is None:
                 current = mid
             row = {"id": mid, "label": label, "a": name(m["slots"][0]), "b": name(m["slots"][1]), "state": st}
+            # (bracket.py's: the side, and where its players come from: the matches below, or seats)
+            lv = m["level"]
+            row["side"], row["from"] = "winners", ([{"winner": f"W{lv}-{2 * j + k + 1}"} for k in (0, 1)] if lv
+                                                   else [{"seat": 2 * j + k} for k in (0, 1)])
             if m["winner"] is not None:
                 row["winner"] = name(m["winner"])
             rows.append(row)

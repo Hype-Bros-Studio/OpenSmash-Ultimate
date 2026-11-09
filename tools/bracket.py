@@ -16,8 +16,10 @@ HTTP, on the lobby's TCP port (the lobby hands over any connection that starts w
                                  press + in turn, "start" first, then "join" (runtime/hle_trace.c);
                                  "game": for those two, the game of the set being played (from 1).
   POST /arena/result             {"match", "winner", "loser", "reporter", "game"?, "stocks"?,
-                                 "percent"?} -> {"ok", "state": "pending"|"confirmed"|"disputed"};
-                                 409 when the match (or that game of it) isn't being played.
+                                 "percent"?, "fighter"?} -> {"ok", "state": "pending"|"confirmed"|
+                                 "disputed"}; 409 when the match (or that game of it) isn't being
+                                 played. "fighter": the reporter's, "0x<hash>[/<costume>]" (the
+                                 hash40 of its ui_chara id, in hex), kept with the game.
   GET  /bracket.json             the whole bracket, for the in-game overlay and the page.
   GET  /bracket                  the page (with ?key=K: the organizer's controls).
   POST /bracket/admin            {"key", "action": "setup"|"result"|"game"|"clear"|"arena", ...}
@@ -49,6 +51,8 @@ MAX_PLAYERS = 64
 MAX_NAME = 40
 POOL_NAMES = "ABCDEFGH"
 FINALS = ("Final", "Winners final", "Losers final", "Grand final", "Grand final reset")   # (build's labels)
+FIGHTER = re.compile(r"0x[0-9a-f]{1,10}(/[0-9]{1,3})?")
+SIDES = {"W": "winners", "L": "losers", "G": "finals"}   # (a bracket match's id: its side)
 
 
 def norm(name):
@@ -428,8 +432,14 @@ class Bracket:
         self.tick()
         g = extra.get("game") if extra else None
         g = g if isinstance(g, int) and not isinstance(g, bool) else None
+        fighter = extra.get("fighter") if extra else None
+        fighter = fighter if isinstance(fighter, str) and FIGHTER.fullmatch(fighter) else None
         if g is not None and mid in self.state["matches"] and 1 <= g <= len(self.games(mid)):
-            return 200, "confirmed"     # (a late report of a game decided already: the game stands, whoever it names)
+            by = self._name_in(reporter, mid)    # (a late report of a game decided already: the game stands, whoever
+            if fighter and by:                   # it names, and takes the reporter's fighter)
+                self.games(mid)[g - 1].setdefault("fighters", {})[by] = fighter
+                self.save()
+            return 200, "confirmed"
         if mid != self.current() or g is not None and g != self.game(mid):
             return 409, "not being played"
         w, lo, by = self._name_in(winner, mid), self._name_in(loser, mid), self._name_in(reporter, mid)
@@ -441,6 +451,8 @@ class Bracket:
         for k in ("stocks", "percent"):
             if extra and isinstance(extra.get(k), (int, float, list)):
                 rep[k] = extra[k]
+        if fighter:
+            rep["fighter"] = fighter
         mine = self.reports.setdefault(mid, {})
         mine[by] = rep
         wins = {r["winner"] for r in mine.values()}
@@ -468,6 +480,9 @@ class Bracket:
         for k in ("stocks", "percent"):
             if rep and k in rep:
                 g[k] = rep[k]
+        fighters = {by: r["fighter"] for by, r in self.reports.get(mid, {}).items() if "fighter" in r}
+        if fighters:
+            g["fighters"] = fighters
         games = self.state.setdefault("games", {}).setdefault(mid, [])
         games.append(g)
         won = sum(x["winner"] == winner for x in games)
@@ -551,7 +566,7 @@ class Bracket:
         if v:
             return v
         cur = self.current()
-        rows = []
+        rows, fighters = [], {}
         for mid in self.order:
             m = self.state["matches"][mid]
             if not self.needed(mid) and mid not in self.state["results"]:
@@ -567,6 +582,14 @@ class Bracket:
             row = {"id": mid, "label": m["label"], "a": a or "", "b": b or "", "state": st}
             if "pool" in m:
                 row["pool"] = m["pool"]
+            else:   # the bracket's: its side, and where its players come from (build's sides)
+                row["side"], row["from"] = SIDES.get(mid[0], ""), [m["a"], m["b"]]
+            seen = {}
+            for x in self.games(mid):
+                seen.update(x.get("fighters", {}))
+            if seen:   # each player's fighter in the set's latest game they reported
+                row["fighters"] = [seen.get(a, ""), seen.get(b, "")]
+                fighters.update(seen)
             if m.get("best_of", 1) > 1:   # the set: its length, the games' winners and the score (a's, b's)
                 games = [x["winner"] for x in self.games(mid)]
                 row.update(best_of=m["best_of"], games=games)
@@ -582,7 +605,8 @@ class Bracket:
                 row["reports"] = {k: v["winner"] for k, v in self.reports[mid].items()}
             rows.append(row)
         out = {"players": self.state["players"], "format": self.state["format"], "arena": self.state.get("arena", ""),
-               "owner": self.state.get("owner", ""), "current": cur, "champion": self.champion(), "matches": rows}
+               "owner": self.state.get("owner", ""), "current": cur, "champion": self.champion(), "matches": rows,
+               "fighters": fighters}   # (each player's latest, in the order matches are played)
         if self.state.get("pools"):
             out["advance"] = self.state.get("advance", 0)
             out["pools"] = []

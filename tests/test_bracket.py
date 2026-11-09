@@ -1,10 +1,14 @@
 """tools/bracket.py: the arena bracket the online lobby keeps. Brackets of every size from 2 to 16
 played out (single and double elimination, byes, the grand-final reset), players' reports (agreeing,
 disagreeing, one left alone), best-of sets, the organizer's fixes, the saved file, and the HTTP the players' games
-and the page use, over loopback. Made-up names only."""
+and the page use, over loopback; and the game's tourney table made from the view (tools/bracket_tui.py,
+and runtime/hle_tourney_table.c, which must make the same). Made-up names only."""
 import asyncio
 import json
 import os
+import random
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'tools'))
 import bracket as B  # noqa: E402
+import bracket_tui as T  # noqa: E402
 
 NAMES = [f"P{i}" for i in range(1, 17)]
 
@@ -161,6 +166,23 @@ class Pools(unittest.TestCase):
         self.assertTrue(all(r["a"] == "" and r["b"] == "" for r in first))
         self.assertTrue(all(r.get("pool") for r in b.view()["matches"] if r["id"].startswith("P")))
 
+    def test_fighters_with_pools(self):
+        """Pool rows take fighters as any row does, but no side or sources; the bracket's rows fed from a
+        pool have its place as their source."""
+        b = B.Bracket()
+        b.setup(["A", "B", "C", "D"], "single", pools=2, advance=1)   # pools: A,D / B,C
+        b.report("PA-1", "D", "A", "D", {"fighter": "0xabc/1"})
+        b.report("PA-1", "D", "A", "A", {"fighter": "0xdef"})
+        v = b.view()
+        rows = {r["id"]: r for r in v["matches"]}
+        self.assertEqual(rows["PA-1"]["fighters"], ["0xdef", "0xabc/1"])   # (a is A, b is D)
+        self.assertNotIn("side", rows["PA-1"])
+        self.assertNotIn("from", rows["PA-1"])
+        self.assertEqual((rows["W1-1"]["side"], rows["W1-1"]["from"]),
+                         ("winners", [{"pool": "A", "place": 0}, {"pool": "B", "place": 0}]))
+        self.assertEqual(v["fighters"], {"A": "0xdef", "D": "0xabc/1"})
+        self.assertEqual(b.standings("A")[0][0]["name"], "D")
+
     def test_tie_broken_head_to_head_then_games(self):
         b = B.Bracket()
         b.setup(["A", "B", "C", "D"], "single", pools=2, advance=1)   # pools: A,D / B,C
@@ -231,6 +253,34 @@ class Reports(unittest.TestCase):
         self.assertEqual(b.state["results"]["W1-1"]["winner"], "Di")
         self.assertEqual(b.state["results"]["W1-1"]["stocks"], 2)
         self.assertEqual(b.current(), "W1-2")
+
+    def test_fighters(self):
+        """Each report's fighter is kept with the game, by reporter; the view has each row's and each player's
+        latest. A fighter that isn't one ("0x" and up to 10 hex digits, then maybe /costume) is left out."""
+        b = self.b
+        b.report("W1-1", "Ann", "Di", "Ann", {"fighter": "0x1a2b3c4d5e/3"})
+        b.report("W1-1", "Ann", "Di", "Di", {"fighter": "Zed"})
+        self.assertEqual(b.games("W1-1")[0]["fighters"], {"Ann": "0x1a2b3c4d5e/3"})
+        b.report("W1-1", "Ann", "Di", "Di", {"game": 1, "fighter": "0x77"})   # (late: the game takes it)
+        self.assertEqual(b.games("W1-1")[0]["fighters"], {"Ann": "0x1a2b3c4d5e/3", "Di": "0x77"})
+        b.report("W1-2", "Bo", "Cy", "Cy", {"fighter": "0x5"})
+        self.clock.t += B.CONFIRM_AFTER
+        v = b.view()
+        rows = {r["id"]: r for r in v["matches"]}
+        self.assertEqual(rows["W1-1"]["fighters"], ["0x1a2b3c4d5e/3", "0x77"])
+        self.assertEqual(rows["W1-2"]["fighters"], ["", "0x5"])
+        self.assertNotIn("fighters", rows["W2-1"])
+        self.assertEqual(v["fighters"], {"Ann": "0x1a2b3c4d5e/3", "Di": "0x77", "Cy": "0x5"})
+        b.report("W2-1", "Ann", "Bo", "Ann", {"fighter": "0x9/0"})
+        b.report("W2-1", "Ann", "Bo", "Bo")
+        self.assertEqual(b.view()["fighters"]["Ann"], "0x9/0")
+
+    def test_sides_and_sources(self):
+        rows = {r["id"]: r for r in self.b.view()["matches"]}
+        self.assertEqual((rows["W1-1"]["side"], rows["W1-1"]["from"]), ("winners", [{"seed": 0}, {"seed": 3}]))
+        self.assertEqual((rows["L1-1"]["side"], rows["L1-1"]["from"]), ("losers", [{"loser": "W1-1"}, {"loser": "W1-2"}]))
+        self.assertEqual((rows["GF"]["side"], rows["GF"]["from"]), ("finals", [{"winner": "W2-1"}, {"winner": "L2-1"}]))
+        self.assertNotIn("GF2", rows)
 
     def test_one_report_confirms_after_a_while(self):
         b = self.b
@@ -494,6 +544,106 @@ class ThroughTheLobby(unittest.TestCase):
             self.assertEqual(asyncio.run(go(b"SSBUNEX1" + bytes(8))), b"")    # (not a known player: closed)
             self.assertEqual(lobby.handshakes, {})
             self.assertTrue(os.path.exists(os.path.join(tmp, "bracket.key")))
+
+
+def lines(text, word):
+    return [ln.split()[1:] for ln in text.splitlines() if ln.split()[0] == word]
+
+
+class Table(unittest.TestCase):
+    """tools/bracket_tui.py: the game's tourney table from the view, for one player."""
+
+    def test_single_elimination(self):
+        b = B.Bracket()
+        b.setup(NAMES[:8], "single")
+        t = T.table_from_view(b.view(), "p1")
+        self.assertEqual(lines(t, "class"), [["1"]])
+        self.assertEqual(lines(t, "local"), [["0"]])
+        self.assertEqual(len(lines(t, "name")), 8)
+        play_out(b, lambda a, c: min(a, c, key=seed_of))
+        self.assertIn(["2", "0", "0"], lines(T.table_from_view(b.view(), "P1"), "match"))   # (the final decided)
+        self.assertIsNone(T.table_from_view(b.view(), "P1", can_end=False))
+
+    def test_byes_are_leaves(self):
+        b = B.Bracket()
+        b.setup(NAMES[:5], "single")
+        t = T.table_from_view(b.view(), "P1")
+        self.assertEqual(lines(t, "local"), [["0"]])
+        self.assertIn(["0", "0", "0", "0"], lines(t, "match"))   # (P1's bye: one entrant, already through)
+        self.assertEqual(len(lines(t, "name")), 5)
+
+    def test_losers_side_and_grand_final(self):
+        b = B.Bracket()
+        b.setup(NAMES[:8], "double")
+        seen = set()
+        while (mid := b.current()):
+            t = T.table_from_view(b.view(), "P8")
+            self.assertIsNotNone(t, mid)
+            seen.add((mid[0], lines(t, "class")[0][0], lines(t, "events")[0][0]))
+            b.admin_result(mid, min(b.players_of(mid), key=seed_of))
+        self.assertEqual(seen, {("W", "1", "8"), ("L", "3", "16"), ("G", "5", "32")})
+
+    def test_pool_being_played(self):
+        b = B.Bracket()
+        b.setup(NAMES[:8], "double", pools=2)
+        self.assertIsNone(T.table_from_view(b.view(), "P1"))
+
+    def test_fighters(self):
+        b = B.Bracket()
+        b.setup(NAMES[:4], "single")
+        mid = b.current()
+        a, c = b.players_of(mid)
+        b.report(mid, a, c, a, {"fighter": "0x1a2b3c4d5e/3"})
+        b.report(mid, a, c, c, {"fighter": "0x99"})
+        t = T.table_from_view(b.view(), a)
+        named = {n: e for e, n in lines(t, "name")}
+        self.assertEqual(sorted(lines(t, "fighter")), sorted([[named[a], "0x1a2b3c4d5e/3"], [named[c], "0x99"]]))
+
+
+CLANG = shutil.which("clang")
+
+
+@unittest.skipUnless(CLANG, "needs clang")
+class TableInC(unittest.TestCase):
+    """runtime/hle_tourney_table.c (through tools/dev/tourneytabletest.c) makes what bracket_tui.py does."""
+
+    def test_same_as_python(self):
+        root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "tourneytabletest")
+            r = subprocess.run([CLANG, "-O1", "-Wall", "-Werror", str(root / "tools/dev/tourneytabletest.c"),
+                                str(root / "runtime/hle_tourney_table.c"), "-o", exe], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            rng = random.Random(7)
+            cases, want = [], []
+
+            def add(v):
+                js = json.dumps(v)
+                for me in sorted({p for r in v["matches"] for p in (r["a"], r["b"]) if p} | {"nobody", " p1 "}):
+                    for can_end in (0, 1):
+                        cases.append(f"{me}\t{can_end}\t{js}")
+                        want.append(T.table_from_view(v, me, bool(can_end)) or "none\n")
+            for n, fmt, pools in [(n, f, 0) for n in range(2, 19) for f in ("single", "double")] + \
+                    [(24, "double", 0), (33, "single", 0), (9, "double", 2), (12, "single", 3)]:
+                b = B.Bracket()
+                b.setup([f"P{i}" for i in range(1, n + 1)], fmt, pools=pools) if pools else b.setup(
+                    [f"P{i}" for i in range(1, n + 1)], fmt)
+                add(b.view())
+                while (mid := b.current()):
+                    a, c = b.players_of(mid)
+                    w = rng.choice([a, c])
+                    lo = c if w == a else a
+                    if rng.random() < .5:
+                        b.report(mid, w, lo, a, {"fighter": "0x%x/%d" % (rng.getrandbits(36), rng.randrange(8))})
+                        b.report(mid, w, lo, c, {"fighter": "0x%x" % rng.getrandbits(36)})
+                    else:
+                        b.admin_result(mid, w)
+                    add(b.view())
+            r = subprocess.run([exe], input="\n".join(cases) + "\n", capture_output=True, text=True, timeout=120)
+            got = r.stdout.split("--\n")[:-1]
+            self.assertEqual(len(got), len(cases))
+            for case, g, w in zip(cases, got, want):
+                self.assertEqual(g, w, case[:200])
 
 
 if __name__ == "__main__":

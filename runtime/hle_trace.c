@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "game_addr.h"
 #include "host.h"
 
 #define TRACES 32
@@ -136,7 +137,7 @@ static void arena_request(int want, const char *word, const char *from, double n
     fflush(stderr);
 }
 long online_arena_assignment(int *place, char *role, int rcap);   /* (hle_online.c) */
-int online_arena_report(int won);
+int online_arena_report(int won, const char *fighter);
 static int a_battle;     /* this station started a battle and has not reported it yet */
 static double a_back;    /* when the room came back after that battle */
 void arena_poll(void) {
@@ -221,7 +222,18 @@ static void arena_place(Cpu *c, u64 room) {
                 if (r[0] == 1 && r[1] == 1) lost = i == own;
             }
         if (lost >= 0) {
-            int sent = online_arena_report(!lost);
+            /* This player's fighter: MATCH_BLOCK's records (+0x580, 0x260 bytes each) for the battle just
+             * played, this station's the one with a fighter (+8) and 0 at +0xa4 (the others' have 1); its
+             * ui_chara id at +0 (its low 40 bits the hash40), its costume at +0x19. */
+            char fighter[32] = "";
+            for (int i = 0; i < 8; i++) {
+                u64 rec = GAME_ADDR(MATCH_BLOCK) + 0x580 + i * 0x260, id = *P(u64, rec);
+                if (*P(i8, rec + 8) >= 0 && !*P(u8, rec + 0xa4) && id >> 56 == 0xc1 && (id & 0xffffffffffull)) {
+                    snprintf(fighter, sizeof fighter, "0x%llx/%u", (unsigned long long)(id & 0xffffffffffull), *P(u8, rec + 0x19));
+                    break;
+                }
+            }
+            int sent = online_arena_report(!lost, fighter);
             fprintf(stderr, "[arena] battle over: %s (%s)\n", lost ? "lost" : "won", sent ? "reporting" : "no bracket match");
             fflush(stderr);
             a_battle = 0;

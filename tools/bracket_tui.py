@@ -5,79 +5,130 @@ SSBU_TOURNEY_UI_FILE takes after "table" (runtime/hle_tourney_ui.c).
 
 NAME is this game's player (their online name); OUT gets "table" and the bracket (stdout without it).
 
-The game draws fixed trees (main+0x239d810's classes); the 1v1 ones are 8, 16 and 32 entrants with
-3, 4 and 5 rounds. The bracket's winners side goes in the last rounds of the smallest one it fits, each
-of its seats under a chain of matches already decided, at the top of its own subtree's slots, the rest
-filled out with blank entrants: the table wants
-an entrant in each first-round match and a winner in each match below the one being played. Byes are
-blank entrants that lose.
+The table is made from the bracket's view (GET /bracket.json), as the runtime makes it itself with
+SSBU_ARENA_BRACKET=1 (runtime/hle_tourney_table.c, the same steps in C; this one is for
+SSBU_TOURNEY_UI_FILE and for checking that one):
 
-With SSBU_ARENA_BRACKET=1 the game makes the same table itself from GET /bracket.json
-(runtime/hle_tourney_ui.c, table_from_view); this one is for SSBU_TOURNEY_UI_FILE and for checking it."""
+The game draws fixed trees (main+0x239d810's classes); the 1v1 ones are 8, 16 and 32 entrants with
+3, 4 and 5 rounds. The tree shown is the side (winners, losers or finals) of the match being played,
+or of the last match once none is: from that side's last match down through the matches whose
+winners feed it on the same side (a finals match takes in the winners' and the losers' sides too).
+Its height picks the smallest class it fits; one too high for 5 rounds starts lower down, at the
+match 4 rounds above the one being played, and the matches deepest down then show just their two
+players. A side whose player comes from anywhere else (a seed, a pool's place, the loser of another
+match, a match with a bye, which the view leaves out) is a leaf: that player at the top slot of the
+leaf's part of the tree, under a chain of matches already decided, the other slots blank entrants.
+The table wants an entrant in each first-round match and a winner in each match below the one being
+played. Once the tree's last match is decided the table moves on past it, which a 5-round class has
+no room for: no table then (nor with can_end false: the runtime without its hook for that).
+
+The lines: class C, events N, local E (this player's entrant: the one that got furthest, the later
+on a tie), me M (its match in the round being played), match R M W E... (round R's match M: winner
+entrant W, -1 not played, then in round 0 its entrants), name E TEXT, fighter E 0x<hash>[/<costume>]."""
 import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bracket import BYE, Bracket, norm  # noqa: E402
+from bracket import Bracket, norm  # noqa: E402
 
-CLASSES = [(3, 1), (4, 3), (5, 5)]     # 1v1 classes: (rounds, class)
+CLASSES = {3: 1, 4: 3, 5: 5}     # 1v1 classes: rounds -> class
+MAX_ROUNDS = 5
+
+
+def table_from_view(v, me, can_end=True):
+    """The table's lines for player `me` from a bracket view, or None when there is none to show."""
+    listed = [r for r in v.get("matches", []) if "pool" not in r and r.get("side")]
+    rows = {r["id"]: r for r in listed}
+    if not rows:
+        return None
+    cur = v.get("current")
+    if cur and cur not in rows:
+        return None     # (a pool's match being played)
+    focus = cur or listed[-1]["id"]
+
+    def kids(mid):      # the rows a row's two sides come from in its tree, None for a leaf
+        r, out = rows[mid], []
+        for src in (r.get("from") or [{}, {}])[:2]:
+            x = src.get("winner") if isinstance(src, dict) else None
+            out.append(x if x in rows and (rows[x]["side"] == r["side"] or r["side"] == "finals") else None)
+        return out
+
+    parent = {x: mid for mid in rows for x in kids(mid) if x and rows[x]["side"] == rows[mid]["side"]}
+    height = {}
+
+    def high(mid):
+        if mid not in height:
+            height[mid] = 0     # (no cycles; this only stops a bad view from recursing forever)
+            height[mid] = 1 + max((high(x) for x in kids(mid) if x), default=0)
+        return height[mid]
+
+    path = [focus]
+    while path[-1] in parent and len(path) <= len(rows):
+        path.append(parent[path[-1]])
+    root = path[min(len(path), MAX_ROUNDS) - 1]
+    rounds = max(min(CLASSES), min(MAX_ROUNDS, high(root)))
+
+    names = [""] * (1 << rounds)
+    match = {}          # (round, index) -> [winner, entrants]
+
+    def chain(name, g, i):      # a leaf at round g's match i
+        names[i << (g + 1)] = name
+        for h in range(g + 1):
+            for j in range(i << (g - h), (i + 1) << (g - h)):
+                match[h, j] = [j << (h + 1), [2 * j] if h == 0 else []]
+        return i << (g + 1)
+
+    def place(mid, g, i):       # a row at round g's match i: returns its winner's entrant (-1 not played)
+        r, ks, got = rows[mid], kids(mid), []
+        sides = [r.get("a") or "", r.get("b") or ""]
+        for k in (0, 1):
+            if g == 0:
+                names[2 * i + k] = sides[k]
+                got.append(2 * i + k)
+            elif ks[k]:
+                got.append(place(ks[k], g - 1, 2 * i + k))
+            else:
+                got.append(chain(sides[k], g - 1, 2 * i + k))
+        w = norm(r.get("winner"))
+        win = next((got[k] for k in (0, 1) if w and norm(sides[k]) == w), -1)
+        match[g, i] = [win, [2 * i, 2 * i + 1] if g == 0 else []]
+        return win
+
+    place(root, rounds - 1, 0)
+    if match[rounds - 1, 0][0] >= 0 and (rounds == MAX_ROUNDS or not can_end):
+        return None
+    count = lambda g: 1 << (rounds - 1 - g)   # noqa: E731
+    now = next((g for g in range(rounds) if any(match[g, i][0] < 0 for i in range(count(g)))), rounds - 1)
+    local, best = -1, -1
+    for e, p in enumerate(names):
+        if p and norm(p) == norm(me):
+            won = sum(match[g, i][0] == e for g in range(rounds) for i in range(count(g)))
+            if won >= best:
+                local, best = e, won
+    mine = 0
+    for i in range(count(now)):
+        sides = match[now, i][1] if now == 0 else [match[now - 1, 2 * i][0], match[now - 1, 2 * i + 1][0]]
+        if local >= 0 and local in sides:
+            mine = i
+
+    fighters = {norm(p): f for p, f in (v.get("fighters") or {}).items()}
+    out = [f"class {CLASSES[rounds]}", f"events {len(names)}", f"local {local}", f"me {mine}"]
+    for (g, i), (w, es) in sorted(match.items()):
+        out.append(" ".join(map(str, ["match", g, i, w] + es)))
+    out += [f"name {e} {p}" for e, p in enumerate(names) if p]
+    out += [f"fighter {e} {fighters[norm(p)]}" for e, p in enumerate(names) if p and norm(p) in fighters]
+    return "\n".join(out) + "\n"
 
 
 def table(state, me):
     b = Bracket()
     b.state.update(state)
     b.order = b._order()
-    ms = b.state["matches"]
-    k = max((int(mid[1:].split("-")[0]) for mid in ms if mid.startswith("W")), default=0)
-    if not k:
-        raise ValueError("no winners matches")
-    fit = [c for c in CLASSES if c[0] >= k]
-    if not fit:
-        raise ValueError(f"{k} rounds: the game's 1v1 tables have 5 at most")
-    rounds, cls = fit[0]
-    off = rounds - k
-    size = 1 << k
-
-    # the seats (entrants 0..size-1): round 1's sides in order
-    # the table draws entrant E in its slot E (of the class's 1 << rounds): seat S is entrant S << off,
-    # at the top of its own subtree, and the other entrants are blank
-    names = [""] * (1 << rounds)
-    for s in range(size):
-        src = ms[f"W1-{s // 2 + 1}"]["a" if s % 2 == 0 else "b"]
-        p = b.side(src)
-        names[s << off] = "" if p is BYE or p is None else p
-    seat = {norm(p): e for e, p in enumerate(names) if p}
-    local = seat.get(norm(me), -1)
-
-    match = {}      # (round, index) -> (winner, entrants)
-    for g in range(rounds):
-        for i in range(1 << (rounds - 1 - g)):
-            if g < off:     # a chain of decided matches above a seat, or above a blank entrant
-                match[g, i] = (2 * i, [2 * i]) if g == 0 else (match[g - 1, 2 * i][0], [])
-                continue
-            mid = f"W{g - off + 1}-{i + 1}"
-            r = b.outcome(mid) if mid in ms else None
-            w = seat.get(norm(r[0]), -1) if r and r[0] is not BYE else -1
-            match[g, i] = (w, [2 * i, 2 * i + 1] if g == 0 else [])
-
-    # (with the final decided the table moves on past it, which the runtime keeps on the final: a
-    # 5-round class has no room for that)
-    if match[rounds - 1, 0][0] >= 0 and rounds == 5:
-        raise ValueError("the bracket is over: a 32-entrant table can't show its end")
-    # this player's match in the round being played (the first with one open; the final once it's over)
-    cur = next((g for g in range(rounds) if any(match[g, i][0] < 0 for i in range(1 << (rounds - 1 - g)))), rounds - 1)
-    mine = 0
-    for i in range(1 << (rounds - 1 - cur)):
-        sides = match[cur, i][1] if cur == 0 else [match[cur - 1, 2 * i][0], match[cur - 1, 2 * i + 1][0]]
-        if local >= 0 and local in sides:
-            mine = i
-
-    out = [f"class {cls}", f"events {len(names)}", f"local {local}", f"me {mine}"]
-    for (g, i), (w, es) in sorted(match.items()):
-        out.append(" ".join(map(str, ["match", g, i, w] + es)))
-    out += [f"name {e} {p}" for e, p in enumerate(names) if p]
-    return "\n".join(out) + "\n"
+    text = table_from_view(b.view(), me)
+    if text is None:
+        raise ValueError("no table for this bracket now (a pool being played, too many rounds, or its end)")
+    return text
 
 
 def main(argv):

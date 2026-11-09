@@ -689,10 +689,10 @@ long online_arena_assignment(int *place, char *role, int rcap) {
     return seq;
 }
 
-/* This player's result of the match (the set's game) it was assigned (won or lost), to POST
- * /arena/result: once, from a thread of its own; 0 when there is no match to report. Then the
- * bracket for the tourney table, once the match is decided (2 minutes at most: bracket.py takes a
- * lone report after 60 s). */
+/* This player's result of the match (the set's game) it was assigned (won or lost), with its fighter
+ * ("0x<hash40>/<costume>", or "": not known), to POST /arena/result: once, from a thread of its own; 0
+ * when there is no match to report. Then the bracket for the tourney table, once the match is decided
+ * (2 minutes at most: bracket.py takes a lone report after 60 s). */
 typedef struct { char body[512], match[24]; long after; int game; } ArenaReport;
 static DWORD WINAPI arena_report_thread(void *arg) {
     ArenaReport *r = arg;
@@ -720,8 +720,8 @@ static void json_escape(char *out, int cap, const char *in) {
     }
     out[n] = 0;
 }
-int online_arena_report(int won) {
-    char match[24], opp[48], me[48], m[64], o[112], i[112], g[24] = "";
+int online_arena_report(int won, const char *fighter) {
+    char match[24], opp[48], me[48], m[64], o[112], i[112], g[24] = "", f[48] = "";
     long after;
     int game;
     AcquireSRWLockExclusive(&ab_lock);
@@ -738,8 +738,9 @@ int online_arena_report(int won) {
     ArenaReport *r = malloc(sizeof *r);
     if (!r) return 0;
     if (game > 0) snprintf(g, sizeof g, ", \"game\": %d", game);
-    snprintf(r->body, sizeof r->body, "{\"match\": \"%s\", \"winner\": \"%s\", \"loser\": \"%s\", \"reporter\": \"%s\"%s}",
-             m, won ? i : o, won ? o : i, i, g);
+    if (fighter && fighter[0]) snprintf(f, sizeof f, ", \"fighter\": \"%.30s\"", fighter);
+    snprintf(r->body, sizeof r->body, "{\"match\": \"%s\", \"winner\": \"%s\", \"loser\": \"%s\", \"reporter\": \"%s\"%s%s}",
+             m, won ? i : o, won ? o : i, i, g, f);
     snprintf(r->match, sizeof r->match, "%s", match);
     r->after = after;
     r->game = game;
