@@ -26,8 +26,12 @@ The formats (runtime/hle_hostmods.c reads them):
                 with key sha256("HypeSmash host mods v1\\0" + salt + code), nonce 4 zero bytes
                 and the chunk's index (u64), additional data the 40-byte head and a byte that
                 is 1 for the last chunk, 0 before; each chunk's 16-byte tag after it
+                The salt is sha256("HypeSmash host mods salt\\0" + code + sha256(plain pack))[:16]: the same pack
+                seals to the same bytes, which a player's game keeps (still sealed) and reads again next time.
   open pack     the plain pack as it is, unsealed (serve --open), under the same pack id
-  plain pack    "SSBUHMP1", u32 version (3 open, 2 sealed; 1 has no plugins); u32 mod count, then each mod's u32 hash (the runtime's
+  plain pack    "SSBUHMP1", u32 version (3 open, 2 sealed; 1 has no plugins; 4 the mods run through
+                ARCropolis: an empty layer map and overlay - the game's own data - and, sealed or open, the
+                folders as the SD card's ultimate/mods lists them, mods.txt's order); u32 mod count, then each mod's u32 hash (the runtime's
                 mod_tree_hash folded to 32 bits, net_relay.c) and u16 length and UTF-8 name;
                 the sha256 of the game's own layer map (romfs_vanilla.cfg's); u32 source
                 count and each source's u64 size; u32 length and the modded layer map; u64
@@ -56,6 +60,7 @@ PLAIN_MAGIC = b"SSBUHMP1"
 LAYER_MAGIC = b"SSBUROM1"
 VERSION = 3            # (an open pack's; a sealed one stays SEALED_VERSION, without the mods' folders)
 SEALED_VERSION = 2
+ARC_VERSION = 4        # (the mods run through ARCropolis: no overlay, the mods' folders as the SD card's ultimate/mods)
 MODS_INDEX_MAGIC = b"SSBUHMI1"   # (the pack's last section, when there: the mods' files as mods:/ sees them)
 MODS_INDEX_DATA_MAX = 4 << 10    # (the bytes of files this small are in it: plugins' marker files)
 PLUGIN_OS = {".dll": 1, ".so": 2, ".dylib": 3}   # (runtime/hle_hostmods.c HM_OS: Windows x64, Linux x64, macOS arm64)
@@ -105,14 +110,24 @@ def seal(code, plain, chunk=CHUNK, salt=None):
     head = SEALED_MAGIC + salt + struct.pack("<QII", len(plain), chunk, 0)
     key = key_of(code, salt)
     n = max(1, -(-len(plain) // chunk))
-    out = [head]
+    out = bytearray(HEAD + len(plain) + n * TAG)
+    out[:HEAD] = head
     view = memoryview(plain)
+    at = HEAD
     for i in range(n):
         c = _cipher(key, i)
         c.update(head + bytes([i == n - 1]))
         ct, tag = c.encrypt_and_digest(view[i * chunk:(i + 1) * chunk])
-        out += [ct, tag]
-    return b"".join(out)
+        out[at:at + len(ct)] = ct
+        out[at + len(ct):at + len(ct) + TAG] = tag
+        at += len(ct) + TAG
+    return bytes(out) if len(out) < (64 << 20) else out
+
+
+def content_salt(code, plain):
+    """The salt of a pack sealed from these bytes with this code: the same each time, so the same pack sealed again
+    is the same bytes, and a player's game finds it in its cache (runtime/hle_hostmods.c) instead of downloading it."""
+    return hashlib.sha256(b"HypeSmash host mods salt\0" + normalize(code) + hashlib.sha256(plain).digest()).digest()[:16]
 
 
 def unseal(code, sealed):
@@ -142,12 +157,14 @@ def unseal(code, sealed):
 
 # ---- the plain pack ------------------------------------------------------------------------
 def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin_list=b"", plugins=(), folders=None,
-                mods_index=None):
+                mods_index=None, version=None):
     """plugins: [(module name, system (PLUGIN_OS), library bytes, image bytes)]. folders (an open pack,
     version 3): [(mod folder name, [(path in the folder, bytes)])]; None for a sealed pack (version 2).
     (Names aren't checked here: tests build bad packs with it. parse_plain checks them.)"""
-    version = SEALED_VERSION if folders is None else VERSION
-    out = [PLAIN_MAGIC, struct.pack("<II", version, len(mods))]
+    if version is None:
+        version = SEALED_VERSION if folders is None else VERSION
+    out = _Out()
+    out.append(PLAIN_MAGIC + struct.pack("<II", version, len(mods)))
     for name, h in mods:
         b = name.encode("utf-8")
         out.append(struct.pack("<IH", h & 0xFFFFFFFF, len(b)) + b)
@@ -169,6 +186,9 @@ def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin
             b = name.encode("utf-8")
             out.append(struct.pack("<H", len(b)) + b + struct.pack("<I", len(files)))
             for path, data in files:
+                if isinstance(data, str):   # (a file on disk, read only now: a pack of GBs isn't held twice)
+                    with open(data, "rb") as f:
+                        data = f.read()
                 pb = path.encode("utf-8")
                 out.append(struct.pack("<H", len(pb)) + pb + struct.pack("<Q", len(data)))
                 out.append(data)
@@ -177,7 +197,19 @@ def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin
         for path, size, data in mods_index:
             pb = path.encode("utf-8")
             out.append(struct.pack("<HQI", len(pb), size, len(data)) + pb + data)
-    return b"".join(out)
+    return bytes(out.buf) if out.small() else out.buf
+
+
+class _Out:
+    """The pack as it is written: one buffer, not a list of pieces joined at the end (the pack would be held twice)."""
+    def __init__(self):
+        self.buf = bytearray()
+
+    def append(self, b):
+        self.buf += b
+
+    def small(self):
+        return len(self.buf) < (64 << 20)
 
 
 # ---- an open pack's folders: names and paths that stay in mods/<name> (runtime: hle_hostmods.c safe_part) ----
@@ -215,7 +247,7 @@ def _parse_plain(p):
     if p[:8] != PLAIN_MAGIC:
         raise Error("not a mod pack")
     version, n = struct.unpack_from("<II", p, 8)
-    if version not in (1, 2, VERSION):
+    if version not in (1, 2, VERSION, ARC_VERSION):
         raise Error(f"a mod pack of version {version}")
     at, mods = 16, []
     for _ in range(n):
@@ -292,7 +324,7 @@ def _parse_plain(p):
             at += dl
     if at != len(p):
         raise Error("a mod pack of the wrong size")
-    return {"mods": mods, "vanilla_map_sha256": sha, "source_sizes": sizes, "map": modded_map, "overlay": overlay,
+    return {"version": version, "mods": mods, "vanilla_map_sha256": sha, "source_sizes": sizes, "map": modded_map, "overlay": overlay,
             "plugin_list": plugin_list, "plugins": plugins, "folders": folders, "mods_index": mods_index}
 
 
@@ -422,8 +454,9 @@ def _cfg_lines(path):
         return [l.strip() for l in f.read().splitlines() if l.strip()]
 
 
-def mod_folder(folder):
-    """Every file of a mod's folder, with its path in it ('/' between folders), sorted. Links are left out."""
+def mod_folder(folder, lazy=False):
+    """Every file of a mod's folder, with its path in it ('/' between folders), sorted. Links are left out.
+    lazy: each file's path on disk in place of its bytes (build_plain reads it then)."""
     files = []
     for top, dirs, names in os.walk(folder):
         dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(top, d)))
@@ -434,8 +467,12 @@ def mod_folder(folder):
             rel = os.path.relpath(full, folder).replace(os.sep, "/")
             if not safe_path(rel):
                 raise Error(f"{full}: a name players' games won't save (rename it)")
+            if lazy:
+                files.append((rel, full))
+                continue
             with open(full, "rb") as f:
                 files.append((rel, f.read()))
+    files.sort(key=lambda f: f[0])
     return files
 
 
@@ -494,7 +531,7 @@ def pack_tree(root, with_plugins=True, open_pack=False):
     except (OSError, ValueError):
         raise Error("no mods applied here (dump/mods/applied.json): tools/mods.py apply first") from None
     if applied.get("arcropolis"):
-        raise Error("mods applied through ARCropolis can't be sent: apply them with tools/mods.py apply")
+        return pack_arcropolis(root, applied, with_plugins, open_pack)
     if len(cfg) < 4 or cfg[0] != "layered" or os.path.basename(cfg[1]) != MODDED_MAP or not applied.get("mods"):
         raise Error("the game here doesn't run with mods applied (dump/modules/romfs.cfg)")
     vanilla = _cfg_lines(os.path.join(modules, "romfs_vanilla.cfg"))
@@ -527,6 +564,84 @@ def pack_tree(root, with_plugins=True, open_pack=False):
     return plain, mods, [name for name, *_ in plugins]
 
 
+def sd_folder_name(root):
+    """A mods.txt entry's folder on the SD card as ARCropolis lists it (runtime/hle_fs.c mod_folder_name)."""
+    if root.startswith("."):
+        return "WindowSmash " + root[1:]
+    return root.replace("/", " - ")
+
+
+def mod_plugin_modules(root, names):
+    """[(mods.txt entry, module)] for the mods whose plugin.nro ARCropolis chainloads, by the NRO's build id
+    (dump/skyline/plugins.json, tools/skyline.py)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import skyline
+    try:
+        with open(os.path.join(root, "dump", "skyline", "plugins.json"), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        record = {}
+    out = []
+    for name in names:
+        nro = os.path.join(root, "mods", name, "plugin.nro")
+        if not os.path.isfile(nro):
+            continue
+        bid = skyline.nro_build_id(nro)
+        module = next((v["module"] for k, v in record.items() if k.rstrip("0").upper() == bid), None)
+        if not module:
+            raise Error(f"mods/{name}/plugin.nro isn't built here yet: start the game once with it on")
+        out.append((name, module))
+    return out
+
+
+def pack_arcropolis(root, applied, with_plugins=True, open_pack=False):
+    """The pack of a tree whose mods run through ARCropolis (version 4): no overlay - the players' games read their own
+    data - and each mod folder ARCropolis lists (dump/skyline/mods.txt, in its order) whole, which their SD card's
+    ultimate/mods is (runtime/hle_fs.c). The plugins: each mod's plugin.nro translated for Windows
+    (build/plugins/<module>.dll: tools/hostmods.py windows-plugins), which players load from memory."""
+    modules = os.path.join(root, "dump", "modules")
+    vanilla = _cfg_lines(os.path.join(modules, "romfs_vanilla.cfg"))
+    if vanilla[0] != "layered":
+        raise Error("romfs_vanilla.cfg isn't a layered one")
+    with open(vanilla[1], "rb") as f:
+        vanilla_sha = hashlib.sha256(f.read()).digest()
+    listed = _cfg_lines(os.path.join(root, "dump", "skyline", "mods.txt"))
+    mods = [(name, mod_hash32(os.path.join(root, "mods", name))) for name in applied["mods"]]
+    plugin_list, plugins = b"", []
+    if with_plugins:
+        with open(os.path.join(root, "dump", "skyline", "plugins.txt"), "rb") as f:
+            plugin_list = f.read()
+        for name, module in mod_plugin_modules(root, listed):
+            dll = os.path.join(root, "build", "plugins", module + ".dll")
+            image = os.path.join(root, "dump", "modules", module + ".reloc.bin")
+            if not os.path.isfile(dll):
+                print(f"note: {name}'s plugin isn't built for Windows (build/plugins/{module}.dll): Windows players' games "
+                      f"won't start with this pack - tools/hostmods.py windows-plugins", file=sys.stderr)
+                continue
+            if not os.path.isfile(image):
+                raise Error(f"dump/modules/{module}.reloc.bin is missing: start the game once with {name} on")
+            with open(dll, "rb") as f:
+                lib = f.read()
+            with open(image, "rb") as f:
+                img = f.read()
+            plugins.append((module, PLUGIN_OS[".dll"], lib, img))
+    # (the files ARCropolis isn't shown on the host's own game: dump/skyline/hidden.txt, "<mods.txt entry>/<path>")
+    try:
+        hidden = {h.lower() for h in _cfg_lines(os.path.join(root, "dump", "skyline", "hidden.txt"))}
+    except OSError:
+        hidden = set()
+    folders = []
+    for name in listed:
+        sd = sd_folder_name(name)
+        if not safe_name(sd):
+            raise Error(f"mods/{name}: a name players' games won't take (rename it)")
+        files = mod_folder(os.path.join(root, "mods", name), lazy=True)
+        folders.append((sd, [f for f in files if f"{name}/{f[0]}".lower() not in hidden]))
+    plain = build_plain(mods, vanilla_sha, [os.path.getsize(s) for s in vanilla[2:]], b"", b"", plugin_list, plugins,
+                        folders, mods_index(root, list(listed)), version=ARC_VERSION)
+    return plain, mods, [name for name, *_ in plugins]
+
+
 # ---- the lobby -----------------------------------------------------------------------------
 def _address(lobby):
     host, _, port = lobby.rpartition(":") if ":" in lobby else (lobby, "", "")
@@ -537,10 +652,10 @@ def put(lobby, pid, sealed, timeout=30):
     """Up on the lobby: the open socket (the pack is up while it is open)."""
     s = socket.create_connection(_address(lobby), timeout=timeout)
     s.sendall(b"SSBUPAK1PUT " + struct.pack(">I", len(pid)) + pid.encode() + struct.pack(">Q", len(sealed)))
-    answer = _exact(s, 4)
+    answer = bytes(_exact(s, 4))
     if answer == b"GO  ":
         s.sendall(sealed)
-        answer = _exact(s, 4)
+        answer = bytes(_exact(s, 4))
     if answer != b"OK  ":
         s.close()
         raise Error({b"TAKN": "that code's pack is up already (another host with it?)",
@@ -556,14 +671,24 @@ def get(lobby, pid, timeout=30):
         return _exact(s, n) if n else None
 
 
+def pack_sum(lobby, pid, timeout=30):
+    """(size, sha256) of the pack up by that id, or None (the depot's SUM)."""
+    with socket.create_connection(_address(lobby), timeout=timeout) as s:
+        s.sendall(b"SSBUPAK1SUM " + struct.pack(">I", len(pid)) + pid.encode())
+        n = struct.unpack(">Q", _exact(s, 8))[0]
+        return (n, bytes(_exact(s, 32))) if n else None
+
+
 def _exact(s, n):
-    buf = bytearray()
-    while len(buf) < n:
-        got = s.recv(min(1 << 20, n - len(buf)))
+    """n bytes from the socket, in one buffer (a bytearray: no copy of a pack of gigabytes)."""
+    buf = bytearray(n)
+    view, at = memoryview(buf), 0
+    while at < n:
+        got = s.recv_into(view[at:], min(1 << 20, n - at))
         if not got:
             raise Error("the lobby closed the connection")
-        buf += got
-    return bytes(buf)
+        at += got
+    return buf
 
 
 def main(argv=None):
@@ -584,7 +709,7 @@ def main(argv=None):
             return 0
         code = o.code or new_code()
         plain, mods, plugins = pack_tree(o.tree, not o.no_plugins, o.open)
-        pack = plain if o.open else seal(code, plain)
+        pack = plain if o.open else seal(code, plain, salt=content_salt(code, plain))
         del plain
         pid = pack_id(code)
         s = put(o.lobby, pid, pack)

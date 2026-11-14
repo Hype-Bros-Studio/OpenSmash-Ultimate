@@ -2,6 +2,7 @@
 (tools/hostmods_depot.py) through the online lobby's TCP port (tools/ssbu_online_lobby.py), and the
 runtime's C crypto (runtime/hostmods_crypto.h) against Python's when a C compiler is there."""
 import asyncio
+import hashlib
 import os
 import shutil
 import struct
@@ -226,10 +227,30 @@ class Pack(unittest.TestCase):
             os.remove(os.path.join(modules, "one.reloc.bin"))
             with self.assertRaises(hm.Error):
                 hm.pack_tree(root)
+            # an ARCropolis tree (version 4): no overlay, ARCropolis' listed folders whole, each mod's plugin.nro
+            # by its build id (dump/skyline/plugins.json) as its Windows DLL
             with open(os.path.join(work, "applied.json"), "w") as f:
                 f.write('{"mods": ["A Mod"], "arcropolis": true}')
-            with self.assertRaises(hm.Error):
-                hm.pack_tree(root)
+            os.remove(os.path.join(mod, "plugins", "libmoveset.nro"))
+            os.rmdir(os.path.join(mod, "plugins"))
+            nro = bytes(0x10) + b"NRO0" + bytes(0x2c) + bytes.fromhex("ab12") + bytes(30)
+            with open(os.path.join(mod, "plugin.nro"), "wb") as f:
+                f.write(nro)
+            with open(os.path.join(modules, "one.reloc.bin"), "wb") as f:
+                f.write(b"image one")
+            with open(os.path.join(skyline, "mods.txt"), "w") as f:
+                f.write("A Mod\n")
+            with open(os.path.join(skyline, "plugins.json"), "w") as f:
+                f.write('{"AB12' + "0" * 60 + '": {"module": "one"}}')
+            plain, mods, plugins = hm.pack_tree(root)
+            got = hm.parse_plain(plain)
+            self.assertEqual(got["version"], hm.ARC_VERSION)
+            self.assertEqual((got["overlay"], got["map"]), (b"", b""))
+            self.assertEqual(got["source_sizes"], [64])
+            self.assertEqual(plugins, ["one"])
+            self.assertEqual(got["folders"], [("A Mod", [("config.json", b'{"a": 1}'), ("fighter/f.bin", b"abc"),
+                                                         ("plugin.nro", nro)])])
+            self.assertEqual(sorted(p for p, *_ in got["mods_index"]), ["config.json", "fighter/f.bin", "plugin.nro"])
 
 
 class Depot(unittest.TestCase):
@@ -268,6 +289,8 @@ class Depot(unittest.TestCase):
             sealed = hm.seal(CODE, plain)
             host = hm.put(addr, pid, sealed)
             self.assertEqual(hm.unseal(CODE, hm.get(addr, pid)), plain)
+            self.assertEqual(hm.pack_sum(addr, pid), (len(sealed), hashlib.sha256(sealed).digest()))
+            self.assertIsNone(hm.pack_sum(addr, "no such pack"))
             with self.assertRaises(hm.Error):   # one host per code
                 hm.put(addr, pid, sealed)
             host.close()
@@ -404,6 +427,7 @@ class RuntimeRomfs(unittest.TestCase):
         env = dict(os.environ, SSBU_HOST_MODS=code, SSBU_NET_RELAY=self.addr)
         env.pop("SSBU_HOST_MODS_DOWNLOAD", None)
         env.pop("HOSTMODSTEST_SETTING", None)
+        env["SSBU_HOST_MODS_CACHE"] = "0"   # (test_pack_kept_between_starts turns it on)
         env.update(more)
         r = subprocess.run([self.exe, data, out], capture_output=True, text=True, env=env, timeout=60)
         got = None
@@ -514,6 +538,82 @@ class RuntimeRomfs(unittest.TestCase):
                 self.assertFalse(os.path.exists(outside))
                 self.assertEqual(r.stderr.count("[hostmods] not saved"), 8, r.stderr)
                 self.assertIn("1 saved into mods/", r.stderr)
+            finally:
+                host.close()
+
+    def arc_pack(self, data, vmap, sources, folders):
+        """An ARCropolis pack (version 4) over that game: no map or overlay, the folders as the SD card's ultimate/mods."""
+        with open(vmap, "rb") as f:
+            sha = hashlib.sha256(f.read()).digest()
+        return hm.build_plain([("Fighter Mod", 0x0BADF00D)], sha, [os.path.getsize(s) for s in sources], b"", b"",
+                              b"arcropolis\n", [("other_os", 99, b"lib", b"image")], folders, version=hm.ARC_VERSION)
+
+    def test_arcropolis_pack_is_the_sd_cards_mods(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, image, vmap, sources = self.game(d)
+            folders = [("Fighter Mod", sorted([("config.json", b'{"x": 1}'), ("fighter/mario/model/body/c08/model.numdlb", b"\2" * 5000),
+                                               ("fighter/mario/model/body/c08/x.marker", b""), ("plugin.nro", b"NRO0 x")])),
+                       ("WindowSmash characters", [("ui/message/msg_name.msbt", b"names")])]
+            plain = self.arc_pack(data, vmap, sources, folders)
+            code = hm.new_code()
+            host = hm.put(self.addr, hm.pack_id(code), hm.seal(code, plain))
+            try:
+                r, got = self.run_game(data, code, HOSTMODSTEST_SD=";Fighter Mod;fighter mod/CONFIG.json;Fighter Mod/fighter/mario/model/body/c08;"
+                                                                  "Fighter Mod/plugin.nro;Fighter Mod/fighter/mar;Nope/x;Fighter Mod/config.json/")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(got, image)   # (this game's own data: ARCropolis lays the mods over it)
+                self.assertIn("arcropolis 1", r.stdout)
+                self.assertIn("built-in copies", r.stderr)
+                sd = r.stdout[r.stdout.index("sd "):].split("arcropolis")[0]
+                self.assertEqual(sd.split("\n"), [
+                    "sd  2 0 ", "  dir Fighter Mod 0", "  dir WindowSmash characters 0",
+                    "sd Fighter Mod 2 0 ", "  file config.json 8", "  dir fighter 0", "  file plugin.nro 6",
+                    'sd fighter mod/CONFIG.json 1 8 {"x": 1}',
+                    "sd Fighter Mod/fighter/mario/model/body/c08 2 0 ", "  file model.numdlb 5000", "  file x.marker 0",
+                    "sd Fighter Mod/plugin.nro 1 6 NRO0 x", "sd Fighter Mod/fighter/mar 0 0 ", "sd Nope/x 0 0 ",
+                    'sd Fighter Mod/config.json/ 1 8 {"x": 1}', ""])
+                self.assertEqual(sorted(os.listdir(d)), ["dump"])
+            finally:
+                host.close()
+
+    def test_pack_kept_between_starts(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, image, vmap, sources = self.game(d)
+            plain = self.arc_pack(data, vmap, sources, [("A", [("a.txt", b"one")])])
+            code = hm.new_code()
+            sealed = hm.seal(code, plain)
+            kept = os.path.join(d, "hostmods_cache")
+            host = hm.put(self.addr, hm.pack_id(code), sealed)
+            try:
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_CACHE="1", HOSTMODSTEST_SD="A/a.txt")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("sd A/a.txt 1 3 one", r.stdout)
+                pid = hm.pack_id(code)
+                self.assertEqual(sorted(os.listdir(kept)), [pid + ".bin", pid + ".sum"])
+                with open(os.path.join(kept, pid + ".bin"), "rb") as f:
+                    self.assertEqual(f.read(), sealed)   # (sealed as it came: the code opens it)
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_CACHE="1", HOSTMODSTEST_SD="A/a.txt")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("not fetched again", r.stderr)
+                self.assertIn("sd A/a.txt 1 3 one", r.stdout)
+                # a broken kept pack (the same sum): fetched again, kept again
+                with open(os.path.join(kept, pid + ".bin"), "r+b") as f:
+                    f.seek(len(sealed) - 5)
+                    f.write(b"XXXXX")
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_CACHE="1", HOSTMODSTEST_SD="A/a.txt")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("doesn't open: fetching it again", r.stderr)
+                self.assertIn("sd A/a.txt 1 3 one", r.stdout)
+            finally:
+                host.close()
+            # the host's pack changed (another salt and content): the kept one isn't used
+            plain2 = self.arc_pack(data, vmap, sources, [("A", [("a.txt", b"two")])])
+            host = hm.put(self.addr, hm.pack_id(code), hm.seal(code, plain2))
+            try:
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_CACHE="1", HOSTMODSTEST_SD="A/a.txt")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("not fetched again", r.stderr)
+                self.assertIn("sd A/a.txt 1 3 two", r.stdout)
             finally:
                 host.close()
 

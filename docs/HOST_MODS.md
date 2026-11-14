@@ -106,6 +106,29 @@ Requirements:
 - **Same HypeSmash build.** Host and players need the same build: a plugin library is linked against the runtime's `module.h` interface.
 - **Standard plugins on the player's side.** Plugins the game links in, such as Smashline, come from the player's own build. If the host's list names one the player's build lacks, it is left out.
 
+### ARCropolis trees (pack version 4)
+
+A tree whose mods run through ARCropolis (`dump/mods/applied.json` `"arcropolis": true`) has no modded layer map or
+overlay: ARCropolis lays the mods over the game's data itself, at the game's start, from the SD card's `ultimate/mods`.
+So the pack carries what ARCropolis reads there:
+
+- no map and no overlay. The player's own game data is read as it is, after the same checks: the vanilla layer map's sha256 and each source's size;
+- each folder `dump/skyline/mods.txt` lists, whole, under the name ARCropolis sees it by (`.characters` is `WindowSmash characters`, `Pack/X` is `Pack - X`). Files `dump/skyline/hidden.txt` hides from ARCropolis on the host are left out;
+- `mods:/` as the host's game sees it (the `SSBUHMI1` index);
+- the host's `plugins.txt`, and for each mod's `plugin.nro` its Windows build, `build/plugins/<module>.dll` with `dump/modules/<module>.reloc.bin`. The module comes from the NRO's build id (`dump/skyline/plugins.json`).
+
+On the player's side, `hle_fs.c` serves `sd:/ultimate/mods` from the pack in memory (`hostmods_sd_entry`/`hostmods_sd_list`), read only.
+ARCropolis, run from the host's plugin list, reads it there. The `plugin.nro` files it chainloads run as the pack's DLLs (Windows), matched by build id.
+On Linux they run as the game's own built-in copies, where it has them: a Linux player of a pack whose plugins are all Windows builds gets a log line, not a stop.
+
+`serve` seals an ARCropolis pack with a salt made from the code and the plain pack (`content_salt`). The same mods and code give the same sealed bytes, so players can keep it:
+
+### The pack kept between starts
+
+The player's game keeps the pack as it came, still sealed, in `hostmods_cache/<id>.bin` beside `mods/`.
+`<id>.sum` holds the size and sha256 the lobby gave for it. On the next start the game asks the lobby for those (`SUM`) and reads the file if they are the same, instead of fetching gigabytes again.
+A kept pack that doesn't open is deleted and fetched again. Keeping a new pack deletes the other codes' packs. `SSBU_HOST_MODS_CACHE=0` turns this off, and nothing is written.
+
 The lobby never sees the code. It only sees the pack id, `sha256("HypeSmash host mods id\0" + code)[:10]`,
 and can't open a sealed pack (an open one it can read). The formats are in `tools/hostmods.py`'s docstring.
 
@@ -114,12 +137,12 @@ and can't open a sealed pack (an open one it can read). The formats are in `tool
 `tests/test_hostmods.py` checks these:
 
 - Sealing and opening round trips, in chunks. A wrong code fails, and so does a changed byte, a changed head, swapped chunks, or a cut pack.
-- The pack format, and building a pack from a made-up applied tree. ARCropolis-mode trees are refused.
+- The pack format, and building a pack from a made-up applied tree, in layer-map mode and in ARCropolis mode (version 4: no map, `mods.txt`'s folders, plugins by build id).
 - Open packs (version 3): the round trip with the mods' folders, building one from a tree (every file of the turned-on mods, none of the others), and version 1 and 2 packs still reading.
 - Names and paths that could leave `mods/<name>` (`..`, absolute paths, drive letters, `\`, device names, ...) make the pack refused.
 - The Python port of the runtime's mod-tree hash, including the files it skips.
 - The depot through the real `OnlineLobby.stream` handler:
-  - PUT, GET, one host per code, size limits, and a non-pack being refused.
+  - PUT, GET, SUM (size and sha256), one host per code, size limits, and a non-pack being refused.
   - An open pack is taken and handed out as it is, under the same limits.
   - The pack goes away when the host disconnects.
 - The C crypto opens what Python seals, with gcc `-Wall -Wextra -Werror`. Its SHA-256 and pack id match Python's.
@@ -129,6 +152,8 @@ and can't open a sealed pack (an open one it can read). The formats are in `tool
   - An open pack: played from memory and nothing saved unless asked; `SSBU_HOST_MODS_DOWNLOAD=0` wins over the setting; with the setting `on` the folders are saved byte for byte; a second run leaves them; a different folder of the same name gets the host's as `<name> (host)`.
   - An open pack's folders with bad names or paths (`../`, `..\`, absolute, `C:`, `nul`, `.packs`) are not saved, nothing is written outside `mods/`, and the good folder next to them is saved.
   - A sealed pack (version 1 here) with downloads asked for: read, nothing saved, and the log says why.
+  - An ARCropolis pack (version 4): this game's own image read unchanged; `ultimate/mods` entries, listings and file bytes as the pack has them, without case, with a trailing `/` too; Windows-only plugins logged, not a stop.
+  - The kept pack: written sealed as it came, read again without a fetch, fetched again when broken, and not used once the host's pack changed.
 - `tests/test_lobby_menu.py`: the Online page's Download host's mods row saves `online_host_mods_download.txt`, reads it back, and notes `SSBU_HOST_MODS_DOWNLOAD`.
 
 ## Not checked
@@ -151,7 +176,7 @@ and can't open a sealed pack (an open one it can read). The formats are in `tool
   - Linux would need a per-plugin `.so` build and a memfd + `dlopen` loader. macOS would need a `.dylib` build.
   - A plugin library with thread-local data is refused, since only the system's loader can give it a TLS slot. Plugins built by `tools/skyline.py` have none.
 - **The plugin is native code in the player's memory.** That makes it harder to reuse than the `.nro`, but it can still be dumped, like the rest of the pack.
-- ARCropolis-mode trees (`"arcropolis": true`) are refused.
+- **ARCropolis packs are big.** They hold the mods' folders whole (several GB with fighter textures). The first start fetches all of it at the lobby's upload speed; later starts read the kept copy.
 - **Same game data.** The player's unmodded data has to match the host's: the vanilla layer map's sha256 and each source's size. Otherwise the game stops with a clear message.
 - **Code patches.** The ARCropolis code-patches setting still has to match between players (it is its own mod-set entry).
 - **Leaks still possible:**
@@ -159,7 +184,7 @@ and can't open a sealed pack (an open one it can read). The formats are in `tool
   - GPU shader/pipeline caches can hold shaders built from modded data.
   - Mid-match mod refresh (`hle_mod_refresh.c`) still watches the player's own `mods/`.
   - The code is in the process environment, which child processes inherit and other local users may read.
-- **Memory.** The whole overlay sits in RAM on every player, and in the lobby's RAM while it's up. The defaults are 1 GiB per pack, 2 GiB in all and 32 packs (`hostmods_depot.py`).
+- **Memory.** The whole pack sits in RAM on every player, and in the lobby's RAM while it's up. The defaults are 1 GiB per pack, 2 GiB in all and 32 packs (`hostmods_depot.py`). A lobby raises them with `--pack-max-mib` and `--pack-total-mib`.
 - **Open packs** are the size of the overlay plus the mods' folders, under the same lobby limits (1 GiB a pack).
   An older game can't read one (it says the pack is of another version or doesn't open).
 - **Anyone with the code can fetch the pack.** The code is the only secret: a player can share it, and the lobby serves every request with the right id.

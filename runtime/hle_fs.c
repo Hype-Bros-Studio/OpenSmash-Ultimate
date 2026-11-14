@@ -122,6 +122,9 @@ int hostmods_mods_entry(const char *rest, const u8 **data, u64 *size);
 int hostmods_mods_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx);
 void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n, const u8 **map, u64 *map_len,
                     const u8 **overlay, u64 *overlay_len);
+int hostmods_arcropolis(void);
+int hostmods_sd_entry(const char *rest, const u8 **data, u64 *size);
+int hostmods_sd_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx);
 static void rom_open(void) {
     char cfg[1024], path[1024];
     static char source_paths[ROM_SOURCES][1024];
@@ -150,11 +153,13 @@ static void rom_open(void) {
             }
         }
         u8 head[24];
-        if (host) {   /* the host's layer map, over this game's sources and the overlay (in memory) */
-            const u8 *hmap, *overlay;
-            u64 hmap_len, overlay_len;
+        const u8 *hmap = NULL, *overlay = NULL;
+        u64 hmap_len = 0, overlay_len = 0;
+        if (host) {   /* (checks that this game's data is the host's; an ARCropolis pack has no map: this game's own is read) */
             if (n >= ROM_SOURCES) rt_fatal("%s: %u sources, and host mods need one more", cfg, n);
             hostmods_romfs(map, (const char (*)[1024])source_paths, n, &hmap, &hmap_len, &overlay, &overlay_len);
+        }
+        if (host && hmap_len) {   /* the host's layer map, over this game's sources and the overlay (in memory) */
             rom.mem[n] = overlay;
             rom.mem_size[n] = overlay_len;
             n++;
@@ -243,6 +248,15 @@ typedef struct Handle {
 static Handle handles[512];
 /* Under host mods mods:/ is the host's mods (hle_hostmods.c), not this game's own. */
 static int host_mods_mount(const struct Mount *m) { return !strcmp(m->name, "mods") && hostmods_on(); }
+/* Under an ARCropolis pack of the host's (version 4) the SD card's ultimate/mods is the pack's folders
+ * (hle_hostmods.c hostmods_sd_entry): *sub the path under it. */
+static int host_sd_mods(const struct Mount *m, const char *rest, const char **sub) {
+    if (strcmp(m->name, "sd") || !hostmods_on()) return 0;
+    rest += strspn(rest, "/");
+    if (_strnicmp(rest, "ultimate/mods", 13) || (rest[13] && rest[13] != '/') || !hostmods_arcropolis()) return 0;
+    *sub = rest + 13;
+    return 1;
+}
 static CRITICAL_SECTION lock;      /* the mount and handle tables */
 static CRITICAL_SECTION jlock;     /* save mounts' working state (taken before `lock`, never after) */
 static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
@@ -1197,7 +1211,7 @@ HLE(_ZN2nn2fs6CommitEPKc) {
 
 /* ---- queries --------------------------------------------------------------------- */
 HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
-    const char *rest;
+    const char *rest, *sub;
     ready();
     struct Mount *m = find_mount(P(char, c->x[1]), &rest);
     if (!m) { c->x[0] = R_NOT_MOUNTED; return; }
@@ -1214,10 +1228,10 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
         LeaveCriticalSection(&jlock);
         if (r || !type) { c->x[0] = r ? r : R_PATH_NOT_FOUND; return; }
         st32(c->x[0], type == 2 ? DIR_ENTRY : FILE_ENTRY);
-    } else if (host_mods_mount(m)) {
+    } else if (host_mods_mount(m) || host_sd_mods(m, rest, &sub)) {
         const u8 *data;
         u64 size;
-        int e = hostmods_mods_entry(rest, &data, &size);
+        int e = host_mods_mount(m) ? hostmods_mods_entry(rest, &data, &size) : hostmods_sd_entry(sub, &data, &size);
         if (!e) { c->x[0] = R_PATH_NOT_FOUND; return; }
         st32(c->x[0], e == 2 ? DIR_ENTRY : FILE_ENTRY);
     } else {
@@ -1232,7 +1246,7 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
 
 /* ---- files ----------------------------------------------------------------------- */
 HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
-    const char *rest;
+    const char *rest, *sub;
     ready();
     struct Mount *m = find_mount(P(char, c->x[1]), &rest);
     int mode = (int)c->x[2];
@@ -1273,6 +1287,13 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
             c->x[0] = R_PATH_NOT_FOUND;
             return;
         }
+        h.mem = data;
+        h.size = size;
+    } else if (host_sd_mods(m, rest, &sub)) {   /* (the host's mod folders: in memory, read only) */
+        const u8 *data;
+        u64 size;
+        if (hostmods_sd_entry(sub, &data, &size) != 1) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        if (mode & OPEN_WRITE) { c->x[0] = R_UNSUPPORTED; return; }
         h.mem = data;
         h.size = size;
     } else {
@@ -1435,7 +1456,7 @@ static void mods_list_add(void *p, const char *name, size_t len, int dir, u64 si
 }
 
 HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path, mode) */
-    const char *rest;
+    const char *rest, *sub;
     ready();
     struct Mount *m = find_mount(P(char, c->x[1]), &rest);
     int mode = (int)c->x[2];
@@ -1452,6 +1473,9 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {   /* (handle*, path,
         if (mode & LIST_FILES)
             for (u32 k = rom_dir(d)->child_file; k != NONE; k = rom_file(k)->sibling)
                 listing_add(&h, rom_file(k)->name, rom_file(k)->name_len, FILE_ENTRY, rom_file(k)->size);
+    } else if (host_sd_mods(m, rest, &sub)) {
+        ModsListing ctx = {&h, mode};
+        if (!hostmods_sd_list(sub, mods_list_add, &ctx)) { listing_free(&h); c->x[0] = R_PATH_NOT_FOUND; return; }
     } else if (!strcmp(m->name, "sd") && !_strnicmp(rest + strspn(rest, "/"), "ultimate/mods", 13) &&
                (!rest[strspn(rest, "/") + 13] || !strcmp(rest + strspn(rest, "/") + 13, "/"))) {
         load_mods_list();   /* (the turned-on mods only; none of this tree's under a host's mods) */

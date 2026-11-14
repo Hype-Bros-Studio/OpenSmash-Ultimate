@@ -55,6 +55,11 @@ void rt_fatal(const char *fmt, ...) {
     exit(3);
 }
 
+static void sd_print(void *ctx, const char *name, size_t len, int dir, u64 size) {
+    (void)ctx;
+    printf("  %s %.*s %llu\n", dir ? "dir" : "file", (int)len, name, (unsigned long long)size);
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     rt_data_dir = argv[1];
@@ -81,5 +86,21 @@ int main(int argc, char **argv) {
         printf("plugin %s %.*s %.*s\n", name, (int)lib_len, (const char *)lib, (int)image_len, (const char *)image);
     const char *list = hostmods_on() ? hostmods_plugin_list() : NULL;
     if (list) printf("list %s", list);
+    /* HOSTMODSTEST_SD="a;b/c": what each path under the SD card's ultimate/mods is under an ARCropolis pack
+     * (hostmods_sd_entry: "sd <path> <0 none, 1 file, 2 folder> <size> <bytes>"), and a folder's entries */
+    const char *sd = getenv("HOSTMODSTEST_SD");
+    while (sd && hostmods_on()) {
+        char path[1024];
+        size_t l = strcspn(sd, ";");
+        snprintf(path, sizeof path, "%.*s", (int)l, sd);
+        const u8 *data = NULL;
+        u64 size = 0;
+        int e = hostmods_sd_entry(path, &data, &size);
+        printf("sd %s %d %llu %.*s\n", path, e, (unsigned long long)size, e == 1 && size < 64 ? (int)size : 0, data ? (const char *)data : "");
+        if (e == 2) hostmods_sd_list(path, sd_print, NULL);
+        if (!sd[l]) break;
+        sd += l + 1;
+    }
+    if (hostmods_on()) printf("arcropolis %d\n", hostmods_arcropolis());
     return 0;
 }

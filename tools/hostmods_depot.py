@@ -12,7 +12,14 @@ starts with "SSBUPAK1" is this service (tools/ssbu_online_lobby.py stream):
         -> "OK  " and the pack is up until the connection closes, or "BAD " (not a pack)
     "SSBUPAK1" "GET " u32 id length id
         -> u64 size and the pack (size 0: no pack by that id)
+    "SSBUPAK1" "SUM " u32 id length id
+        -> u64 size and the pack's sha256 (32 bytes; size 0: no pack by that id, and no hash) - a player
+           whose game keeps the pack already (runtime/hle_hostmods.c's cache) asks this, not GET
+
+The limits are the lobby's (tools/ssbu_online_lobby.py --pack-max-mib/--pack-total-mib); the packs are
+held as they came up, with no copy of them.
 """
+import hashlib
 import asyncio
 import struct
 import time
@@ -25,14 +32,16 @@ MAX_PACK = 1 << 30           # bytes one pack may be
 MAX_TOTAL = 2 << 30          # bytes all the packs up may be, together
 MAX_PACKS = 32
 IDLE_TIME = 30               # seconds a PUT may go without a byte
-SEND_TIME = 600              # seconds a GET has to take its pack
+SEND_TIME = 120              # seconds a GET may go without taking a byte of its pack
+SEND_CHUNK = 4 << 20
 
 
 class PackDepot:
     def __init__(self, log=print, max_pack=MAX_PACK, max_total=MAX_TOTAL, max_packs=MAX_PACKS):
         self.log = log
         self.max_pack, self.max_total, self.max_packs = max_pack, max_total, max_packs
-        self.packs = {}   # id -> the pack (bytes): sealed, or open
+        self.packs = {}   # id -> the pack (a bytearray, never changed while up): sealed, or open
+        self.sums = {}    # id -> its sha256
         self.coming = 0   # bytes of packs on their way up
         self.gets = 0
 
@@ -46,13 +55,22 @@ class PackDepot:
         if not 0 < n <= MAX_ID:
             return
         pid = (await asyncio.wait_for(reader.readexactly(n), IDLE_TIME)).decode("ascii", "replace")
+        if op == b"SUM ":
+            pack, digest = self.packs.get(pid), self.sums.get(pid)
+            writer.write(struct.pack(">Q", len(pack)) + digest if pack and digest else struct.pack(">Q", 0))
+            await asyncio.wait_for(writer.drain(), IDLE_TIME)
+            return
         if op == b"GET ":
             pack = self.packs.get(pid)
             writer.write(struct.pack(">Q", len(pack) if pack else 0))
             if pack:
-                writer.write(pack)
+                view = memoryview(pack)
+                t0 = time.monotonic()
+                for at in range(0, len(view), SEND_CHUNK):
+                    writer.write(view[at:at + SEND_CHUNK])
+                    await asyncio.wait_for(writer.drain(), SEND_TIME)
                 self.gets += 1
-                self.log(f"host mods: pack {pid} ({len(pack)} B) to {peer}")
+                self.log(f"host mods: pack {pid} ({len(pack)} B) to {peer} in {time.monotonic() - t0:.0f} s")
             await asyncio.wait_for(writer.drain(), SEND_TIME)
             return
         if op != b"PUT ":
@@ -68,14 +86,17 @@ class PackDepot:
             self.log(f"host mods: pack {pid} from {peer}: {size} B is over the limits")
             return
         writer.write(b"GO  ")
-        body = bytearray()
         self.coming += size
         try:
-            while len(body) < size:
-                got = await asyncio.wait_for(reader.read(min(1 << 20, size - len(body))), IDLE_TIME)
+            body = bytearray(size)
+            at = 0
+            while at < size:
+                got = await asyncio.wait_for(reader.read(min(1 << 20, size - at)), IDLE_TIME)
                 if not got:
                     return
-                body += got
+                body[at:at + len(got)] = got
+                at += len(got)
+            digest = await asyncio.to_thread(lambda: hashlib.sha256(body).digest())
         finally:
             self.coming -= size
         if body[:8] not in (SEALED_MAGIC, PLAIN_MAGIC) or pid in self.packs:
@@ -83,7 +104,7 @@ class PackDepot:
             await writer.drain()
             return
         body_open = body[:8] == PLAIN_MAGIC
-        self.packs[pid] = bytes(body)
+        self.packs[pid], self.sums[pid] = body, digest
         del body
         t0 = time.monotonic()
         self.log(f"host mods: pack {pid} ({size} B{', open' if body_open else ''}) up from {peer}")
@@ -94,4 +115,5 @@ class PackDepot:
                 pass
         finally:
             self.packs.pop(pid, None)
+            self.sums.pop(pid, None)
             self.log(f"host mods: pack {pid} down after {time.monotonic() - t0:.0f} s")

@@ -29,7 +29,7 @@ import bracket   # noqa: E402
 import ssbu_relay as relay   # noqa: E402
 from nex.prudp import lite_size   # noqa: E402
 from nex.server import NAT_CHECK_SECOND_IP, make_server   # noqa: E402
-from hostmods_depot import MAGIC as PACK_MAGIC, PackDepot   # noqa: E402
+from hostmods_depot import MAGIC as PACK_MAGIC, MAX_PACK, MAX_TOTAL, PackDepot   # noqa: E402
 
 GATEWAY = 0x0A0D0001
 NAT_CHECK_SECOND = struct.unpack(">I", socket.inet_aton(NAT_CHECK_SECOND_IP))[0]   # nncs2
@@ -100,7 +100,8 @@ class OnlineLobby(relay.Lobby):
         services = getattr(self.nex, "services", None)
         if services is not None:
             self.bracket.live = services.tourney.view   # the Online Tourney, while one is on
-        self.depot = PackDepot(log=self.say)        # host-only mods' sealed packs (docs/HOST_MODS.md)
+        self.depot = PackDepot(log=self.say, max_pack=getattr(o, "pack_max", MAX_PACK),
+                               max_total=getattr(o, "pack_total", MAX_TOTAL))        # host-only mods' sealed packs (docs/HOST_MODS.md)
 
     def part_of(self, ip):
         c = self.by_ip.get(ip_int(ip))
@@ -324,9 +325,14 @@ def parse_args(argv=None):
     a.add_argument("--state", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "nex", "state"),
                    help="where the game server keeps accounts and ratings")
     a.add_argument("--nex-log", type=int, default=1, help="game server log: 0 quiet, 1 calls, 2 packets")
+    a.add_argument("--pack-max-mib", type=int, default=MAX_PACK >> 20,
+                   help="host mods: MiB one host's pack may be (held in memory while the host is on)")
+    a.add_argument("--pack-total-mib", type=int, default=MAX_TOTAL >> 20,
+                   help="host mods: MiB all the packs up may be, together")
     mine, rest = a.parse_known_args(argv)
     o = relay.parse_args(rest)
     o.state, o.nex_log = mine.state, mine.nex_log
+    o.pack_max, o.pack_total = mine.pack_max_mib << 20, mine.pack_total_mib << 20
     os.makedirs(o.state, exist_ok=True)
     return o
 
