@@ -733,6 +733,7 @@ static void hm_save_folders(void) {
                 safe = -1;
             }
         }
+        if (f.name_len == 3 && !memcmp(f.name, ".sd", 3)) continue;   /* (the host's SD card extras: hostmods_sd_extra) */
         if (!safe) fprintf(stderr, "[hostmods] not saved: a mod folder named \"%.*s\" (not a folder name of mods/)\n",
                            (int)(f.name_len > 200 ? 200 : f.name_len), f.name);
         if (safe != 1) continue;
@@ -1252,6 +1253,23 @@ int hostmods_sd_entry(const char *rest, u64 *ref, u64 *size) {
     dir[l] = '/';
     return hm_sd_under(hm_sd_at(dir, (u32)l + 1), dir, (u32)l + 1) ? 2 : 0;
 }
+/* The host's SD card files outside ultimate/mods that its framework plugins need (ARCropolis' menu resources, the
+ * clone engine's settings: tools/hostmods.py SD_EXTRA), carried in the pack's hidden folder ".sd": `rest` (under
+ * the SD card) as a path for hostmods_sd_entry into out, or 0 when it isn't one of them or the pack hasn't it. */
+int hostmods_sd_extra(const char *rest, char *out, size_t n) {
+    static const char *const roots[] = {"ultimate/arcropolis/resources", "ultimate/clone_engine"};
+    if (!hostmods_on() || !hostmods_arcropolis()) return 0;
+    while (*rest == '/') rest++;
+    for (u32 i = 0; i < sizeof roots / sizeof *roots; i++) {
+        size_t rl = strlen(roots[i]);
+        if (_strnicmp(rest, roots[i], rl) || (rest[rl] && rest[rl] != '/')) continue;
+        if ((size_t)snprintf(out, n, ".sd/%s", rest + 9) >= n) return 0;   /* (after "ultimate/") */
+        u64 ref, size;
+        return hostmods_sd_entry(out, &ref, &size) != 0;
+    }
+    return 0;
+}
+
 /* A folder's entries there: add(ctx, name, length, is a folder, size) for each, once; 0 when it isn't one. */
 int hostmods_sd_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx) {
     load();
@@ -1275,6 +1293,7 @@ int hostmods_sd_list(const char *rest, void (*add)(void *, const char *, size_t,
         if (last && last_len == nl && !_strnicmp(last, name, nl)) continue;   /* (a folder's later files) */
         last = name;
         last_len = nl;
+        if (!l && nl == 3 && !memcmp(name, ".sd", 3)) continue;   /* (not a mod: hostmods_sd_extra's) */
         add(ctx, name, nl, slash != NULL, slash ? 0 : hm.sd[i].size);
     }
     return found;

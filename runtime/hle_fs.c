@@ -288,8 +288,11 @@ static Handle handles[512];
 static int host_mods_mount(const struct Mount *m) { return !strcmp(m->name, "mods") && hostmods_on(); }
 /* Under an ARCropolis pack of the host's (version 4) the SD card's ultimate/mods is the pack's folders
  * (hle_hostmods.c hostmods_sd_entry): *sub the path under it. */
+int hostmods_sd_extra(const char *rest, char *out, size_t n);
 static int host_sd_mods(const struct Mount *m, const char *rest, const char **sub) {
     if (strcmp(m->name, "sd") || !hostmods_on()) return 0;
+    static __declspec(thread) char extra[1100];   /* (the host's SD card extras, in its pack's ".sd") */
+    if (hostmods_sd_extra(rest, extra, sizeof extra)) { *sub = extra; return 1; }
     rest += strspn(rest, "/");
     if (_strnicmp(rest, "ultimate/mods", 13) || (rest[13] && rest[13] != '/') || !hostmods_arcropolis()) return 0;
     *sub = rest + 13;

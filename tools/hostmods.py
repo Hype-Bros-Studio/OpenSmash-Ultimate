@@ -304,7 +304,7 @@ def _parse_plain(p):
             name = p[at + 2:at + 2 + nl].decode("utf-8")
             nf = struct.unpack_from("<I", p, at + 2 + nl)[0]
             at += 6 + nl
-            if not safe_name(name):
+            if not safe_name(name) and name != ".sd":
                 raise Error(f"a mod folder named {name!r} in the pack")
             files = []
             for _ in range(nf):
@@ -612,6 +612,9 @@ def mod_plugin_modules(root, names):
     return out
 
 
+SD_EXTRA = ("arcropolis/resources", "clone_engine")   # (under the SD card's ultimate/: pack_arcropolis)
+
+
 def pack_plugin_modules(root, listed):
     """[(what, module)] for every plugin the host's game runs: the mods' own (mod_plugin_modules) and the framework
     ones dump/skyline/plugins.txt names (ARCropolis, CSK, Smashline, ...), whose translated C is build/nro/<module>.
@@ -669,6 +672,16 @@ def pack_arcropolis(root, applied, with_plugins=True, open_pack=False):
             raise Error(f"mods/{name}: a name players' games won't take (rename it)")
         files = mod_folder(os.path.join(root, "mods", name), lazy=True)
         folders.append((sd, [f for f in files if f"{name}/{f[0]}".lower() not in hidden]))
+    # the host's SD card files the framework plugins need besides ultimate/mods (ARCropolis stops without its menu's
+    # resources; the clone engine's settings): one hidden folder, ".sd", that players' games read them from
+    # (runtime/hle_fs.c host_sd_extra); a mod folder's name never starts with a dot
+    extra = []
+    for sub in SD_EXTRA:
+        d = os.path.join(root, "dump", "skyline", "sd", "ultimate", *sub.split("/"))
+        if os.path.isdir(d):
+            extra += [(f"{sub}/{rel}", full) for rel, full in mod_folder(d, lazy=True)]
+    if extra:
+        folders.append((".sd", sorted(extra)))
     plain = build_plain(mods, vanilla_sha, [os.path.getsize(s) for s in vanilla[2:]], b"", b"", plugin_list, plugins,
                         folders, mods_index(root, list(listed)), version=ARC_VERSION)
     return plain, mods, [name for name, *_ in plugins]
