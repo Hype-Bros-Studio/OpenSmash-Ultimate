@@ -52,6 +52,7 @@ static const char *mode_name(int m) { return m == DISPLAY_WINDOWED ? "windowed" 
 static void set_mode(int m) {
     if (m == mode) return;
     mode = m;
+    display_note_mode(m);
     if (SDL_SetWindowFullscreen(window, m == DISPLAY_WINDOWED ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP))
         fprintf(stderr, "[display] cannot switch to %s: %s\n", mode_name(m), SDL_GetError());
     else fprintf(stderr, "[display] %s\n", mode_name(m));
@@ -116,19 +117,37 @@ static void menu_key_of(const SDL_KeyboardEvent *k) {
     case SDL_SCANCODE_BACKSPACE: key = MENU_KEY_BACKSPACE; break;
     case SDL_SCANCODE_DELETE: key = MENU_KEY_DELETE; break;
     case SDL_SCANCODE_TAB: if (!k->repeat) key = k->keysym.mod & KMOD_SHIFT ? MENU_KEY_SHIFT_TAB : MENU_KEY_TAB; break;
+    case SDL_SCANCODE_PAGEUP: if (!k->repeat) key = MENU_KEY_PAGE_UP; break;   /* (the menu's pages, as L and R) */
+    case SDL_SCANCODE_PAGEDOWN: if (!k->repeat) key = MENU_KEY_PAGE_DOWN; break;
     default: break;
     }
     if (key && (key == MENU_KEY_ESC || menu_is_open())) menu_key(key);
 }
 
 /* ---- start-up and the event loop ---------------------------------------------------- */
-int rt_window_init(void) {
+static void video_hints(void) {
     setenv("DXVK_WSI_DRIVER", "SDL2", 0);   /* (DXVK's native build asks which window system) */
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
+    SDL_SetHint(SDL_HINT_APP_NAME, "Super Smash Bros. Ultimate");
+}
+
+/* --warm-shaders (gpu_d3d11.c): DXVK's native build presents through SDL, so SDL's video system
+ * must be started before the first device, even though the warm pass makes no window (it draws
+ * into 1x1 targets of its own). 1: started. */
+int rt_video_init(void) {
+    video_hints();
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+        fprintf(stderr, "[warm] SDL could not start the video system: %s\n", SDL_GetError());
+        return 0;
+    }
+    return 1;
+}
+
+int rt_window_init(void) {
+    video_hints();
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");   /* positional, as hle_pad.c expects */
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* (controllers.ini's background = ... decides) */
     SDL_SetHint(SDL_HINT_AUTO_UPDATE_JOYSTICKS, "0");              /* hle_pad.c's input thread updates the pads */
-    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
-    SDL_SetHint(SDL_HINT_APP_NAME, "Super Smash Bros. Ultimate");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS)) {
         fprintf(stderr, "[gfx] SDL could not start the video system: %s\n", SDL_GetError());
         return 0;
@@ -177,6 +196,24 @@ void rt_window_loop(int every, void (*status)(void)) {
             case SDL_MOUSEMOTION:
                 mouse_moved_at = SDL_GetTicks64();
                 if (cursor_hidden) { SDL_ShowCursor(SDL_ENABLE); cursor_hidden = 0; }
+                {   int w, h;
+                    SDL_GetWindowSize(window, &w, &h);
+                    menu_mouse_move(e.motion.x, e.motion.y, w, h); }
+                break;
+            case SDL_MOUSEBUTTONDOWN:
+                if (menu_is_open() && (e.button.button == SDL_BUTTON_LEFT || e.button.button == SDL_BUTTON_RIGHT)) {
+                    int w, h;
+                    SDL_GetWindowSize(window, &w, &h);
+                    menu_mouse_move(e.button.x, e.button.y, w, h);
+                    menu_key(e.button.button == SDL_BUTTON_LEFT ? MENU_MOUSE_LEFT : MENU_MOUSE_RIGHT);
+                }
+                break;
+            case SDL_MOUSEWHEEL:
+                if (menu_is_open()) {
+                    int y = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+                    for (; y > 0; y--) menu_key(MENU_WHEEL_UP);
+                    for (; y < 0; y++) menu_key(MENU_WHEEL_DOWN);
+                }
                 break;
             case SDL_TEXTINPUT:   /* (typed letters, for the settings menu) */
                 if (menu_is_open())

@@ -19,7 +19,7 @@ static int failures, checks;
 static void load_text(const char *text) {
     memset(&cfg, 0, sizeof cfg);
     cfg.keyboard_slot = 0; cfg.background = 1; cfg.rumble = 1;
-    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.invert = -1;
+    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.invert = cfg.def.dpad_moves = cfg.def.stick_taunts = -1;
     kb_defaults();
     char path[MAX_PATH], dir[MAX_PATH];
     GetTempPathA(sizeof dir, dir);
@@ -44,14 +44,14 @@ static Dev make_dev(const char *guid, const char *serial, const char *path, cons
     return d;
 }
 
-static PadState state(const Dev *d, u32 raw_buttons, i32 lt, i32 rt) {
+static PadState state(Dev *d, u32 raw_buttons, i32 lt, i32 rt) {
     Raw raw = {raw_buttons, {0, 0, 0, 0, lt, rt}};
     PadState o;
     dev_state(d, &raw, &o);
     return o;
 }
 
-static u64 press(const Dev *d, u32 raw_buttons, i32 lt, i32 rt) {
+static u64 press(Dev *d, u32 raw_buttons, i32 lt, i32 rt) {
     Raw raw = {raw_buttons, {0, 0, 0, 0, lt, rt}};
     PadState o;
     dev_state(d, &raw, &o);
@@ -337,6 +337,62 @@ static void test_usb(void) {
     CHECK(usb_player(8).buttons == (1ull << N_Y | 1ull << N_X | 1ull << N_B), "Switch 2: Y X B");
 }
 
+/* The adapter's stick calibration (hle_padusb.c's Axis): the centre measured from still reports
+ * (a stick moving, or resting far off, as it is plugged in keeps the default), each direction's
+ * reach grown only after a few reports in a row agree, and recalibration. */
+static void test_axes(void) {
+    Device dev = {.kind = KIND_ADAPTER, .first = 0};
+    UCHAR r[37] = {0x21};
+    UCHAR *p1 = r + 1, *p2 = r + 1 + 9;
+    p1[0] = 0x10; p1[3] = p1[4] = p1[5] = p1[6] = 128; p1[7] = p1[8] = 30;
+    for (int i = 0; i < 40; i++) adapter_report(&dev, r, sizeof r);   /* at rest: the centre is measured */
+    PadUsbAxes ua;
+    CHECK(padusb_axes(0, &ua) && ua.centre[0] == 128 && ua.lo[0] == 80 && ua.hi[0] == 80 && ua.raw[0] == 128,
+          "rest: centre 128, reach 80: %d %d %d %d", ua.centre[0], ua.lo[0], ua.hi[0], ua.raw[0]);
+    CHECK(usb_ports[0].lx == 0 && usb_ports[0].ly == 0, "rest: zeroed");
+
+    p2[0] = 0x10; p2[3] = 150; p2[4] = p2[5] = p2[6] = 128; p2[7] = p2[8] = 30;
+    for (int i = 0; i < 40; i++) adapter_report(&dev, r, sizeof r);
+    CHECK(padusb_axes(1, &ua) && ua.centre[0] == 128, "plugged in 22 off: too far, the default centre stays: %d", ua.centre[0]);
+    CHECK(usb_ports[1].lx > 8000 && usb_ports[1].lx < 10000, "and its offset shows: %d", usb_ports[1].lx);
+    p2[0] = 0;
+
+    /* each direction's own reach */
+    p1[3] = 48;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx == -32767, "80 left is all the way: %d", usb_ports[0].lx);
+    p1[3] = 198;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx == 28671, "70 right with 80 of reach: %d", usb_ports[0].lx);
+    p1[3] = 128;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(usb_ports[0].lx == 0, "back to rest");
+
+    /* a corrupt report must not grow the reach: one spike, then four in a row */
+    p1[3] = 255;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(padusb_axes(0, &ua) && ua.hi[0] == 80 && usb_ports[0].lx == 32767, "one spike: saturated, the reach keeps 80: %d", ua.hi[0]);
+    p1[3] = 128;
+    adapter_report(&dev, r, sizeof r);
+    p1[3] = 255;
+    for (int i = 0; i < 4; i++) adapter_report(&dev, r, sizeof r);
+    CHECK(padusb_axes(0, &ua) && ua.hi[0] == 100, "four spikes in a row: the reach grows, capped: %d", ua.hi[0]);
+
+    /* Recalibrate sticks (the menu) starts it over */
+    padusb_recalibrate(0);
+    p1[3] = 128;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(padusb_axes(0, &ua) && ua.centre[0] == 128 && ua.hi[0] == 80, "recalibrated: as new");
+
+    /* a trigger's top is as careful */
+    CHECK(dev.trigger_top[0][0] == 170, "trigger top rest + 140: %d", dev.trigger_top[0][0]);
+    p1[7] = 255;
+    adapter_report(&dev, r, sizeof r);
+    CHECK(dev.trigger_top[0][0] == 170, "one trigger spike: the top keeps 170");
+    for (int i = 0; i < 3; i++) adapter_report(&dev, r, sizeof r);
+    CHECK(dev.trigger_top[0][0] == 255, "four in a row: the top is relearned: %d", dev.trigger_top[0][0]);
+}
+
 /* The keyboard ([keyboard]): the defaults are the keys of before, rebinding, several keys, the
  * sticks' directions, Alt+Enter, ssbu-recomp's spellings and bad names. */
 static int held_keys[8], nheld;
@@ -428,15 +484,110 @@ static void test_keyboard(void) {
     CHECK(lx == 32767 && cfg.kb_ssf2 == 0, "movement = full: fully at once");
 }
 
+static void test_dpad_moves(void) {
+    load_text("[device default]\ndpad_moves = on\n[device ps5]\ndpad_moves = off\n");
+    CHECK(cfg.def.dpad_moves == 1 && cfg.dev[0].dpad_moves == 0, "dpad_moves parsed per section");
+    load_text("");
+    CHECK(cfg.def.stick_taunts == -1, "stick_taunts unset by default");
+    CHECK(cfg.def.dpad_moves == -1, "dpad_moves unset by default");
+    Dev d = make_dev("g", "", "", "Xbox", "xboxone");
+    int labels[4] = {N_A, N_B, N_X, N_Y};
+    dev_configure(&d, labels);
+    CHECK(d.dpad_moves == 0, "dpad_moves off by default");
+    Raw raw = {1u << RB_DPAD_RIGHT, {0, 0, 0, 0, 0, 0}};
+    PadState o;
+    dev_state(&d, &raw, &o);
+    CHECK(o.lx == 0 && (o.buttons >> N_RIGHT & 1), "off: the D-pad is only buttons");
+    load_text("[device default]\ndpad_moves = on\n");
+    Dev e = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&e, labels);
+    CHECK(e.dpad_moves == 1, "dpad_moves on");
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx == 32767 && o.ly == 0 && !(o.buttons >> N_RIGHT & 1), "right: full tilt, no D-pad button");
+    raw.buttons = 1u << RB_DPAD_UP | 1u << RB_DPAD_LEFT;
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx == -23170 && o.ly == 23170 && !(o.buttons >> N_UP & 1), "diagonal on the circle");
+    raw.buttons = 1u << RB_DPAD_DOWN;
+    dev_state(&e, &raw, &o);
+    CHECK(o.ly == -32767, "down is negative y");
+    raw.buttons = 1u << RB_DPAD_RIGHT;
+    raw.axis[RA_LEFTX] = -20000;   /* the stick pushed less far the other way: the D-pad wins */
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx == 32767, "larger wins: D-pad over a small stick");
+    raw.buttons = 0;
+    raw.axis[RA_LEFTX] = 30000;
+    dev_state(&e, &raw, &o);
+    CHECK(o.lx > 29000 && o.lx <= 32767, "no D-pad: the stick as it is");
+}
+
+static void test_stick_taunts(void) {
+    int labels[4] = {N_A, N_B, N_X, N_Y};
+    load_text("[device default]\nstick_taunts = on\n[device ps5]\nstick_taunts = off\n");
+    CHECK(cfg.def.stick_taunts == 1 && cfg.dev[0].stick_taunts == 0, "stick_taunts parsed per section");
+    load_text("");
+    Dev d = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&d, labels);
+    Raw raw = {0, {32767, 0, 0, 0, 0, 0}};
+    PadState o;
+    dev_state(&d, &raw, &o);
+    CHECK(d.stick_taunts == 0 && o.lx == 32767 && !(o.buttons >> N_RIGHT & 1), "off by default: the stick is the stick");
+    load_text("[device default]\nstick_taunts = on\n");
+    Dev e = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&e, labels);
+    dev_state(&e, &raw, &o);
+    CHECK(e.stick_taunts == 1 && (o.buttons >> N_RIGHT & 1) && o.lx == 0, "stick right: right taunt, stick still");
+    raw.axis[RA_LEFTX] = 0; raw.axis[RA_LEFTY] = -32767;   /* (the raw y is down-positive: up is negative) */
+    dev_state(&e, &raw, &o);
+    CHECK((o.buttons >> N_UP & 1) && !(o.buttons >> N_DOWN & 1) && o.ly == 0, "stick up: up taunt");
+    raw.axis[RA_LEFTY] = 32767;
+    dev_state(&e, &raw, &o);
+    CHECK((o.buttons >> N_DOWN & 1) && !(o.buttons >> N_UP & 1), "stick down: down taunt");
+    raw.axis[RA_LEFTX] = -32767; raw.axis[RA_LEFTY] = 0;
+    dev_state(&e, &raw, &o);
+    CHECK((o.buttons >> N_LEFT & 1), "stick left: left taunt");
+    raw.axis[RA_LEFTX] = 10000;
+    dev_state(&e, &raw, &o);
+    CHECK(!(o.buttons & (1ull << N_RIGHT | 1ull << N_LEFT | 1ull << N_UP | 1ull << N_DOWN)), "a light push is no taunt");
+    load_text("[device default]\nstick_taunts = on\ndpad_moves = on\n");
+    Dev f = make_dev("g", "", "", "Xbox", "xboxone");
+    dev_configure(&f, labels);
+    Raw both = {1u << RB_DPAD_LEFT, {0, -32767, 0, 0, 0, 0}};
+    dev_state(&f, &both, &o);
+    CHECK((o.buttons >> N_UP & 1) && o.lx == -32767 && o.ly == 0, "together: the stick taunts, the D-pad walks");
+}
+
+/* The adapter's pipes found from its descriptors, not assumed (official 0x81/0x02, GC Pocket+ 0x82/0x01). */
+static void test_pipes(void) {
+    UCHAR in, out; USHORT len;
+    { UCHAR id[] = {0x81, 0x02}, ty[] = {3, 3}; USHORT sz[] = {37, 6};
+      padusb_pick_pipes(id, ty, sz, 2, &in, &out, &len);
+      CHECK(in == 0x81 && out == 0x02 && len == 37, "official: in 0x%02x out 0x%02x len %u", in, out, len); }
+    { UCHAR id[] = {0x01, 0x82}, ty[] = {3, 3}; USHORT sz[] = {64, 64};
+      padusb_pick_pipes(id, ty, sz, 2, &in, &out, &len);
+      CHECK(in == 0x82 && out == 0x01 && len == 64, "0x82/0x01 in either order: in 0x%02x out 0x%02x len %u", in, out, len); }
+    { UCHAR id[] = {0x83}, ty[] = {3}; USHORT sz[] = {512};
+      padusb_pick_pipes(id, ty, sz, 1, &in, &out, &len);
+      CHECK(in == 0x83 && out == 0 && len == 37, "input only: in 0x%02x out 0x%02x len %u", in, out, len); }
+    { UCHAR id[] = {0x84, 0x05, 0x81, 0x02}, ty[] = {2, 2, 3, 3}; USHORT sz[] = {64, 64, 37, 5};
+      padusb_pick_pipes(id, ty, sz, 4, &in, &out, &len);
+      CHECK(in == 0x81 && out == 0x02, "interrupt wins over bulk: in 0x%02x out 0x%02x", in, out); }
+    padusb_pick_pipes(NULL, NULL, NULL, 0, &in, &out, &len);
+    CHECK(!in && !out, "no pipes: nothing found");
+}
+
 int main(void) {
     test_keyboard();
     test_config();
     test_mapping();
     test_gamecube();
     test_usb();
+    test_pipes();
+    test_axes();
     test_sticks();
     test_slots();
     test_rumble();
+    test_dpad_moves();
+    test_stick_taunts();
     printf("%d of %d checks passed\n", checks - failures, checks);
     return failures != 0;
 }

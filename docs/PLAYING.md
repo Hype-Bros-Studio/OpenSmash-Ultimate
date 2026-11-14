@@ -20,22 +20,21 @@ Everything about playing once the game is built: how to start it, the controls, 
 
 ## Starting the game
 
-Everything starts from a launcher. `Play SSBU.bat` and `Install WindowSmash.bat` are in the WindowSmash folder; the others are in its `launchers` folder. Double-click the one you want:
+Everything starts from a launcher. `OpenSmash.exe` is in the WindowSmash folder; the others are in its `launchers` folder. Double-click the one you want:
 
 | Launcher | What it does |
 | :--- | :--- |
-| **`Play SSBU.bat`** | Opens the WindowSmash window (below), then starts the game and joins the online lobby, so Local Wireless shows everyone's rooms. Quickplay and Local Wireless room matches are played with rollback netcode when the other player has it too ([how](MULTIPLAYER.md#rollback-in-online-mode)). If the lobby doesn't answer, the game plays offline. |
-| **`Play SSBU.bat`** with <kbd>Shift</kbd> held | Opens the WindowSmash window even when you've ticked **Start the game directly next time**. |
-| **`launchers\Play SSBU Offline.bat`** | Starts the game without going online. |
+| **`OpenSmash.exe`** | Opens the WindowSmash window (below), then starts the game and joins the online lobby, so Local Wireless shows everyone's rooms. Quickplay and Local Wireless room matches are played with rollback netcode when the other player has it too ([how](MULTIPLAYER.md#rollback-in-online-mode)). If the lobby doesn't answer, the game plays offline. |
+| **`OpenSmash.exe`** with <kbd>Shift</kbd> held | Opens the WindowSmash window even when you've ticked **Start the game directly next time**. |
+| the launcher's **Lobby: Offline** setting | Starts the game without going online. |
 | **`launchers\Host SSBU Netplay.bat`** | Starts the game as the host of a private room ([multiplayer guide](MULTIPLAYER.md#private-room)). |
 | **`launchers\Join SSBU Netplay.bat`** | Starts the game and joins someone's private room. |
 | **`launchers\Unlock All Fighters.bat`** | Unlocks every base-game fighter on your save. Close the game first ([DLC and unlocks](DLC-AND-UNLOCKS.md#unlock-every-base-game-fighter)). |
-| **`launchers\Prepare Shaders.bat`** | Prepares all of the game's shaders ahead of time ([below](#shaders-and-first-time-stutter)). |
-| **`Install WindowSmash.bat`** | Sets everything up and builds the game ([setup guide](BUILDING.md#install-in-one-go)). Run it again to get the newest WindowSmash and build it. |
-| **`launchers\Build WindowSmash.bat`** | Builds the game from your files, when the tools are already installed ([setup guide](BUILDING.md#shortcut-build-windowsmashbat)). |
+| **`python tools\shader_aot.py`** (the launcher also offers it after the install) | Prepares all of the game's shaders ahead of time ([below](#shaders-and-first-time-stutter)). |
+| **`python tools\build_game.py`** | Builds the game from your files, when the tools are already installed ([setup guide](BUILDING.md#shortcut-build_gamepy)). |
 | **`launchers\Configure Game Data.bat`** | Points WindowSmash at your game data and fonts ([setup guide, step 10](BUILDING.md#step-10-connect-your-game-data)). |
 
-`Play SSBU.bat` first opens a small window that shows the game version (13.0.5) and changes the most used settings: your online name and lobby, the window and frame pacing, the render scale, the graphics card, and which player the keyboard is. **Play** saves what you changed and starts the game; **Close** changes nothing. It edits the same files as the in-game [settings](#settings), keeping their comments. Tick **Start the game directly next time** to skip the window; hold <kbd>Shift</kbd> while you start `Play SSBU.bat` to see it again.
+`OpenSmash.exe` first opens a small window that shows the game version (13.0.5) and changes the most used settings: your online name and lobby, the window and frame pacing, the render scale, the graphics card, and which player the keyboard is. **Play** saves what you changed and starts the game; **Close** changes nothing. It edits the same files as the in-game [settings](#settings), keeping their comments. Tick **Start the game directly next time** to skip the window; hold <kbd>Shift</kbd> while you start `OpenSmash.exe` to see it again.
 
 The first time you play online, the game picks a name for you, such as `Player1234`, and shows it at the bottom of the screen. To change it, open the [settings](#settings) and go to **Online**.
 
@@ -69,7 +68,7 @@ The **Mods** page lists every installed mod with its own switch: the same switch
 
 **ARCropolis code patches** are the fixes ARCropolis makes to the game's code for costume slots that mods add (c08 and up). They have a switch of their own: **auto** (the default) turns them on while a mod runs and off otherwise, so the game with no mod runs its own code, as an unmodded game. They count when the game starts, and players online need the same setting. `SSBU_CODE_PATCHES=1` or `0` sets them for one start (tests).
 
-The settings are kept in the same files as always: `display.ini`, `controllers.ini` and the `online_*.txt` files in the WindowSmash folder. You can still edit those files by hand, and the settings keep your comments in them. Some things are only in the files, such as settings for a whole kind of controller ([below](#controllersini)).
+The settings are kept in files: `display.ini`, `controllers.ini` and the `online_*.txt` files in the **`config`** folder inside the WindowSmash folder. (Older versions kept them in the WindowSmash folder itself; the first start of a newer one copies them into `config` once, and from then on the copies left in the WindowSmash folder are not read.) You can still edit those files by hand, and the settings keep your comments in them. Some things are only in the files, such as settings for a whole kind of controller ([below](#controllersini)).
 
 ## Controls
 
@@ -149,7 +148,7 @@ Any other pad can use the game's GameCube controls too: set `style = gamecube` f
 
 ### controllers.ini
 
-The first time the game starts, it writes **`controllers.ini`** into the WindowSmash folder. The [settings](#settings) change it for you; you can also open it in Notepad (**Controllers → Open controllers.ini** opens it). Every setting is explained inside the file. Changes made by hand apply the next time the game starts, and deleting the file brings back the defaults.
+The first time the game starts, it writes **`controllers.ini`** into the WindowSmash folder's `config` folder (`config\controllers.ini`: a `controllers.ini` left beside `OpenSmash.exe` by an older version is no longer read). The [settings](#settings) change it for you; you can also open it in Notepad (**Controllers → Open controllers.ini** opens it). Every setting is explained inside the file. Changes made by hand apply the next time the game starts, and deleting the file brings back the defaults.
 
 | Setting | What it does | Default |
 | :--- | :--- | :--- |
@@ -160,6 +159,8 @@ The first time the game starts, it writes **`controllers.ini`** into the WindowS
 | `deadzone` | How much of the stick's travel around the centre is ignored, 0–50 percent. | `0` |
 | `rumble` | Rumble strength, 0–100 percent. `0` turns it off. (In `[general]`: `0` turns rumble off for every controller, `1` leaves each at its own strength.) | `100` (`1` in `[general]`) |
 | `trigger_threshold` | How far a trigger must be pulled to press ZL or ZR, 1–99 percent. (On a GameCube controller, the game itself decides how far L and R are pulled.) | `25` |
+| `stick_taunts` | `on`: the left stick's four directions (past half way) press the D-pad's buttons, the taunts, and the stick no longer moves; meant to go with `dpad_moves = on`. Also in Settings, Controllers, "Stick taunts". | `off` |
+| `dpad_moves` | `on`: the D-pad drives the left stick (full tilt: tap to walk, double-tap to dash; with the stick, the larger wins) and stops pressing its own buttons, the taunts. Also in Settings, Controllers, "D-pad moves". | `off` |
 | *remaps* | `<Switch button> = <pad control>`, for example `ZR = rightshoulder`. The file lists every name. | |
 
 The file has these sections:
@@ -224,24 +225,28 @@ The first start also writes **`display.ini`**, which sets how the game starts. T
 | `window` | `windowed`: a window that keeps 16:9 as you resize it. `borderless`: covers its whole monitor. `fullscreen`: borderless and always on top; the monitor keeps its resolution. | `windowed` |
 | `width`, `height` | The window's inside size at 100% display scaling. | `1280`, `720` |
 | `pacing` | `clock`: a steady 60 frames a second. `vrr`: for G-Sync or FreeSync monitors, each frame shown as soon as it's ready; best with `borderless`. `display`: follows a 60, 120 or 240 Hz monitor's own refresh. | `clock` |
-| `latency` | How many frames the graphics card may work ahead, 1–3. Lower is more responsive. | `3` |
+| `latency` | How many frames the graphics card may work ahead, 1–3. Lower is more responsive. The Vulkan renderer keeps 2 at least: with 1 the processor and the card wait for each other every frame. | `3` |
 | `low_latency` | `1`: the game starts each frame as late as it can and still make the next refresh, so it reads your controller later: up to most of a frame less input delay. If a frame misses its refresh it turns itself off for a second. | `1` |
 | `hide_cursor` | `1` hides the mouse pointer after two seconds without movement. | `1` |
-| `runahead` | Run-ahead (Windows; the Display page's *Run-ahead*: off, 1, 2): in fights, each frame is shown this many frames ahead, so a press reaches the picture sooner. `1` shows the real frame one frame sooner (nothing guessed: the game's own one frame of drawing behind its logic is gone); `2` also guesses one frame on the controls you hold (wrong only for the frame a press or release begins). Each frame ahead costs a frame of the game's work more for every frame shown, and a savestate a frame: on a PC that can't keep 60 frames a second with it, leave it off. Not in online matches. A change from `0` takes a restart; `SSBU_RUNAHEAD` overrides it. | `0` |
+| `runahead` | No longer read: run-ahead hitched at *GO!* and in fights on mid-range PCs (issue #250), so it is off for everyone. `SSBU_RUNAHEAD=1-3` still turns it on, for tests. | — |
 | `language` | The game's language: `auto` (the language Windows shows its menus in), or one of `ja`, `en-US`, `en-GB`, `fr`, `fr-CA`, `de`, `it`, `es`, `es-419`, `zh-Hans`, `zh-Hant`, `ko`, `nl`, `ru`. A language the game doesn't have plays in English. Chinese, Japanese and Korean text needs your console's firmware fonts. Read when the game starts; the settings menu's Game page changes it. `SSBU_LANGUAGE` overrides it. | `auto` |
 | `volume` | The game's whole sound, from `0` (silent) to `100`, over the game's own sound settings. The settings menu's Game page changes it while you play. `SSBU_VOLUME` overrides it. | `100` |
 | `overlay` | `1` shows the frame rate in the corner from the start (<kbd>F1</kbd> shows or hides it while playing). | `1` |
 | `gpu` | Which graphics card draws the game. `auto`: the fastest; on a laptop with two, the NVIDIA or AMD one rather than the processor's own. Or part of a card's name, such as `nvidia`, `radeon` or `intel`. `build\play.log` lists the cards found (a `[gfx] graphics cards` line). | `auto` |
 | `render_scale` | How many times bigger than 1920 × 1080 the game draws its picture, in each direction: a number from `0.5` to `4`, or `auto`. `auto` matches the picture to the screen when the game starts, for example 1.33 (2560 × 1440) on a 1440p monitor with `window = borderless`; it never goes below 1. A picture bigger than the window is shrunk to fit, which smooths edges (`2` on a 1440p monitor). Each step up costs the graphics card more: `2` draws four times the pixels and needs about 200 MB more graphics memory. | `1` |
-| `renderer` | `d3d11`: Direct3D 11, the renderer the game is played and tested with. `vulkan`: the Vulkan renderer, in development: until it can draw the game, the game checks Vulkan on your PC at its start, writes what it found in `build\play.log` (a `[gfx] renderer = vulkan` line), and draws with Direct3D 11 as before. The settings' Display page has it as **Renderer**; `SSBU_RENDERER` overrides it. Read when the game starts. | `d3d11` |
+| `renderer` | `auto`: Vulkan on an AMD, NVIDIA or Intel graphics card (every pipeline made behind the loading screen and kept in its own cache: no stutter the first time each effect shows), Direct3D 11 on any other. `direct3d11` or `vulkan`: that one on any card. If Vulkan cannot start, or stopped the game in its first seconds twice in a row, Direct3D 11 draws and `build\play.log` says why (a `[gfx] renderer = ...` line). Vulkan's shaders come from `ssbu_glslang.dll` beside the game, which the build makes and which needs the Visual C++ runtime. `d3d11` in an older `display.ini` means `auto`. The settings' Display page has it as **Renderer**; `SSBU_RENDERER` overrides it. Read when the game starts. | `auto` |
 
-A `display.ini` written by an older WindowSmash has no `gpu`, `render_scale` or `renderer` line; the game then uses `auto`, `1` and `d3d11`. Add the line yourself to use it, or delete `display.ini` to get a new one with every setting. `render_scale` is read when the game starts: change it, then start the game again.
+A `display.ini` written by an older WindowSmash has no `gpu`, `render_scale` or `renderer` line; the game then uses `auto`, `1` and `auto`. Add the line yourself to use it, or delete `display.ini` to get a new one with every setting. `render_scale` is read when the game starts: change it, then start the game again.
 
 ## Shaders and first-time stutter
 
 The game's graphics programs (*shaders*) are prepared the first time each one is used, so a new effect can show a moment late, or stutter, the first time you see it. WindowSmash keeps every prepared shader in `dump\shadercache\` and loads them in the background each time the game starts, so each stutter happens only once.
 
-To prepare them all before playing, double-click **`launchers\Prepare Shaders.bat`**. It runs at low priority so the PC stays usable, and shows a progress bar with the time left. A first run compiles about 40,000 shaders: about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; what's done stays done, so a later run takes minutes. It needs Python and Visual Studio, as for [building](BUILDING.md).
+To prepare them all before playing, double-click **`python tools\shader_aot.py`** (the launcher also offers it after the install). It runs at low priority so the PC stays usable, and shows a progress bar with the time left. A first run compiles about 40,000 shaders: about half an hour on a 16-thread processor, an hour or two on a 4- to 8-thread one. You can close it at any time and start it again later; what's done stays done, so a later run takes minutes. It needs Python and Visual Studio, as for [building](BUILDING.md).
+
+## Playing with yuzu-compatible clients (Windows)
+
+The optional client connects to an existing yuzu-compatible room server, then uses the game's **Local Wireless** mode. Start it with **launchers/Join yuzu Room.bat**. Eden 0.2.0 and another unnamed compatible client have been reported working in multiple complete matches. Game UDP defaults to Eden's format; historical yuzu peers can use the separate format option. See [the client guide](YUZU_CLIENT.md) for dependencies, configuration, validation and logs.
 
 ## Low frame rate
 
@@ -250,7 +255,7 @@ If matches run slowly on a PC that should manage them (press <kbd>F1</kbd> for t
 - **The PC is below what the game needs.** It needs about what an emulator needs to run Smash well: if Smash struggles in an emulator on your PC, it struggles here too. A dual-core laptop chip, or an old entry-level graphics card, is not enough; processor graphics (Intel UHD / Iris Xe, AMD Vega) play, but slower, and stutter more the first time each effect shows ([above](#shaders-and-first-time-stutter)); keep `render_scale` at its default there.
 - **A laptop is drawing with its processor's graphics.** With two graphics chips, the game takes the NVIDIA or AMD one by itself. Check the `[gfx] drawing with` line near the top of `build\play.log`, and see `gpu` in [`display.ini`](#window-and-display).
 - **Prepare Shaders is still running.** It uses most of the processor; let it finish, or close it while you play.
-- **NVIDIA's shader cache is off.** In NVIDIA Control Panel → *Manage 3D settings*, set **Shader Cache Size** to *Driver default* (not *Disabled*). Without it, the graphics driver redoes its part of every shader each time the game starts.
+- **NVIDIA's shader cache is off, or full.** In NVIDIA Control Panel → *Manage 3D settings*, set **Shader Cache Size** to *Driver default* or larger (not *Disabled*). Without it, the graphics driver redoes its part of every shader each time the game starts. The game prepares more than ten thousand shaders: if the start's preparation stays slow from one start to the next, set it to *10 GB* or *Unlimited* - a cache file that is nearly full loses entries it already had (measured by the SCSKiller project on NVIDIA's D3D12 cache: a 4 GiB file at 94-97 % full).
 - **Windows uses a slow system timer.** Some "gaming tweaks" set Windows to time everything with an old, slow timer (the HPET). WindowSmash notices and works around it, and says so near the top of `build\play.log`: a `[clock]` line ending in *slow*. Other programs stay slower, though; to undo the tweak, run `bcdedit /deletevalue useplatformclock` in a Command Prompt opened as administrator, then restart the PC.
 
 ## Your own Miis

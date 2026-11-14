@@ -76,9 +76,19 @@ The dependency plugins themselves (latest releases):
 
 | Plugin | Imports | How it works on the console |
 | --- | --- | --- |
-| Smashline 2 v1.6.8 | Skyline 5 (incl. `A64InlineHook`), main 11, lua2cpp_common 12, SDK 59 | hooks the game's agent factories (main+0x64c310 ...), lua2cpp_common's coroutine call and status lines with **inline** hooks at single instructions |
+| Smashline 2 v2.0.0 (was 1.6.8) | Skyline 5 (incl. `A64InlineHook`), main 11, lua2cpp_common 12, SDK 59 | hooks the game's agent factories (main+0x64c310 ...), lua2cpp_common's coroutine call and status lines with **inline** hooks at single instructions |
 | lib_paramconfig 6.5 | Skyline 3, ARCropolis 2, main 20 | on console: hooks param getters; reads `config_param.toml`. Here: the `.nro` is not run (its main hangs); `tools/paramconfig.py` + `runtime/hle_paramconfig.c` apply each enabled mod's toml natively. Movesets that link paramconfig into their own `plugin.nro` still work. |
 | CSK Collection 5.0.6 | Skyline 5 (incl. `A64InlineHook`), ARCropolis 6 (`arcrop_register_callback`: rewrites files as the game loads them) | patches `ui_chara_db` and friends at load time |
+
+Smashline 2.0 changed `smashline_clone_weapon`, `smashline_update_weapon_count` and
+`smashline_whitelist_kirby_copy_article` (a clone is a new weapon kind; counts and the Kirby
+whitelist go by fighter and generate-article id, not weapon kind), and plugins built for 1.6
+crash calling them. `hle_skyline.c` answers `LookupSymbol` for those three with adapters: a
+plugin with 2.0's new function names in it (or whose `clone_weapon` call has 2.0's arguments) gets
+2.0's calls as they are, any other gets 1.6's turned into 2.0's. Not the same as 1.6: a 1.6 plugin
+that compares its clone's weapon kind with the original's (the clone has a new kind now); the
+original owner a 1.6 `clone_weapon` names, when it isn't the article's own (2.0 takes the
+article's); a 1.6 `update_weapon_count` reaches clones the 1.6 plugins made, not 2.0 plugins'.
 
 ## How plugins run in WindowSmash (prototype)
 
@@ -195,9 +205,13 @@ hashbrown maps for the cXX/characall fields) into `csk.json`, and `tools/csk.py`
 `mods.py apply`) adds them to `ui_chara_db.prc` / `ui_layout_db.prc` (a copy of the fighter's
 entry, the plugin's fields set). CSK's `color_start_index` is not a game field: the runtime does
 CSK's redirect itself - at the fighter set-up (main+0x66dcf0) a player whose record names a new
-character gets costume start+k for color k, and the portrait-path function (main+0x3238a70) maps
+character in its own ui_chara field (+0; a hash further in can be another player's) gets costume
+start+k for color k, and the portrait-path function (main+0x3238a70) maps
 c120+k back to the character's own portraits (the HUD). Both are called directly by the game, so
-they are on the hookable list (`NATIVE_HOOKS` in skyline.py).
+they are on the hookable list (`NATIVE_HOOKS` in skyline.py). A character a mod adds with its
+`ui_chara_db.prcxml` alone, no plugin (Popple: Mario with `color_start_index` 24), is redirected the
+same way: `mods.py apply` lists such characters in `dump/skyline/prcxml_redirects.txt` and the runtime
+adds them when the plugins load.
 
 The CSK Collection itself (5.0.6) is built for game 13.0.4: in 13.0.5 the code from about
 main+0x1788000 up moved by 0x5B0 (Smashline's `+ 0x5B0` offsets), and most of its work is code
@@ -213,6 +227,11 @@ files, a later mod winning; the runtime reads the order from `dump/skyline/mods.
 - hookable functions: `recomp.py` makes each hook target in `dump/skyline/hooks.txt` reachable
   through the dispatch table from direct calls too (`f_X` -> `rt_lookup(X)`, the body as `f_X_orig`);
   per-module fingerprints, so only the modules concerned are generated again.
+- direct calls to a hooked function (Windows): `runtime/hle_detour.c` patches the function's first
+  bytes when the plugin hooks it, so a new function hook needs no rebuild. Where clang copied the
+  function into a caller in its file, that copy never reaches the patch: `skyline.py stale_hooks`
+  compiles that one file again with `-Rpass=inline` (once, kept in `build/work/inlined.json`) and
+  asks for a game update only then, which puts the function behind its dispatcher.
 - CRC32 instructions (crc32b/h/w/x, crc32c*: plugins compute Hash40s with them) and the
   `fcvtn`/`fcvtl` 64-bit-destination forms.
 - getting the order of hashbrown maps right, Smashline costume rules (a slot a plugin claimed

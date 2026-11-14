@@ -1,5 +1,5 @@
 /* Offline checks of where the game goes online (runtime/net_relay.c's configure): the lobby from
- * SSBU_NET_RELAY, or from online_server.txt when started with --online as Play SSBU.bat does,
+ * SSBU_NET_RELAY, or from online_server.txt when started with --online as OpenSmash.exe does,
  * and net_relay_address(), which the game's Online mode (hle_online.c) logs in through. Nothing
  * is sent: only the settings are read. Each case runs in a child process of its own (the settings
  * are read once a process), in a folder of its own.
@@ -41,11 +41,14 @@ typedef struct Case {
 } Case;
 
 static const Case CASES[] = {
-    {"public lobby from the file", "# the lobby\nsmash.recomps.wtf:39421\n", NULL, "--online", "smash.recomps.wtf:39421", "smash"},
+    {"public lobby from the file", "# the lobby\nna\n", NULL, "--online", "smash.recomps.wtf:39421", "smash"},   /* (na pins North America: its address alone now means auto, which needs the network) */
+    {"eu pins Europe", "eu\n", NULL, "--online", "opensmash-lobby.duckdns.org:39421", "smash"},
     {"lobby code from the file", "smash.recomps.wtf:39421 OurCode\n", NULL, "--online", "smash.recomps.wtf:39421", "OurCode"},
     {"offline in the file", "off\n", NULL, "--online", NULL, "smash"},
     {"no file", NULL, NULL, "--online", NULL, "smash"},
     {"no --online: the file is not read", "smash.recomps.wtf:39421\n", NULL, "", NULL, "smash"},
+    {"SSBU_NET_RELAY=na (the macOS / Linux launchers pass the file's word, #259)", "na\n", "SSBU_NET_RELAY=na", "--online", "smash.recomps.wtf:39421", "smash"},
+    {"SSBU_NET_RELAY=eu", "eu\n", "SSBU_NET_RELAY=eu", "--online", "opensmash-lobby.duckdns.org:39421", "smash"},
     {"SSBU_NET_RELAY wins", "smash.recomps.wtf:39421\n", "SSBU_NET_RELAY=127.0.0.1:39420", "--online", "127.0.0.1:39420", "smash"},
     {"SSBU_NET_RELAY=off wins", "smash.recomps.wtf:39421\n", "SSBU_NET_RELAY=off", "--online", NULL, "smash"},
     {"hosting a private room: no lobby", "smash.recomps.wtf:39421\n", "SSBU_NET_HOST=1", "--online", NULL, "smash"},

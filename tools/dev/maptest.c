@@ -29,6 +29,7 @@
  * Exit code 0 when every check passes. tests/test_kernel_map_memory.py builds and runs both. */
 #include <stdarg.h>
 #include "../../runtime/kernel.c"
+void rb_shadow_note(u64 at, u64 size) { (void)at; (void)size; }   /* (hle_rb_state.c: the rollback shadow's shared pages) */
 #include "../../runtime/clock.h"
 #ifndef _WIN32
 #include <setjmp.h>
@@ -38,6 +39,7 @@
 /* ---- what kernel.c needs from the rest of the runtime ---------------------------------- */
 int rt_trace;
 void skyline_note_sleep(void) {}   /* (hle_skyline.c: no Skyline plugins here) */
+int movie_preroll_skip(u64 ns) { (void)ns; return 0; }   /* (hle_movie.c: no movie here) */
 u64 rt_clock_ns(void) { return clock_now_ns(); }
 void rt_call(Cpu *c, u64 guest_addr) { ((GuestFn *)(uintptr_t)guest_addr)(c); }
 const char *rt_describe(u64 guest_addr, char *buf, size_t n) { snprintf(buf, n, "test function %#llx", (unsigned long long)guest_addr); return buf; }

@@ -24,6 +24,7 @@
 #include "game_addr.h"
 #include "host.h"
 #include "input_seq.h"
+#include "pad.h"
 
 #define FD(s) "_ZN3app8lua_bind" s "EPNS_26BattleObjectModuleAccessorE"
 #define FIGHTER_MANAGER "_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E"
@@ -45,38 +46,49 @@ static u64 getter(Cpu *c, const char *name, u64 boma, u64 x1, float *f) {
     return r;
 }
 
-/* FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID's value, as lua2cpp_common gets its constants:
- * lib::lua_bind_get_value<int> of the XXH64 of the name, seed ~0 (as ssbu-recomp read it off the
- * game). ssbu-recomp itself read it from the constant table by an index its build made. Not
- * found: every line's e is -1, as there without the table. */
+/* A Lua constant's value, as lua2cpp_common gets its constants: lib::lua_bind_get_value<int> of the
+ * XXH64 of the name, seed ~0 (as ssbu-recomp read it off the game). 1: found. */
+static int lua_const(Cpu *c, const char *name, u64 *value) {
+    u64 fn = rt_symbol("_ZN3lib18lua_bind_get_valueIiEEbmRT_");   /* bool (u64 key, int &) */
+    if (!fn) return -1;
+    Cpu saved = *c;
+    u64 sp = (c->sp - 0x40) & ~15ull, out = sp + 0x20;   /* (below the caller's frame) */
+    st32(out, 0);
+    c->sp = sp;
+    c->x[0] = fight_xxh64(name, strlen(name), ~0ull);
+    c->x[1] = out;
+    rt_call(c, fn);
+    int found = (int)(c->x[0] & 1);
+    *value = (u64)(i64)(i32)ld32(out);
+    *c = saved;
+    return found;
+}
+
+/* FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID's value (ssbu-recomp itself read it from the constant table by an
+ * index its build made). Not found: every line's e is -1, as there without the table. */
 static int entry_work_id(Cpu *c, u64 *id) {
     static int state;   /* 0 not asked yet, 1 found, -1 not */
     static u64 value;
     if (!state) {
         static const char NAME[] = "FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID";
-        u64 fn = rt_symbol("_ZN3lib18lua_bind_get_valueIiEEbmRT_");   /* bool (u64 key, int &) */
-        state = -1;
-        if (fn) {
-            Cpu saved = *c;
-            u64 sp = (c->sp - 0x40) & ~15ull, out = sp + 0x20;   /* (below the caller's frame) */
-            st32(out, 0);
-            c->sp = sp;
-            c->x[0] = fight_xxh64(NAME, sizeof NAME - 1, ~0ull);
-            c->x[1] = out;
-            rt_call(c, fn);
-            if (c->x[0] & 1) state = 1;
-            value = (u64)(i64)(i32)ld32(out);
-            *c = saved;
-        }
+        int r = lua_const(c, NAME, &value);
+        state = r > 0 ? 1 : -1;
         if (state > 0) fprintf(stderr, "[fight] %s is %lld: the fighters' entry ids\n", NAME, (long long)value);
         else fprintf(stderr, "[fight] %s not found (lib::lua_bind_get_value<int>%s): e is -1 on every line\n", NAME,
-                     fn ? " said no" : " is not exported");
+                     r == 0 ? " said no" : " is not exported");
     }
     *id = value;
     return state > 0;
 }
 
 /* The game's FighterManager says a fight is on: its ready-go flag (impl + 0xd2). Any thread. */
+static int ready_go(void);
+/* (gpu_overlay.c's ping badge: hidden while a fight is on) Read on the game's thread at each frame end and kept
+ * here: the overlay runs on the presenting thread, which must not take the kernel's lock (kernel_read64) - the
+ * game's thread holds it while it waits for the renderer, and the first try froze the game that way. */
+static volatile LONG fight_flag;
+int game_fight_on(void) { return (int)fight_flag; }
+static void fight_flag_hook(Cpu *c, const u64 args[8], void *unused) { (void)c; (void)args; (void)unused; InterlockedExchange(&fight_flag, ready_go()); }
 static int ready_go(void) {
     static u64 inst;
     u64 mgr, impl, word;
@@ -132,6 +144,34 @@ static void first_battle_frame(int entry) {
 }
 
 
+/* ---- SSBU_DEBUG_FINAL ------------------------------------------------------------------- */
+/* SSBU_DEBUG_FINAL=<first>[,<every>]: at that fight frame of each fighter (and every <every> frames after), its
+ * FIGHTER_INSTANCE_WORK_ID_FLAG_FINAL turned on (WorkModule::on_flag: what breaking a Smash Ball gives) and its status
+ * asked to be FIGHTER_STATUS_KIND_FINAL (StatusModule::change_status_request_from_script): its Final Smash, as
+ * ssbu-recomp's SSBU_FIGHTER_DEBUG "final" then "status". The flag alone left the next neutral special a neutral
+ * special (measured). For the pipeline sweep (tools/dev/pipeline_sweep.py): every fighter's Final Smash drawn. */
+static long long final_first, final_every;
+static void give_final(Cpu *c, u64 boma, int entry, long long f) {
+    static int state;   /* 0 not asked yet, 1 found, -1 not */
+    static u64 flag, kind;
+    if (!state) {
+        state = lua_const(c, "FIGHTER_INSTANCE_WORK_ID_FLAG_FINAL", &flag) > 0 && lua_const(c, "FIGHTER_STATUS_KIND_FINAL", &kind) > 0 ? 1 : -1;
+        fprintf(stderr, "[fight] SSBU_DEBUG_FINAL: FIGHTER_INSTANCE_WORK_ID_FLAG_FINAL %lld, FIGHTER_STATUS_KIND_FINAL %#llx%s\n",
+                (long long)flag, (unsigned long long)kind, state > 0 ? "" : " (not found: off)");
+    }
+    if (state < 0) return;
+    getter(c, FD("24WorkModule__on_flag_impl") "i", boma, flag, NULL);
+    u64 fn = rt_symbol(FD("52StatusModule__change_status_request_from_script_impl") "ib");
+    if (fn) {
+        Cpu saved = *c;
+        c->x[0] = boma; c->x[1] = kind; c->x[2] = 1;
+        rt_call(c, fn);
+        *c = saved;
+    }
+    fprintf(stderr, "[fight] SSBU_DEBUG_FINAL: fighter entry %d has its Final Smash at its fight frame %lld%s\n", entry, f,
+            fn ? "" : " (no StatusModule::change_status_request_from_script: the flag alone)");
+}
+
 /* At the entry of a fighter's frame line (x0 = the agent; agent + 0x40 = its module accessor,
  * whose word + 8 has the category in its top 4 bits, 0 for a fighter). */
 /* (run-ahead, hle_rb_core.c: a predicted frame, thrown away at the load, is no fight frame: neither counted for
@@ -153,6 +193,8 @@ static void frame_line(Cpu *c) {
         if (k == 0) first_battle_frame(fighters[k].entry);
     }
     FightFrame fr = {++fighters[k].frame, fighters[k].entry};
+    if (final_first && fr.f >= final_first && (fr.f == final_first || (final_every && (fr.f - final_first) % final_every == 0)))
+        give_final(c, boma, fighters[k].entry, fr.f);
     if (!hash_out) return;
     fr.st = (int)getter(c, FD("30StatusModule__status_kind_impl"), boma, 0, NULL);
     fr.mot = getter(c, FD("30MotionModule__motion_kind_impl"), boma, 0, NULL);
@@ -270,6 +312,7 @@ static u64 stage_choice(void) {
  * frame hook (hle_each_frame.c holds the wrap: rollback netplay needs the function too),
  * registered while a debug match is on. Called on the game's main thread, one player at a time:
  * what the panel was is kept here between the two halves. */
+int input_seq2_on(void);   /* (hle_hid.c) */
 static u64 record_was;
 static u32 record_type_was;
 static void record_before(Cpu *c, const u64 args[8], void *ctx) {
@@ -289,6 +332,17 @@ static void record_before(Cpu *c, const u64 args[8], void *ctx) {
         fprintf(stderr, "[fight] debug match: the screens' stage choice: ui_stage %llx form %u, hazards %u; rule: stock %u, item appear %u\n",
                 (unsigned long long)ld64(sel), ld32(sel + 8), ld8(GAME_ADDR(STAGE_HAZARDS)), ld8(block + 0x4c), ld32(block + 0x54));
         dm_stage(&match, P(u8, sel), P(u8, GAME_ADDR(STAGE_HAZARDS)), P(u8, block + 0x54));
+    }
+    /* A human player 2 plays on controller slot 2 when something drives it: SSBU_SEQ2's sequence, else a pad
+     * connected there (a remap test's scripted pad, tools/dev/fakexi.c). Set as a controller that joined the
+     * panel: + 0x210 the controller slot, + 0x450 a human's panel (hle_rb_core.c) */
+    if (idx == 1 && ld32(st + 0x78) == 0) {
+        PadState pad;
+        const char *by = input_seq2_on() ? "SSBU_SEQ2" : pad_get(1, &pad) ? "the pad connected there" : NULL;
+        if (by) {
+            st32(st + 0x210, 1); st8(st + 0x450, 1);
+            fprintf(stderr, "[fight] debug match: player 2 is human on controller slot 2 (%s)\n", by);
+        }
     }
     if (idx == 1) { memcpy(match_p2, P(u8, st), DM_STATE); match_p2_ok = 1; }
     record_was = was;
@@ -361,11 +415,13 @@ static DWORD WINAPI end_watch(LPVOID unused) {
 
 /* The vsync thread, at each frame shown (ipc_vi.c): the fight frames SSBU_DEBUG_END counts, and
  * the debug match's line when a fight starts. */
+volatile long long test_fight_frame;   /* the current fight's frame (0 outside fights): SSBU_CAPTURE_FROM / _TO */
 void test_fight_presented(void) {
     if (!end_limit && !match_on) return;
     shown++;
     int ended;
     long long n = dm_end_frame(&end, ready_go(), &ended);
+    test_fight_frame = n;
     if (ended) fprintf(stderr, "[fight] fight off (the game's ready-go cleared) at frame %lld shown, after %lld fight frames\n", shown, end.frames);
     if (n == 1) {
         u64 block = GAME_ADDR(MATCH_BLOCK), sel = stage_choice();
@@ -392,12 +448,19 @@ void test_fight_start(void) {
         hash_on = hash_out != NULL;
         if (!hash_on) fprintf(stderr, "[fight] SSBU_FIGHT_HASH: cannot write %s\n", h);
     }
-    if (hash_on || det) {
+    const char *fin = getenv("SSBU_DEBUG_FINAL");
+    if (fin && *fin && (final_first = strtoll(fin, NULL, 10)) > 0) {
+        const char *comma = strchr(fin, ',');
+        final_every = comma ? strtoll(comma + 1, NULL, 10) : 0;
+        fprintf(stderr, "[fight] SSBU_DEBUG_FINAL: each fighter's Final Smash at its fight frame %lld, then every %lld\n", final_first, final_every);
+    } else final_first = 0;
+    if (hash_on || det || final_first) {
         fprintf(stderr, "[fight] SSBU_FIGHT_HASH %s, SSBU_DETERMINISTIC %d (off mask %d): the fighters' frame line is watched\n",
                 hash_on ? "on" : "off", det, det_off);
         frame_hook_add(FRAME_HOOK_LINE, FRAME_ORDER_FIGHT_TEST, frame_line_hook, NULL, NULL);
     }
     if (det) frame_hook_add(FRAME_HOOK_END, FRAME_ORDER_FIGHT_TEST, NULL, frame_end_hook, NULL);
+    frame_hook_add(FRAME_HOOK_END, FRAME_ORDER_FIGHT_TEST, NULL, fight_flag_hook, NULL);   /* (game_fight_on, always) */
     if (det && !(det_off & DET_OFF_STEPS)) input_seq_set_steps(seq_steps);
     if (fixed_seed_parse(getenv("SSBU_FIXED_SEED"), &n)) {
         fixed_on = 1;

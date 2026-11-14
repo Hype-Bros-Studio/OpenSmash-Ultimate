@@ -14,10 +14,10 @@ It is the merge of two projects, [WindowSmash](https://github.com/OpenSmash-Ulti
 
 ## Install
 
-1. Download **[OpenSmash Setup.exe](https://github.com/OpenSmash-Ultimate/OpenSmash-Ultimate/releases/download/v0.3.0-alpha.3/OpenSmash-Setup.exe)** from the latest [release](https://github.com/OpenSmash-Ultimate/OpenSmash-Ultimate/releases) and run it. It does the rest.
-2. Choose where OpenSmash goes (about 60 GB free; not the Desktop or Documents) and click **Download and set up**. It downloads the project from GitHub into that folder, makes the **OpenSmash** and **Play SSBU** shortcuts (desktop and Start menu), and opens the launcher there.
+1. Download **OpenSmash.exe** (Windows), **OpenSmash** (Linux), or **OpenSmash.app** (macOS) from the [release](https://github.com/OpenSmash-Ultimate/OpenSmash-Ultimate/releases) for your platform and run it.
+2. Choose a location with about 60 GB free and click **Download & Continue**. It creates an **OpenSmash** folder there, downloads the project, and opens its installer.
 3. In the installer window, check that it found your game files (game plus its 13.0.5 update), keys and optionally firmware; fix any folder with **Browse**. Click **Set up and build** and wait: 30 minutes to a few hours.
-4. Press **Play** in the launcher, or use the **Play SSBU** shortcut.
+4. Press **Play**. The launcher shows **Starting game**, then closes once the game window opens.
 5. To update, open **Settings -> Update** in the launcher. Mods are in the launcher's **Mods** view; online is in **Settings -> Online**.
 
 You need your own copy of the game, version 13.0.5, dumped from your own Switch, and a 64-bit Windows 10 or 11 PC; AVX2 is recommended, SSE4.2 works too. Linux and macOS (Apple silicon) are experimental. The [installation guide](docs/INSTALL.md) explains each step; [docs/BUILDING.md](docs/BUILDING.md) is the step-by-step setup and building from source.
@@ -37,6 +37,10 @@ You need your own copy of the game, version 13.0.5, dumped from your own Switch,
 Rows that link to pull requests are being reviewed and land in `main` as they are merged.
 
 ## Guides
+
+The launcher uses one shared implementation on Windows, Linux and macOS.
+[Build it](docs/DESKTOP-LAUNCHER.md) with `Build Launcher Windows.bat`,
+`Build Launcher Linux.sh`, or `Build Launcher macOS.command`.
 
 | Guide | Read it to |
 | :--- | :--- |
@@ -67,6 +71,10 @@ Rows that link to pull requests are being reviewed and land in `main` as they ar
 ## For developers
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Its three rules hold for every change: nothing derived from the game goes into the repository, clean sources only, and every claim is measured.
+
+### Built with AI coding tools
+
+Much of OpenSmash-Ultimate was written with AI coding assistants, directed and checked by its maintainers: reading the game's code in a disassembler, writing the runtime and the tools, running the game headless to prove each change with its own logs and counters, and reviewing pull requests. That lowers the bar to contribute: you don't need to know ARM64, Direct3D or the Switch's services before you start. Describe the problem, let an assistant read the code with you, and hold it to the same rules as anyone else: [CONTRIBUTING.md](CONTRIBUTING.md)'s three rules, a measurement for every claim, and a test that fails without the fix. Say in your pull request what you checked yourself.
 
 WindowSmash's source-only tests use made-up data and need no game files. Run them from the repository root, in PowerShell or a Unix shell:
 

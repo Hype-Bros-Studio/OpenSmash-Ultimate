@@ -23,6 +23,7 @@ directly as well needs it built in: the runtime lists every hook target it is as
 dump/skyline/hooks.txt, and the targets the generated C calls directly are made hookable
 (tools/recomp.py HOOKABLE) by the next build, which regenerates the C of the modules they are in
 (that takes long for main: tens of minutes)."""
+import contextlib
 import filecmp
 import hashlib
 import json
@@ -33,12 +34,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECOMPILER = ("recomp.py", "lift.py", "lift_simd.py", "regcache.py", "plugin_eh.py", "eh.py")   # (what makes a plugin's C)
 sys.path.insert(0, HERE)
 ROOT = os.path.dirname(HERE)
+
+import progress  # noqa: E402  (a neighbour: after HERE is on sys.path, for python -P)
 
 # Game functions runtime/hle_skyline.c hooks itself that the game also calls directly (the CSK
 # Collection's select-screen redirect: the fighter set-up and the portrait paths)
@@ -132,33 +136,42 @@ def template_module(name):
     return name == "smashline_test" or name.startswith("smashline_test_")
 
 
-def write_module_name(path, name):
-    """Smashline identifies a plugin by the length-prefixed name in front of MOD0, not by the
-    file name. That slot ends at MOD0, so a longer name stops there."""
-    from nso import Module
-    m = Module(path)
+def with_module_name(data, m, name):
+    """The NRO's bytes (`data`, module `m`) with the module name `name`. Smashline identifies a plugin
+    by the length-prefixed name at the start of rodata, not by the file name. Only the old name's bytes
+    are written over: what follows it is the plugin's own data (MOD0 can be 50 KB further on), so a
+    longer name is cut to the old one's length. Unchanged when there is no such name."""
     start = m.rodata.mem + 8
-    mod0 = bytes(m.image).find(b"MOD0", start)
-    if mod0 < 0:
-        return m.module_name()
-    raw = name.encode("ascii", "ignore")[:mod0 - start]
+    old = struct.unpack_from("<I", data, start - 4)[0] if start <= len(data) else 0
+    if not 0 < old <= 0x200 or start + old > len(data):
+        return bytes(data)
+    raw = name.encode("ascii", "ignore")[:old]
     if not raw:
-        return m.module_name()
-    blob = struct.pack("<I", len(raw)) + raw + b"\0" * (mod0 - start - len(raw))
-    with open(path, "r+b") as f:
-        f.seek(m.rodata.mem + 4)
-        f.write(blob)
-    return raw.decode("ascii")
+        return bytes(data)
+    blob = struct.pack("<I", len(raw)) + raw + b"\0" * (old - len(raw))
+    out = bytearray(data)
+    out[m.rodata.mem + 4:m.rodata.mem + 4 + len(blob)] = blob
+    return bytes(out)
 
 
-def stamp_identity(path, prefer, p):
-    """A Skyline template leaves every moveset named smashline_test. Smashline then treats the
-    second one as the first, and its character never reaches the select screen. The name becomes
-    the character the mod folder names."""
+def write_module_name(path, name):
+    """with_module_name, written into the file at `path` (a copy in dump/nro/, never a mod's own file)."""
     from nso import Module
     m = Module(path)
+    with open(path, "rb") as f:
+        data = with_module_name(f.read(), m, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return Module(path).module_name()
+
+
+def identity(m, prefer, p):
+    """The module name a plugin's copy gets: a Skyline template leaves every moveset named
+    smashline_test. Smashline then treats the second one as the first, and its character never
+    reaches the select screen, so the copy is named after the character the mod folder names.
+    None: the plugin keeps its own name."""
     if not prefer or not template_module(m.module_name()):
-        return
+        return None
     taken = set()
     bases = os.path.join(p.nro, "bases.txt")
     if os.path.isfile(bases):
@@ -169,7 +182,27 @@ def stamp_identity(path, prefer, p):
     name = prefer
     while name in taken:
         name += "_"
-    write_module_name(path, name)
+    return name
+
+
+def placed_bytes(source, m, name):
+    """What dump/nro/ holds for the plugin at `source` (module `m`): its bytes, under `name` (identity)
+    when it has one. The mod's own file is only read."""
+    with open(source, "rb") as f:
+        data = f.read()
+    return with_module_name(data, m, name) if name else data
+
+
+def place(path, data):
+    """Write a plugin's copy unless it already holds these bytes (its date then stays as it is)."""
+    if os.path.isfile(path):
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
 
 
 def rename_template(p, build_id, current, prefer):
@@ -200,19 +233,48 @@ def rename_template(p, build_id, current, prefer):
     return name
 
 
+def retire_older(p, source, build_id, record):
+    """Forget the earlier builds of the plugin at `source` (the record's entries for the same file under
+    another build id): their rows of bases.txt, their copies in dump/nro/ and their record entries. Returns
+    the module name the latest of them had (the new build keeps it), or None."""
+    rel = os.path.relpath(source, p.tree)
+    older = [(b, e["module"]) for b, e in record.items()
+             if b != build_id and isinstance(e, dict) and e.get("module") and
+             os.path.normcase(os.path.normpath(e.get("file", ""))) == os.path.normcase(os.path.normpath(rel))]
+    if not older:
+        return None
+    bases = os.path.join(p.nro, "bases.txt")
+    rows = [l.split() for l in open(bases, encoding="utf-8") if l.strip()] if os.path.isfile(bases) else []
+    gone = {b for b, _name in older}
+    names = {r[0] for r in rows if len(r) == 4 and r[3] in gone}
+    with open(bases, "w", encoding="utf-8", newline="\n") as f:
+        f.writelines(" ".join(r) + "\n" for r in rows if not (len(r) == 4 and r[3] in gone))
+    for name in names:
+        copy = os.path.join(p.nro, name + ".nro")
+        if os.path.isfile(copy):
+            os.remove(copy)
+    for b in gone:
+        del record[b]
+    kept = [name for _b, name in older if name in names]
+    return kept[-1] if kept else None
+
+
 def module_of(p, source, record, prefer=None):
     """The module name tools/recomp.py gives the plugin: placed in dump/nro/ if it is new."""
     import recomp as rc
     from nso import Module
-    stamp_identity(source, prefer, p)
     m = Module(source)
     placed = os.path.join(p.nro, record[m.build_id]["module"] + ".nro") if m.build_id in record else None
     if placed and os.path.exists(placed):
-        if not filecmp.cmp(source, placed, shallow=False):   # (same build, other bytes: a ported plugin, tools/port_plugin.py)
-            shutil.copyfile(source, placed)
+        # (same build, other bytes: a ported plugin, tools/port_plugin.py)
+        named = record[m.build_id]["module"] if prefer and template_module(m.module_name()) else None
+        place(placed, placed_bytes(source, m, named))
         return m.build_id, rename_template(p, m.build_id, record[m.build_id]["module"], prefer)
     rc.NRO_DIR = p.nro
-    shutil.copyfile(source, os.path.join(p.nro, m.build_id[:16] + ".nro"))
+    # (a new build of a plugin the game has: it takes the old one's place and name, not a name with a _ more)
+    reused = retire_older(p, source, m.build_id, record)
+    named = (reused or identity(m, prefer, p)) if prefer and template_module(m.module_name()) else None
+    place(os.path.join(p.nro, m.build_id[:16] + ".nro"), placed_bytes(source, m, named))
     rc.nro_modules()   # (names it after the module, gives it an address: bases.txt)
     for row in open(os.path.join(p.nro, "bases.txt"), encoding="utf-8").read().splitlines():
         parts = row.split()
@@ -249,7 +311,7 @@ def generate(p, name, log, own_exports=False, jobs=1):
     if fresh_c or not os.path.exists(img) or os.path.getmtime(img) < os.path.getmtime(nro):
         recomp(p, "image", nro, "--out", img)
     if fresh_c:
-        log(f"writing {name}'s C — 0%, estimating the time left")
+        log(f"writing {name}'s C")
         if own_exports:
             os.environ["SSBU_OWN_EXPORTS"] = "1"
         try:
@@ -279,6 +341,34 @@ def seed_lists(p):
                 f.writelines(l + "\n" for l in new)
 
 
+def prune_patches(p, live, log=print):
+    """Drop from dump/skyline/patches.txt the code patches of plugins no longer loaded (turned off,
+    removed, or another build of one, under a new module name): compiled into the game, they'd go on
+    changing its code for a plugin that isn't there (Smashline 2.0.0's, left after going back to
+    1.6.8, crashed every match). A line without its plugin (from before the runtime named it) is kept
+    if the standard plugins' seed has it, else dropped: a loaded plugin's is listed again as it runs."""
+    path = os.path.join(p.skyline, "patches.txt")
+    if not os.path.exists(path):
+        return
+    seed = os.path.join(SEED, "patches.txt")
+    seed = set(open(seed, encoding="utf-8").read().splitlines()) if os.path.exists(seed) else set()
+    lines = open(path, encoding="utf-8").read().splitlines()
+    keep, dropped = [], {}
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 5 and parts[4] not in live and parts[4] != "?":
+            dropped[parts[4]] = dropped.get(parts[4], 0) + 1
+        elif len(parts) == 4 and line not in seed:
+            dropped["no plugin named"] = dropped.get("no plugin named", 0) + 1
+        elif line.strip():
+            keep.append(line)
+    if dropped:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.writelines(l + "\n" for l in keep)
+        log("code patches of plugins no longer loaded dropped (the next build leaves them out): "
+            + ", ".join(f"{n} ({k})" for n, k in sorted(dropped.items())))
+
+
 def sync(tree, log=print, jobs=1):
     """Recompile the turned-on mods' plugins and list them to load; returns the list."""
     p = Paths(tree)
@@ -305,6 +395,7 @@ def sync(tree, log=print, jobs=1):
         if name not in names:
             names.append(name)
             log(f"{mod}: plugin {os.path.basename(source)} -> {name}")
+    prune_patches(p, set(names), log)
     with open(p.record, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=1)
     import mods
@@ -349,17 +440,6 @@ def sync(tree, log=print, jobs=1):
     return names
 
 
-# On Linux a mod's plugin is compiled into the program as the standard ones are
-# (tools/linux/build_linux.py links every build/nro/<name>): no plugin file of its own.
-LINUX = sys.platform.startswith("linux")
-
-
-def programs_of(tree):
-    """The game's program, as each system's build makes it."""
-    return [os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"),
-            os.path.join(tree, "build", "ssbu.exe"), os.path.join(tree, "build-linux", "ssbu")]
-
-
 def built_in(tree, name):
     """Whether the game's program has the plugin compiled in (its nro_table names it), from C the
     current recompiler made (an older one's can carry bugs fixed since), and compiled since (Apply
@@ -367,7 +447,9 @@ def built_in(tree, name):
     c = os.path.join(tree, "build", "nro", name, "g_module.c")
     if c_stale(c):
         return False
-    built = max((os.path.getmtime(x) for x in programs_of(tree) if os.path.exists(x)), default=0)
+    programs = [os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"), os.path.join(tree, "build", "ssbu.exe"),
+                os.path.join(tree, "build-linux", "ssbu")]
+    built = max((os.path.getmtime(x) for x in programs if os.path.exists(x)), default=0)
     if os.path.getmtime(c) > built:
         return False
     for table in (os.path.join(tree, "build-mac", "gen", "nro_table.c"), os.path.join(tree, "build", "rt", "nro_table.c"),
@@ -400,7 +482,9 @@ def plugin_state(tree, mod, rels):
         except Exception:   # (not an NRO the recompiler reads)
             entry = None
         name = entry and entry["module"]
-        out.append({"file": rel, "module": name, "built": (built_in(tree, name) if LINUX else dll_current(tree, name)) if name else None})
+        # (Windows: its own DLL, cache_mod_plugins; macOS and Linux: compiled into the program)
+        built = (dll_current(tree, name) if os.name == "nt" else built_in(tree, name)) if name else None
+        out.append({"file": rel, "module": name, "built": built})
     return out
 
 
@@ -434,27 +518,33 @@ def patch_lines(p):
     if os.path.exists(path):
         for line in open(path, encoding="utf-8"):
             parts = line.split()
-            if len(parts) == 4:
-                out[parts[0]] = out.get(parts[0], "") + " ".join(parts[1:]) + "\n"
+            if len(parts) in (4, 5):   # (the plugin that made it, the fifth: not in recomp.py's record)
+                out[parts[0]] = out.get(parts[0], "") + " ".join(parts[1:4]) + "\n"
     return out
 
 
 def _hook_sources(tree):
-    """(module, folder of its generated C) for every module with an inline hook or a code patch."""
+    """(module, folder of its generated C) for every module with an inline hook or a code patch, and
+    (Windows: copied_hooks) a function hook."""
     p = Paths(tree)
     inline, patches = inline_targets(p), patch_lines(p)
+    functions = hook_targets(p) if os.name == "nt" else {}
     found = []
-    for mod in sorted(set(inline) | set(patches)):
+    for mod in sorted(set(inline) | set(patches) | set(functions)):
         table = os.path.join(tree, "build", mod, "g_module.c") if mod in ("main", "subsdk0", "sdk") else \
             os.path.join(tree, "build", "nro", mod, "g_module.c")
         found.append((mod, os.path.dirname(table), inline, patches))
     return found
 
 
+# (bump when what _stale_hooks decides changes: an answer cached by an earlier version is asked again)
+HOOKS_CHECK_VERSION = 2
+
+
 def _hooks_sig(tree):
-    """Changes when the hook lists or the generated C that carries them change."""
+    """Changes when the hook lists or the generated C that carries them change, or the check itself."""
     p = Paths(tree)
-    parts = []
+    parts = [f"v{HOOKS_CHECK_VERSION}"]
     for path in (p.hooks, os.path.join(p.skyline, "patches.txt")):
         if os.path.exists(path):
             st = os.stat(path)
@@ -475,37 +565,141 @@ def _hooks_sig(tree):
 
 
 def stale_hooks(tree):
-    """The game modules whose generated C lacks an inline hook or a code patch the runtime listed.
-    A function hook (A64HookFunction) is patched into that function when the game starts, so it
-    is not a reason to rebuild the program. The answer is cached: reading every generated file is
-    what made the mods page wait."""
+    """The game modules whose generated C lacks an inline hook or a code patch the runtime listed,
+    or (Windows) has a function hook the compiler copied into a caller (copied_hooks). Any other
+    function hook (A64HookFunction) is patched into that function when the game starts
+    (runtime/hle_detour.c), so it is not a reason to rebuild the program. The answer is cached:
+    reading every generated file is what made the mods page wait."""
+    return _hooks_state(tree)["mods"]
+
+
+def copied_hooks(tree):
+    """The modules of stale_hooks that are there for a function hook the compiler copied into a
+    caller in the same file. The patch at the function's start does not reach that copy, so the
+    module's C is generated again with the function behind its dispatcher (recomp.py hookable)."""
+    return _hooks_state(tree)["copied"]
+
+
+def _hooks_state(tree):
     cache = os.path.join(tree, "build", "work", "stale_hooks.json")
     sig = _hooks_sig(tree)
     try:
         with open(cache, encoding="utf-8") as f:
             saved = json.load(f)
-        if saved.get("sig") == sig and isinstance(saved.get("mods"), list):
-            return saved["mods"]
-    except (OSError, ValueError):
+        if saved.get("sig") == sig and isinstance(saved.get("mods"), list) and isinstance(saved.get("copied"), list):
+            return saved
+    except (OSError, ValueError, AttributeError):
         pass
-    out = _stale_hooks(tree)
+    mods, copied = _stale_hooks(tree)
+    out = {"sig": sig, "mods": mods, "copied": copied}
     try:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         with open(cache, "w", encoding="utf-8") as f:
-            json.dump({"sig": sig, "mods": out}, f)
+            json.dump(out, f)
     except OSError:
         pass
     return out
 
 
+INLINED_REMARK = re.compile(r"'f_([0-9a-f]+)' inlined into ")
+DEFINITION = re.compile(r"void (f_[0-9a-f]+)\(Cpu \*c\)")
+
+
+def _defined_in(folder, names):
+    """{name: generated file} of the functions among `names` the module's files lift. One the build
+    forwards (a runtime wrap, an export it hands on: a one-line `{ other(c); }`) is left out: no
+    rebuild gives it a dispatcher, so asking for one would ask after every update."""
+    want, out = set(names), {}
+    for n in sorted(os.listdir(folder)):
+        if not want:
+            break
+        if not (n.startswith("g") and n.endswith(".c")) or n == "g_module.c":
+            continue
+        with open(os.path.join(folder, n), encoding="utf-8") as f:
+            for line in f:
+                m = DEFINITION.match(line) if line.startswith("void f_") else None
+                if m and m.group(1) in want and line.rstrip().endswith("{"):
+                    out[m.group(1)] = os.path.join(folder, n)
+                    want.discard(m.group(1))
+    return out
+
+
+def inlined_functions(tree, src):
+    """Guest addresses of the functions clang copies into a caller when it compiles generated file
+    `src` (its -Rpass=inline remarks), at the level the build compiled it (compile_times.json); None
+    if it did not compile. The ladder may have compiled it with fewer functions optimised, which
+    only copies fewer. Kept in build/work/inlined.json by the file's content and the compile command,
+    so each file is compiled once for this."""
+    import cc
+    import ladder
+    build = os.path.join(tree, "build")
+    rel = os.path.relpath(src, build).replace(os.sep, "/")
+    try:
+        with open(os.path.join(build, ladder.TIMES_FILE), encoding="utf-8") as f:
+            level = json.load(f)["files"][rel]["level"]
+    except (OSError, ValueError, KeyError, TypeError):
+        level = "/O2"
+    path = os.path.join(build, "work", "inlined.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    with tempfile.TemporaryDirectory(prefix="inlined ") as tmp:
+        cmd = cc.compile_command(src, os.path.join(tmp, "x.obj"), level, cc.GAME_CFLAGS)
+        cmd[1:1] = ["/clang:-Rpass=inline"]
+        with open(src, "rb") as f:
+            key = hashlib.sha256(f.read() + "\0".join([level, *cc.GAME_CFLAGS]).encode("utf-8")).hexdigest()
+        entry = saved.get(rel)
+        if isinstance(entry, dict) and entry.get("key") == key and isinstance(entry.get("copied"), list):
+            return {int(a, 16) for a in entry["copied"]}
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        return None
+    found = sorted({int(a, 16) for a in INLINED_REMARK.findall(r.stdout + r.stderr)})
+    saved[rel] = {"key": key, "copied": [f"{a:x}" for a in found]}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(saved, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+    return set(found)
+
+
+def _copied_targets(tree, folder, base, offsets):
+    """Of a module's function hook targets (offsets), the addresses of those its C has no dispatcher
+    for yet that the compiler copied into a caller (inlined_functions; one that did not compile:
+    taken as copied)."""
+    with open(os.path.join(folder, "g_module.c"), encoding="utf-8") as f:
+        table = f.read()
+    names = {f"f_{base + o:x}": base + o for o in offsets if f"f_{base + o:x}_orig" not in table}
+    by_file = {}
+    for name, src in _defined_in(folder, names).items():
+        by_file.setdefault(src, set()).add(names[name])
+    out = set()
+    for src, addrs in sorted(by_file.items()):
+        copied = inlined_functions(tree, src)
+        out |= addrs if copied is None else addrs & copied
+    return out
+
+
 def _stale_hooks(tree):
+    """(stale_hooks, copied_hooks)."""
     import recomp as rc
     rc.TREE = tree
-    out = []
+    out, copied = [], []
+    functions = hook_targets(Paths(tree)) if os.name == "nt" else {}
     for mod, folder, inline, patches in _hook_sources(tree):
         table = os.path.join(folder, "g_module.c")
         base = rc.MODULES.get(mod) or rc.nro_modules().get(mod) if os.path.exists(table) else None
         if not base:
+            continue
+        if functions.get(mod) and _copied_targets(tree, folder, base, functions[mod]):
+            out.append(mod)
+            copied.append(mod)
             continue
         rec = os.path.join(folder, "plugin_patches.txt")
         if patches.get(mod, "") != (open(rec, encoding="utf-8").read() if os.path.exists(rec) else ""):
@@ -518,14 +712,50 @@ def _stale_hooks(tree):
                     have |= {int(h, 16) for h in re.findall(r"rt_inline_hook\(c, 0x([0-9A-Fa-f]+)ull\)", open(os.path.join(folder, n), encoding="utf-8").read())}
             if any(base + o not in have for o in inline[mod]):
                 out.append(mod)
-    return out
+    return out, copied
+
+
+def programs(tree, platform=None):
+    """The game's programs a tree can hold, this system's first (a folder can hold another system's
+    build too: a Windows build cross-compiled for Linux keeps build/ssbu.exe beside build-linux/ssbu)."""
+    platform = platform or sys.platform
+    mac = os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu")
+    win = os.path.join(tree, "build", "ssbu.exe")
+    linux = os.path.join(tree, "build-linux", "ssbu")
+    if platform.startswith("linux"):
+        return [linux, win, mac]
+    if platform == "darwin":
+        return [mac, win, linux]
+    return [win, mac, linux]
 
 
 def program(tree):
-    for exe in programs_of(tree):
+    for exe in programs(tree):
         if os.path.exists(exe):
             return exe
     return None
+
+
+def link_commands(tree, jobs, platform=None):
+    """The commands that link the game again with the turned-on mods' plugins, on this system: macOS's
+    build_mac.py; on Linux the C written into build/ (recomp.py all --generate-only: recomp.py's own
+    compile is the Windows one, clang-cl and the MSVC libraries, which a Linux PC does not have), then
+    compiled and linked into build-linux/ssbu by build_linux.py, as tools/build_game.py's build does;
+    on Windows recomp.py all, which compiles and links build/ssbu.exe."""
+    platform = platform or sys.platform
+    exefs = os.path.join(tree, "dump", "exefs")
+    if platform == "darwin":
+        return [[sys.executable, os.path.join(HERE, "mac", "build_mac.py"), "--port", tree, "--jobs", str(jobs)]]
+    if platform.startswith("linux"):
+        out = os.path.join(tree, "build-linux")
+        import game_dll
+        dll = ["--game-dll"] if os.path.exists(os.path.join(out, game_dll.SO)) else []   # (built that way before: kept)
+        return [[sys.executable, os.path.join(HERE, "recomp.py"), "all", exefs, "--out", os.path.join(tree, "build"),
+                 "--jobs", str(jobs), "--tree", tree, "--generate-only"],
+                [sys.executable, os.path.join(HERE, "linux", "build_linux.py"), "--port", tree, "--out", out,
+                 "--jobs", str(jobs), *dll]]
+    return [[sys.executable, os.path.join(HERE, "recomp.py"), "all", exefs, "--out", os.path.join(tree, "build"),
+             "--jobs", str(jobs), "--tree", tree]]
 
 
 def probe(tree, log=print):
@@ -567,7 +797,7 @@ def probe(tree, log=print):
     with tempfile.TemporaryDirectory(prefix="skyline-probe-") as data:
         env["SSBU_DATA_ROOT"] = data
         try:
-            with open(probe_log, "w", encoding="utf-8") as output:
+            with open(probe_log, "w", encoding="utf-8") as output, counting(log, "testing the plugins in the game", PROBE):
                 ran = subprocess.run([exe, os.path.join(tree, "dump", "modules")], env=env,
                                      timeout=180, cwd=tree, stdout=output, stderr=subprocess.STDOUT)
         except subprocess.TimeoutExpired:
@@ -589,16 +819,56 @@ def probe_and_apply(tree, log=print):
 
 
 _BAR = re.compile(r"^\[[#-]+\]\s+(\d+)%\s+(.*?)\s*(?:\(\s*(.*?)\s*\))?\s*$")
+# A plugin build relinking the game (main's hooks, the plugins, the link), before its own bar has a time left.
+# (one guess for every PC: 3-4 min on a fast one; the build's own bar replaces it as soon as it has a time left)
+RELINK = 180.0
+# A test boot (probe): runtime/hle_skyline.c's probe_timer ends it a fixed 60 s after the plugins have loaded (the
+# real ARCropolis), and getting there took about 5 s (i5-12600K). The game says nothing meanwhile: the bar goes by this.
+PROBE = 65.0
+_CHAIN = None
 
 
-def run_logged(cmd, log, keep=60):
+def chain():
+    """This run's one bar (progress.Chain) across every program run_logged starts: the Mods app's
+    bar follows one command (os_mods.py build), so it does not start over at each program."""
+    global _CHAIN
+    if _CHAIN is None:
+        _CHAIN = progress.Chain()
+    return _CHAIN
+
+
+@contextlib.contextmanager
+def counting(log, label, seconds, every=2.0):
+    """While a program of known length runs and prints nothing (the test boot), the bar goes on by its time,
+    a line every `every` seconds: `label — percent%, time left`, as run_logged's."""
+    whole, stop, t0 = chain(), threading.Event(), time.time()
+    whole.start(0.0)
+
+    def tick():
+        while not stop.wait(every):
+            spent = time.time() - t0
+            frac, left = whole.update(min(spent / seconds, 0.99), max(seconds - spent, 5.0))
+            log(f"{label} — {int(frac * 100)}%, {progress.left_text(frac, left)}")
+    thread = threading.Thread(target=tick, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+
+
+def run_logged(cmd, log, keep=60, later=None):
     """Run the game's build with its output in `log` (the Mods app's window and manager.log - its
     pythonw.exe has no console, and a failed build said nothing of why): what reads as a problem as
     it comes, and when it fails, its last `keep` lines. Each progress line becomes
-    `what it is doing — percent%, time left` so a bar can follow the step, not only a spinner."""
+    `what it is doing — percent%, time left`, the percent and the time left being the whole run's
+    (chain(); `later`: seconds estimated for what comes after this program), so a bar can follow it."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", bufsize=1)
-    tail = []
+    whole = chain()
+    whole.start(later)
+    tail, detail = [], "building the game"
     for line in proc.stdout:
         line = line.rstrip()
         if not line:
@@ -606,9 +876,9 @@ def run_logged(cmd, log, keep=60):
         tail = (tail + [line])[-keep:]
         bar = _BAR.match(line.strip())
         if bar:
-            detail = (bar.group(3) or "building the game").strip()
-            eta = (bar.group(2) or "").strip()
-            log(f"{detail} — {int(bar.group(1))}%, {eta}")
+            detail = (bar.group(3) or detail).strip()   # (its last line, "100%  done", names nothing)
+            frac, left = whole.update(int(bar.group(1)) / 100, progress.seconds_left(bar.group(2) or ""))
+            log(f"{detail} — {int(frac * 100)}%, {progress.left_text(frac, left)}")
         elif re.search(r"error|failed|warning: .*(undeclared|implicit)|did not compile|LNK\d", line, re.I):
             log(line[:400])
         elif re.search(r"generating its C|C up to date|modules reused|linking the|applying the mods", line, re.I):
@@ -658,23 +928,25 @@ extern const RtModule rt_module_{name};
 static GuestFn *(*plugin_lookup)(u64);
 static GuestFn *(*plugin_lookup_cached)(u64, RtCache *);
 static void (*plugin_trap)(Cpu *, u64, const char *);
+static void (*plugin_svc)(Cpu *, u32);
 GuestFn *rt_lookup(u64 addr) {{ return plugin_lookup(addr); }}
 GuestFn *rt_lookup_cached(u64 addr, RtCache *cache) {{ return plugin_lookup_cached(addr, cache); }}
 void rt_trap(Cpu *c, u64 pc, const char *why) {{ plugin_trap(c, pc, why); }}
+/* A plugin whose code makes a system call (an svc: Raichu's svcQueryMemory) calls this. */
+void rt_svc(Cpu *c, u32 number) {{ plugin_svc(c, number); }}
 __declspec(dllexport) const RtModule *ssbu_plugin_module(void) {{ return &rt_module_{name}; }}
 __declspec(dllexport) void ssbu_plugin_bind(GuestFn *(*lookup)(u64), GuestFn *(*lookup_cached)(u64, RtCache *),
-                                            void (*trap)(Cpu *, u64, const char *)) {{
-    plugin_lookup = lookup; plugin_lookup_cached = lookup_cached; plugin_trap = trap;
+                                            void (*trap)(Cpu *, u64, const char *), void (*svc)(Cpu *, u32)) {{
+    plugin_lookup = lookup; plugin_lookup_cached = lookup_cached; plugin_trap = trap; plugin_svc = svc;
 }}
 """
 
 
 def cache_mod_plugins(tree, jobs, log=print, quiet=False):
     """Compile each turned-on mod's plugin into build/plugins/<name>.dll and list those files.
-    The standard plugins stay in the program. Returns the module names that translated.
-    On Linux they are linked into the program instead (build), so this makes none."""
-    if LINUX:
-        return []
+    The standard plugins stay in the program. Returns the module names that translated."""
+    if os.name != "nt":   # (macOS and Linux load no plugin DLLs: a mod's plugin is compiled into the program,
+        return []         # which game_link_reason links again for: unbuilt_mod_plugin)
     import cc
     import recomp
     p = Paths(tree)
@@ -746,9 +1018,28 @@ def unbuilt_standard(tree):
     return None
 
 
-def game_link_reason(tree):
-    """Why the program itself must be linked again, or None. A mod plugin's own file is not a reason:
-    the game loads that at start."""
+def unbuilt_mod_plugin(tree):
+    """macOS and Linux: a turned-on mod's plugin the program doesn't have compiled in, or None (on
+    Windows each is its own DLL, which the game loads at start: cache_mod_plugins)."""
+    record = load_record(Paths(tree))
+    for mod, source in turned_on(tree):
+        if mod.startswith("(standard) "):
+            continue
+        try:
+            entry = record.get(nro_build_id(source))
+        except ValueError:
+            continue
+        name = entry["module"] if entry else None
+        if not name or not built_in(tree, name):
+            return f"{mod}'s plugin isn't in the game"
+    return None
+
+
+def game_link_reason(tree, mods=True):
+    """Why the program itself must be linked again, or None. On Windows a mod plugin's own file is not
+    a reason: the game loads that at start. On macOS and Linux it is compiled into the program.
+    mods=False (Play without mods): only what the game and the community plugins need, not the mods'
+    plugins or the hook points and code patches the plugins asked for (the lists don't say whose)."""
     exe = program(tree)
     if not exe:
         return "the game isn't built"
@@ -764,13 +1055,13 @@ def game_link_reason(tree):
                     return f"{rel} is newer than the game"
     p = Paths(tree)
     patches = os.path.join(p.skyline, "patches.txt")
-    if os.path.exists(patches) and os.path.getmtime(patches) > built:
+    if mods and os.path.exists(patches) and os.path.getmtime(patches) > built:
         return "dump/skyline/patches.txt is newer than the game"
     import std_plugins
     for name, plugin in std_plugins.PLUGINS.items():
         if plugin[5] == "runs" and not os.path.exists(os.path.join(std_plugins.folder(tree), name)):
             return f"{name} isn't fetched"
-    missing = unbuilt_standard(tree)
+    missing = unbuilt_standard(tree) or (unbuilt_mod_plugin(tree) if mods and os.name != "nt" else None)
     if missing:
         return missing
     listed = os.path.join(p.skyline, "plugins.txt")
@@ -778,38 +1069,41 @@ def game_link_reason(tree):
     for name in names:
         if name and not built_in(tree, name):
             return f"the standard plugin {name} isn't in the game"
-    if stale_hooks(tree):
+    if mods and stale_hooks(tree):
+        if set(stale_hooks(tree)) <= set(copied_hooks(tree)):
+            return "a plugin hooks a function the game copied into its callers"
         return "a plugin hooks a function the game has no slot for"
     return None
 
 
 def build(tree, jobs, log=print, again=True):
-    """Translate each turned-on mod plugin into its own file. Link the game only when a standard
-    plugin is missing, the runtime changed, or a plugin's inline hook or code patch is not in it.
+    """Translate each turned-on mod plugin into its own file (Windows; on macOS and Linux it is linked
+    into the program). Link the game only when a plugin it should have is missing, the runtime
+    changed, or a plugin's inline hook or code patch is not in it.
     A function hook is patched into that one function when the game starts."""
+    global _CHAIN
+    if again:   # (a bar of its own: the Mods app runs every build in one process, and would start at the last one's end)
+        _CHAIN = progress.Chain()
+    chain().later = (RELINK if game_link_reason(tree) else 0.0) + PROBE   # (the bar: a relink, then a test boot)
     sync(tree, log, jobs)
     cache_mod_plugins(tree, jobs, log)
     reason = game_link_reason(tree)
     if reason:
         exefs = os.path.join(tree, "dump", "exefs")
-        for mod in stale_hooks(tree):
-            log(f"writing {mod}'s C again — 0%, estimating the time left")
+        # (recomp.py all writes again the C of a module whose hooks or code patches changed - its fingerprint
+        # has them - so writing it here first was done twice: main's, the biggest. macOS's link, build_mac.py,
+        # writes no C: there it is written here.)
+        for mod in stale_hooks(tree) if sys.platform == "darwin" else ():
+            log(f"writing {mod}'s C again")
             src = os.path.join(exefs, mod) if mod in ("main", "subsdk0", "sdk") else os.path.join(tree, "dump", "nro", mod + ".nro")
             out = os.path.join(tree, "build", mod) if mod in ("main", "subsdk0", "sdk") else os.path.join(tree, "build", "nro", mod)
             recomp_stream(Paths(tree), log, "build", src, "--out", out, "--jobs", str(jobs))
         log(f"linking the game once ({reason})")
-        if sys.platform == "darwin":
-            cmd = [sys.executable, os.path.join(HERE, "mac", "build_mac.py"), "--port", tree, "--jobs", str(jobs)]
-        elif LINUX:
-            cmd = [sys.executable, os.path.join(HERE, "linux", "build_linux.py"), "--port", tree,
-                   "--out", os.path.join(tree, "build-linux"), "--jobs", str(jobs)]
-        else:
-            cmd = [sys.executable, os.path.join(HERE, "recomp.py"), "all", exefs, "--out", os.path.join(tree, "build"),
-                   "--jobs", str(jobs), "--tree", tree]
-        log(" ".join(cmd))
-        rc = run_logged(cmd, log)
-        if rc:
-            return rc
+        for cmd in link_commands(tree, jobs):
+            log(" ".join(cmd))
+            rc = run_logged(cmd, log, later=PROBE)
+            if rc:
+                return rc
     else:
         log("the mod plugins are translated; the game itself was left as it is")
     probe_and_apply(tree, log)
@@ -821,10 +1115,7 @@ def build(tree, jobs, log=print, again=True):
 
 # What isn't part of the game's program: an update that changes only these needs no build (the Mods
 # app's files are read as it runs; the tools here run as they are)
-NOT_BUILT = ("tools/modmanager/", "tools/dev/", "tools/mods.py", "tools/os_mods.py", "tools/progress.py", "tools/std_plugins.py", "tools/csk.py", "tools/miis.py",
-             "tools/unlock_all.py", "tools/install_windowsmash.ps1", "tools/update.py", "tools/arc.py", "tools/prc.py",
-             "tools/msbt.py", "tools/ssbu_online_lobby.py", "tools/ssbu_relay.py", "tools/skyline.py",
-             "tools/shader_aot.py")
+NOT_BUILT = ('tools/modmanager/', 'tools/weblauncher/', 'tools/app_window.py', 'tools/linux/askpass.sh', 'tools/dev/', 'tools/mods.py', 'tools/os_mods.py', 'tools/progress.py', 'tools/std_plugins.py', 'tools/csk.py', 'tools/miis.py', 'tools/unlock_all.py', 'tools/install_windowsmash.ps1', 'tools/update.py', 'tools/arc.py', 'tools/prc.py', 'tools/msbt.py', 'tools/ssbu_online_lobby.py', 'tools/ssbu_relay.py', 'tools/skyline.py', 'tools/shader_aot.py', 'tools/find_python.bat', 'tools/build_desktop_launcher.py', 'tools/build_launcher.py', 'tools/build_launcher.ps1', 'tools/prepare_desktop_source.py', 'tools/desktop_update.py', 'tools/linux/install.sh', 'tools/linux/play.sh', 'tools/mac/install.sh', 'tools/mac/play.sh', 'tools/mac/launch.sh', 'tools/linux/install_linux.py', 'tools/mac/install_mac.py', 'tools/linux/bundle/', 'tools/mac/ModsApp.swift', 'tools/mac/ModsShell.swift')
 
 
 def plugin_refresh_reason(tree):
@@ -848,7 +1139,9 @@ def needs_build(tree):
     """Why the game's program needs building again, or None: it's missing, a file that goes into it
     (the runtime, the recompiler, the build's tools, the plugins' hook lists) is newer than it, a
     standard plugin isn't fetched, or a plugin that runs isn't compiled in (current)."""
-    built = max((os.path.getmtime(x) for x in programs_of(tree) if os.path.exists(x)), default=0)
+    programs = [os.path.join(tree, "build-mac", "WindowSmash.app", "Contents", "MacOS", "ssbu"), os.path.join(tree, "build", "ssbu.exe"),
+                os.path.join(tree, "build-linux", "ssbu")]
+    built = max((os.path.getmtime(x) for x in programs if os.path.exists(x)), default=0)
     if not built:
         return "it isn't built"
     for top in ("runtime", "tools"):

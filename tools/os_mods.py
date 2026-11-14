@@ -244,6 +244,8 @@ def status(tree):
             m["group_title"] = g["title"]
             m["group_thumb"] = g["thumb"]
     data["needs_build"] = skyline.game_link_reason(tree.root) or ""
+    # (Play without mods asks only for this one: 30 mods turned on but not built don't hold up the plain game)
+    data["needs_build_vanilla"] = data["needs_build"] and (skyline.game_link_reason(tree.root, mods=False) or "")
     data["needs_refresh"] = skyline.plugin_refresh_reason(tree.root) or ""
     plugins = []
     folder = std_plugins.folder(tree.root)
@@ -275,15 +277,25 @@ def status(tree):
     return 0
 
 
-def recomp_busy():
+def recomp_busy(root=None):
+    """A game build of THIS install running now (recomp.py all on this folder's tree). Any python.exe with
+    "recomp.py" and " all " used to count, so another install's build, or a build left running by a launcher
+    that was closed, kept saying "already being built" for ever (a player's report, 2026-11-11)."""
+    root = os.path.normcase(os.path.abspath(root or ROOT))
     try:
         out = subprocess.check_output(
             ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Select-Object -ExpandProperty CommandLine"],
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | ForEach-Object { $_.CommandLine }"],
             text=True, timeout=20, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return False
-    return "recomp.py" in out and " all " in out
+    return any(recomp_line_busy(line, root) for line in out.splitlines())
+
+
+def recomp_line_busy(line, root):
+    """Whether one process's command line is a game build of the install at root."""
+    low = os.path.normcase(line.replace("/", os.sep))
+    return "recomp.py" in low and " all " in low and root in low
 
 
 def fetch_plugins(tree, every, log):
@@ -300,7 +312,8 @@ def main(argv):
     cmd = argv[1] if len(argv) > 1 else "status"
     try:
         if cmd == "status":
-            return status(tree)
+            with mods.walk_once():
+                return status(tree)
         if cmd in ("enable", "disable"):
             if len(argv) < 3:
                 raise mods.Error("name the mod's folder")

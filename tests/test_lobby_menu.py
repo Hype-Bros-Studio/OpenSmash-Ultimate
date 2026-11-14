@@ -1,4 +1,6 @@
-"""The settings menu's Lobby page (runtime/gpu_menu.c): the online lobby's room browser and
+"""The settings menu (runtime/gpu_menu.c): its pages as tabs switched with L / R, every row reachable with a
+pad (Restart game and Quit game under each page's rows), the text grid the game's software keyboard is
+typed on (the one the menu's own names use: pad and keyboard), and its Lobby page: the online lobby's room browser and
 matchmaking in netplay version 3, and Online > Netplay version (online_protocol.txt), through
 tools/dev/lobbymenutest.c (the menu and the game's netplay client with no game around them, driven
 line by line), against fake lobbies that answer by hand and the real one (tools/ssbu_relay.py) on
@@ -36,8 +38,10 @@ LOBBY_PAGE = 4   # (the Lobby page's number in the menu, less one)
 NO_ANSWER = 'no answer from the lobby (A: ask again)'
 
 
-def build(folder):
+def build(folder, yuzu=False):
     src = ['tools/dev/lobbymenutest.c', 'runtime/net_relay.c', 'runtime/hle_settings.c']
+    if yuzu:
+        src += ['runtime/net_yuzu.c', 'runtime/net_yuzu_wire.c']
     if os.name == 'nt':   # (as tests/test_net_client_v3.py builds netv3test.c)
         exe = os.path.join(folder, 'lobbymenutest.exe')
         cmd = [cc.CLANG, '/nologo', '/O1', *cc.LINK_FLAGS, *cc.CFLAGS, *src, '/Fe' + exe, '/Fo' + folder + os.sep, '/link', *cc.LINK_OPTIONS]
@@ -45,7 +49,7 @@ def build(folder):
         exe = os.path.join(folder, 'lobbymenutest')
         Path(folder, 'd3d11.h').write_text(D3D11_STAND_IN)
         layer = ['runtime/linux/win32.c']
-        layer += ['runtime/macos/memory.c', 'runtime/macos/platform.c'] if sys.platform == 'darwin' else ['-lpthread']
+        layer += ['runtime/macos/memory.c', 'runtime/macos/platform.c'] if sys.platform == 'darwin' else ['-lpthread', '-lm']
         cmd = ['clang', '-O1', '-w', '-I', folder, '-I', 'runtime/macos/include', '-I', 'runtime/linux/include', '-I', 'runtime', *src, *layer,
                '-o', exe]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
@@ -95,13 +99,39 @@ class Menu:
     def type(self, text):
         self.ok(f'type {text}')
 
+    def pad(self, buttons, n=1):
+        """Pad 1's buttons (A B X Y L R PLUS UP DOWN LEFT RIGHT, joined by +) pressed and let go, n times."""
+        self.ok(f'pad {buttons} {n}')
+
+    def cursor(self):
+        """(page, the cursor's row, on Restart game (1) / Quit game (2) or 0)."""
+        _, page, sel, _ = self.page()
+        return page, sel, self.foot
+
+    def osk(self, initial='', title='', guide='', least=0, most=20):
+        """The game asks for text (its software keyboard, as hle_applet.c asks), on a thread of its own."""
+        self.ok(f'osk {least} {most} {initial}|{title}|{guide}')
+
+    def osk_state(self):
+        """(open, the grid's row, its column, the text)."""
+        head, text = self.ask('oskstate').split('|', 1)
+        return (*map(int, head.split()[1:]), text)
+
+    def osk_result(self, wait=3.0):
+        """(1 typed / 0 cancelled, the text), or None while the game still waits."""
+        got = self.ask(f'oskresult {wait}', wait + 10)
+        if got == 'oskresult pending':
+            return None
+        ok, text = got[len('oskresult '):].split('|', 1)
+        return int(ok), text
+
     def frames(self, secs):
         self.ok(f'frame {secs}')
 
     def page(self):
         """(open, page, the cursor's row, [rows]): each row a dict of id, kind, label, value, note, help."""
         head = self.ask('rows').split()
-        is_open, page, sel, n = map(int, head[1:])
+        is_open, page, sel, n, self.foot = map(int, head[1:6])
         out = []
         for _ in range(n):
             ids, label, value, note, helptext = self.answer().split('|')
@@ -327,14 +357,25 @@ class Pages(MenuTest):
         drawn = m.draw()
         for i, name in enumerate(('Display', 'Controllers', 'Online', 'Game', 'Lobby', 'Mods')):
             self.assertIn(f'{i + 1} {name}', drawn)
-        self.assertIn('Up/Down: choose   Left/Right: change   A/Enter: select   L/R or Tab, 1-6: page   B/Esc: close', drawn)
+        self.assertIn('Up/Down: choose   Left/Right: change   A/Enter: select   L/R, Q/E or Tab: page   B/Esc: close', drawn)
+        for icon in ('L', 'R', 'Restart game', 'Quit game'):   # (the tab bar's buttons, and under the rows)
+            self.assertIn(icon, drawn)
+        m.key('PGDN')
+        self.assertEqual(m.page()[1], LOBBY_PAGE + 1)
+        m.key('PGUP')
+        m.key('PGUP')
+        self.assertEqual(m.page()[1], 3)
+        m.type('e')
+        self.assertEqual(m.page()[1], LOBBY_PAGE)
+        m.type('Q')
+        self.assertEqual(m.page()[1], 3)
         m.key('ESC')
         self.assertEqual(m.page()[0], 0)
 
     def test_other_pages_as_before(self):
         m = self.menu()
         m.key('ESC')
-        display = ['Window', 'Frame pacing', 'Frames queued ahead'] + (['Run-ahead (experimental)'] if os.name == 'nt' else []) + ['Hide the mouse pointer', 'Frame rate in the corner', 'Window size',
+        display = ['Window', 'Frame pacing', 'Frames queued ahead'] + ['Hide the mouse pointer', 'Frame rate in the corner', 'Window size',
                    'Render scale'] + (['Graphics card'] if os.name == 'nt' else []) + (['Renderer'] if sys.platform != 'darwin' else [])
         self.assertEqual(m.labels(), display)
         m.type('2')
@@ -350,7 +391,7 @@ class Pages(MenuTest):
         m.key('BKSP')
         self.assertEqual(m.labels()[3], 'Keyboard keys...')
         m.type('3')
-        self.assertEqual(m.labels(), ['Now', 'Play online in', 'Your name', 'Direct connections'] + (['Rollback netcode'] if os.name == 'nt' else [])
+        self.assertEqual(m.labels(), ['Now', 'Play online in', 'Your name', 'Direct connections', 'Input delay'] + (['Rollback netcode'] if os.name == 'nt' else [])
                          + ['Netplay version', "Download host's mods"])   # (offline: no code)
         m.type('6')
         self.assertEqual(m.labels(), ['Mods', 'ARCropolis code patches', 'No mod installed'])   # (the harness has no mods)
@@ -361,23 +402,27 @@ class Pages(MenuTest):
 
     @unittest.skipIf(sys.platform == 'darwin', 'the Mac program has no Renderer row (Metal only)')
     def test_renderer_row(self):
-        """Display > Renderer: the system's own renderer, then Vulkan, saved in display.ini for the
-        next start (runtime/renderer.h's names)."""
-        own = 'd3d11' if os.name == 'nt' else 'dxvk'
+        """Display > Renderer: the system's own renderer (Windows: auto, then direct3d11), then Vulkan,
+        saved in display.ini for the next start (runtime/renderer.h's names)."""
+        own = 'auto (Direct3D 11)' if os.name == 'nt' else 'dxvk'   # (auto says which one this start drew with)
         m = self.menu()
         m.key('ESC')
         labels = m.labels()
         at = labels.index('Renderer')
         self.assertEqual(m.row('Renderer')['value'], own)
-        self.assertIn('Vulkan: in development', m.row('Renderer')['help'])
+        self.assertIn('Vulkan on an AMD, NVIDIA or Intel card' if os.name == 'nt' else 'Vulkan: in development', m.row('Renderer')['help'])
         m.key('DOWN', at)
         self.assertEqual(m.at()['label'], 'Renderer')
+        if os.name == 'nt':
+            m.key('RIGHT')
+            self.assertEqual(m.row('Renderer')['value'], 'direct3d11')
+            self.assertIn('renderer = direct3d11', (m.dir / 'display.ini').read_text())
         m.key('RIGHT')
         self.assertEqual(m.row('Renderer')['value'], 'vulkan')
         self.assertIn('renderer = vulkan', (m.dir / 'display.ini').read_text())
         m.key('RIGHT')
         self.assertEqual(m.row('Renderer')['value'], own)
-        self.assertIn(f'renderer = {own}', (m.dir / 'display.ini').read_text())
+        self.assertIn(f'renderer = {own.split()[0]}', (m.dir / 'display.ini').read_text())
         m.key('LEFT')
         self.assertEqual(m.row('Renderer')['value'], 'vulkan')
 
@@ -417,6 +462,8 @@ class HostModsDownload(MenuTest):
         m.key('ESC')
         m.type('3')
         self.assertEqual(m.row("Download host's mods")['note'], 'SSBU_HOST_MODS_DOWNLOAD set')
+
+
 
 
 class Version(MenuTest):
@@ -472,7 +519,7 @@ class Version(MenuTest):
         self.assertEqual(join[2], 3)
 
     def test_online_files(self):
-        """Started with --online (Play SSBU.bat): the lobby and code from online_server.txt, the version from online_protocol.txt."""
+        """Started with --online (OpenSmash.exe): the lobby and code from online_server.txt, the version from online_protocol.txt."""
         lobby = FakeLobby()
         self.fakes.append(lobby)
         m = self.menu(room=None, name=None, args=['--online'],

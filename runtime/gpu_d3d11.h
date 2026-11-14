@@ -6,6 +6,7 @@
 void d3d11_clear(const u32 *regs, u32 arg);
 void d3d11_draw(const u32 *regs, const CbBinding cb[STAGES][18], int indexed);
 void d3d11_present(u64 guest, u32 width, u32 height);
+int d3d11_present_again(void);   /* the last frame once more (gfx_present_again): 1, or 0 before any */
 void d3d11_blit2d(const u32 *regs);
 void d3d11_dispatch(const u32 *regs, const u32 *qmd);
 int d3d11_copy_resident(u64 dst_va, u64 src_va, u64 bytes);
@@ -23,3 +24,6 @@ DWORD d3d11_lock_owner(void);
 DWORD d3d11_last_enter_thread(void);
 void d3d11_report_compiles(void (*line)(const char *text));
 void *d3d11_display_output(void);
+/* (renderer = auto: gpu_backend.c) The PCI vendor of the card Direct3D 11 would draw with, its name in `name`; 0 for
+ * Windows' own renderer (gpu = warp) or none. */
+unsigned d3d11_card_vendor(char *name, size_t size);

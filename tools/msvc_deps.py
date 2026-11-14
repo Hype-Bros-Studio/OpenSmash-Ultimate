@@ -27,7 +27,7 @@ where from, download and unpacked sizes; it is written last, so a folder without
 and cc.py does not use it. Downloads go to deps\\downloads and are deleted afterwards: LLVM's
 archive and Microsoft's packages at the same time, those DOWNLOAD_JOBS files at a time.
 
-The setup is part of the build: Install WindowSmash.bat runs this (step 4) when no compiler works,
+The setup is part of the build: OpenSmash.exe runs this (step 4) when no compiler works,
 and tools/build_game.py (launchers\\Build WindowSmash.bat) asks agree() at its first step and runs
 install() in the background while it prepares the game files.
 
@@ -84,7 +84,8 @@ VC_TOOLS = "Microsoft.VisualCpp.Tools.HostX64.TargetX64"   # its dependency name
 VC_PACKAGES = ("Microsoft.VC.{v}.CRT.Headers.base", "Microsoft.VC.{v}.CRT.x64.Desktop.base",
                "Microsoft.VC.{v}.CRT.x64.Store.base")   # (the last only for lib\x64\oldnames.lib, which the others lack)
 VC_LIBS = ("libcmt.lib", "libvcruntime.lib", "oldnames.lib", "legacy_stdio_definitions.lib",
-           "legacy_stdio_wide_specifiers.lib")   # (of the CRT package's hundreds of MB: the static release C runtime)
+           "legacy_stdio_wide_specifiers.lib",   # (of the CRT package's hundreds of MB: the static release C runtime)
+           "msvcrt.lib", "msvcprt.lib", "vcruntime.lib")   # (and the DLL one's: ssbu_glslang.dll, tools/glslang_lib.py)
 SDK_WORKLOAD = "Microsoft.VisualStudio.Workload.VCTools"   # its recommended Windows SDK is the one the Build Tools install
 SDK_MSIS = (   # (what each holds: measured on SDK 10.0.26100's, each unpacked with msiexec /a)
     "Windows SDK Desktop Headers x86-x86_en-us.msi",                      # most of um\ (windows.h, d3d11.h, ...)

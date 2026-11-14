@@ -19,7 +19,9 @@ PS = S.Key('ps', 'fedcba9876543210', '00000007', 712)
 
 # A worker as shaderaot --serve answers: "done <key> <outcome> <ms>" per key read, with the
 # worker's number (FAKE_ID) as the ms, so that a test sees which worker took which key. A hash
-# starting with "s1" takes a second; "dead" ends the worker without an answer.
+# starting with "s1" takes a second, "s0" a twentieth of one (an instant answer lets the first
+# worker's thread drain the whole queue before a later worker's process is up); "dead" ends the
+# worker without an answer.
 FAKE_WORKER = r'''
 import os, sys, time
 me = os.environ.get("FAKE_ID", "0")
@@ -30,6 +32,9 @@ for line in sys.stdin:
         sys.exit(3)
     if p[1].startswith("s1"):
         time.sleep(1.0)
+    if p[1].startswith("s0"):
+        time.sleep(0.2)   # (long enough that the last worker is up before the first two finish: a busy
+                          # Windows runner took over 1.5 s to start it, and it got no key)
     outcome = "failed" if p[1].startswith("bad") else "compiled"
     sys.stderr.write("ps_x: shader compiler failed: no\n" if outcome == "failed" else "noise\n")
     sys.stdout.write("done " + " ".join(p) + " %s %s\n" % (outcome, me))
@@ -90,6 +95,60 @@ class CacheTests(unittest.TestCase):
                 open(os.path.join(d, name), 'w').close()
             self.assertEqual(S.cached_keys(d, 10), {VS.key, PS.key})
 
+    def test_spirv_file_names(self):
+        g = 'g1001.01100600'
+        self.assertEqual(S.spirv_file_name(VS, g), 'g1001.01100600_vs_0123456789abcdef_00000000_0000000000000000.spv')
+        self.assertEqual(S.spirv_file_name(PS, g), 'g1001.01100600_ps_fedcba9876543210_00000007_0000000000000000.spv')
+        self.assertEqual(S.parse_spirv_file_name(S.spirv_file_name(PS, g), g), PS.key)
+        self.assertEqual(S.parse_spirv_file_name(S.spirv_file_name(VS, g), g), VS.key)
+        self.assertIsNone(S.parse_spirv_file_name(S.spirv_file_name(PS, g), 'g1001.01100601'))   # another library
+        self.assertIsNone(S.parse_spirv_file_name(S.spirv_file_name(PS, g), 'g1002.01100600'))   # another version
+        self.assertIsNone(S.parse_spirv_file_name('g1001.01100600_ps_fedcba9876543210_00000007_00000000000000ab.spv', g))   # jump tables
+        self.assertIsNone(S.parse_spirv_file_name('g1001.01100600_cs_fedcba9876543210_00000000_0000000000000000.spv', g))   # compute
+        self.assertIsNone(S.parse_spirv_file_name(S.cache_file_name(PS, 10), g))
+
+    def test_with_spirv_a_key_is_cached_when_both_its_files_are_there(self):
+        g = 'g1001.01100600'
+        with tempfile.TemporaryDirectory() as d:
+            for name in (S.cache_file_name(VS, 10), S.cache_file_name(PS, 10), S.spirv_file_name(PS, g),
+                         S.spirv_file_name(VS, 'g1001.01100500'),                     # (an older library's)
+                         S.spirv_file_name(S.Key('ps', 'a' * 16, '00000001', 1), g)):  # (no DXBC beside it)
+                open(os.path.join(d, name), 'w').close()
+            self.assertEqual(S.cached_keys(d, 10, spirv=g), {PS.key})
+            self.assertEqual(S.cached_keys(d, 10), {VS.key, PS.key})
+
+    def test_an_alpha_tested_key_is_cached_under_its_salted_hash(self):
+        g = 'g1001.01100600'
+        pa = S.Key('pa', PS.hash, PS.mask, 1)
+        salted = S.Key('ps', S.alpha_file_hash(PS.hash), PS.mask, 1)
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, S.cache_file_name(salted, 10)), 'w').close()
+            self.assertTrue(S.cached(pa, S.cached_keys(d, 10)))
+            self.assertFalse(S.cached(pa, S.cached_keys(d, 10, spirv=g)))
+            open(os.path.join(d, S.spirv_file_name(salted, g)), 'w').close()
+            self.assertTrue(S.cached(pa, S.cached_keys(d, 10, spirv=g)))
+
+    def test_the_tool_is_asked_for_spirv_only_when_it_can_make_it(self):
+        was = S.SPIRV
+        try:
+            S.SPIRV = None
+            self.assertEqual(S.tool_command('t.exe', 'pack', 'cache', '--serve'), ['t.exe', 'pack', 'cache', '--serve'])
+            S.SPIRV = 'g1001.01100600'
+            self.assertEqual(S.tool_command('t.exe', 'pack', 'cache', '0', '4'), ['t.exe', 'pack', 'cache', '0', '4', '--spirv'])
+        finally:
+            S.SPIRV = was
+
+    def test_no_spirv_when_it_is_turned_off(self):
+        was = os.environ.get('SSBU_AOT_SPIRV')
+        os.environ['SSBU_AOT_SPIRV'] = '0'
+        try:
+            self.assertIsNone(S.spirv_names('no such tool.exe', log=lambda *_: None))
+        finally:
+            if was is None:
+                del os.environ['SSBU_AOT_SPIRV']
+            else:
+                os.environ['SSBU_AOT_SPIRV'] = was
+
 
 class TimesTests(unittest.TestCase):
     def test_missing_file_is_empty(self):
@@ -140,6 +199,10 @@ class WeightTests(unittest.TestCase):
         self.assertEqual(w[b.key], 101 * 10 + 1)
         self.assertEqual(w[c.key], 102 * 10 + 1)
 
+    def test_an_alpha_tested_key_weighs_as_a_pixel_program(self):
+        pa = S.Key('pa', 'c' * 16, '00000001', 100)   # (drawn_keys.txt's kind: it stopped the queue with a KeyError)
+        self.assertAlmostEqual(S.weights([pa], {})[pa.key], 100 * S.MS_PER_BYTE['ps'] + 1)
+
     def test_without_any_time_the_kinds_have_their_own_rate(self):
         v, = keys(1, 'vs', 'a')
         p, = keys(1, 'ps', 'b')
@@ -161,7 +224,7 @@ class ServeTests(unittest.TestCase):
         return totals, times, shown
 
     def test_every_key_once_and_the_totals_add_up(self):
-        todo = keys(30)
+        todo = keys(30, prefix='s0')   # (not instant answers: the last worker started must get keys too)
         totals, times, shown = self.serve(todo, 3)
         self.assertEqual(totals, {'compiled': 30})
         self.assertEqual(set(times), {k.key for k in todo})
@@ -186,6 +249,55 @@ class ServeTests(unittest.TestCase):
         works = [w for _s, _f, w in shown]
         self.assertTrue(all(w[1] == 21000.0 for w in works))
         self.assertEqual(works, sorted(works))                           # (only ever up)
+
+    def test_no_key_is_sent_while_the_game_runs(self):
+        # The game started while Prepare Shaders ran: its workers on every core left the game's
+        # start nothing (2026-11-11, a 4-core laptop's log stopped after "drawing with"). No new
+        # key goes out while the game runs; the compile goes on once it has closed.
+        running = [True]
+        S_poll = S.PAUSE_POLL
+        S.PAUSE_POLL = 0.02
+        try:
+            import threading as th
+            import time
+            th.Timer(0.6, lambda: running.__setitem__(0, False)).start()
+            t0 = time.monotonic()
+            shown = []
+            self.out = io.StringIO()
+            totals = S.serve('exe', 'pack', 'cache', keys(6), 2, {},
+                             lambda state, final=False, work=None: shown.append((time.monotonic() - t0, state[0][0])),
+                             every=0.01, popen=fake_popen_factory(), out=self.out, paused=lambda: running[0])
+        finally:
+            S.PAUSE_POLL = S_poll
+        self.assertEqual(totals, {'compiled': 6})
+        self.assertTrue(all(done == 0 for at, done in shown if at < 0.5), shown[:5])   # (nothing done while it ran)
+        said = self.out.getvalue().splitlines()
+        self.assertEqual(said[:2], ['paused: the game is running; the compile goes on when it closes',
+                                    'the game has closed: the compile goes on'])
+
+    def test_no_worker_is_above_normal_priority(self):
+        # "high" was Windows' high priority class on every core: the launcher's window (its bar
+        # stayed at 0) and a game started meanwhile got nothing. Never above normal now.
+        for name, (cls, nice) in S._PRIORITY.items():
+            self.assertIn(cls, (0x00004000, 0x00000020), name)   # (below normal, normal)
+            self.assertGreaterEqual(nice, 0, name)
+        self.assertGreaterEqual(S.jobs_for('high', 0), S.jobs_for('medium', 0))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'the game mutex is Windows')
+    def test_game_running_sees_the_games_mutex(self):
+        import ctypes
+        k = ctypes.WinDLL('kernel32')
+        k.CreateMutexW.restype = ctypes.c_void_p
+        k.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+        k.CloseHandle.argtypes = (ctypes.c_void_p,)
+        if S.game_running():
+            self.skipTest('the game is running on this PC')
+        h = k.CreateMutexW(None, 0, S.GAME_RUNNING)
+        try:
+            self.assertTrue(S.game_running())
+        finally:
+            k.CloseHandle(h)
+        self.assertFalse(S.game_running())
 
     def test_a_slow_worker_does_not_hold_the_others(self):
         todo = [S.Key('vs', 's1' + 'a' * 14, None, 100)] + keys(20)
@@ -230,3 +342,27 @@ class ServeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DrawnKeysTests(unittest.TestCase):
+    """drawn_keys.txt: programs the game compiled at a first draw, with their variant (2026-11-09)."""
+
+    def test_parse_and_cache_names(self):
+        k = S.parse_key_line('pa 0123456789abcdef 0000000f')
+        self.assertEqual((k.kind, k.hash, k.mask), ('pa', '0123456789abcdef', '0000000f'))
+        self.assertEqual(k.line, 'pa 0123456789abcdef 0000000f')
+        salted = S.alpha_file_hash('0123456789abcdef')   # (gpu_d3d11.c: (h ^ salt) * FNV prime, 64 bits)
+        self.assertEqual(salted, f"{((0x0123456789abcdef ^ 0x616C706861743032) * 1099511628211) & (2**64 - 1):016x}")
+        have = {S.key_of('ps', salted, '0000000f')}
+        self.assertTrue(S.cached(k, have))
+        self.assertFalse(S.cached(S.parse_key_line('ps 0123456789abcdef 0000000f'), have))
+        self.assertEqual(S.parse_done_line('done pa 0123456789abcdef 0000000f compiled 12'), (('pa', '0123456789abcdef', '0000000f'), 'compiled', 12))
+
+    def test_drawn_keys_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, S.DRAWN_KEYS), 'w') as f:
+                f.write('vs 00000000000000aa\nps 00000000000000bb 00000003\nps 00000000000000bb 00000003\npa 00000000000000bb 00000003\njunk\n')
+            keys = S.drawn_keys(d)
+            self.assertEqual(sorted(k.line for k in keys), ['pa 00000000000000bb 00000003', 'ps 00000000000000bb 00000003', 'vs 00000000000000aa'])
+        self.assertEqual(S.drawn_keys(os.path.join(d, 'gone')), [])

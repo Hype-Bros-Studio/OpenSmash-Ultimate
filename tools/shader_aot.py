@@ -2,7 +2,15 @@
 """Compile the game's shaders ahead of time, into the renderer's disk cache.
 
 Usage:
-  shader_aot.py [--jobs N] [--dry] [--parts]
+  shader_aot.py [--jobs N] [--dry] [--parts] [--no-warm] [--rewarm]
+  shader_aot.py --files <file or folder>... [--tree <dir>] [--warm] [--jobs N]
+
+--files takes the programs of loose files instead of data.arc's: .eff, .nushdb and .arc files, or
+folders searched for them (a new fighter's folder, a mod's). Their keys not in the cache yet are
+compiled, and with --warm every one of their cache files is dated now, so the start's prewarm makes
+them: the fighter's effects are ready before its first match instead of compiling while the match
+loads (tools/fighter_mod.py --shaders runs this for a fighter folder). The cache is <tree>/dump/shadercache
+(default: this checkout's); the "every shader compiled" marker is left as it is.
 
 The game's GPU programs are stored in data.arc as they are uploaded: in the effect files
 (.eff), the shader databases (.nushdb) and nested archives (.arc); a few more are built into the
@@ -18,6 +26,15 @@ The files are dated 2001-01-01 until the game first uses them, so the start's pr
 makes the shaders the game has used. Programs with indirect branches are left out (their key
 depends on a draw's constant buffers), as are compute programs (on their launch's size).
 --dry translates without compiling and compares the keys with the cache that is there.
+
+On Linux, after a successful compile, the cache is drawn once by the game itself
+(build-linux/ssbu --warm-shaders dump/shadercache): DXVK then makes each Vulkan pipeline and the
+Vulkan driver compiles its GPU code, so the first use in a game does not have to (on Windows the
+game draws the cache for AMD's driver itself, when it closes: runtime/gpu_d3d11.c, "first draws").
+It is skipped with --no-warm. It draws what warm.done says an earlier run has not; warm.done is
+keyed by this game and the graphics driver, so a Mesa, RADV, DXVK or other driver update (which
+may empty those caches) draws everything again by itself. --rewarm forces that. A warm pass that fails (no GPU, say) is reported, but does not fail the
+compile: the game still works as without it.
 
 How the work is shared out: one discovery pass (shaderaot --dry) lists every key once; the
 keys not in the cache yet go into one queue, longest compile first (by the times recorded in
@@ -47,7 +64,11 @@ except ImportError:                                               # 3.10 to 3.13
     import zstandard
 
     def zstd_decompress(data):
-        return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+        decoder = zstandard.ZstdDecompressor().decompressobj()
+        result = decoder.decompress(data)
+        if not decoder.eof:
+            raise zstandard.ZstdError("incomplete zstd frame")
+        return result
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arc as A    # noqa: E402
@@ -210,6 +231,45 @@ def find_programs(arc, read_errors=None, pause=0.5, modules=(), progress=None):
     return programs, unread
 
 
+LOOSE_EXT = {".eff": (256, 0x30), ".arc": (256, 0x30), ".nushdb": (8, 0)}
+
+
+def loose_files(paths):
+    """The .eff / .arc / .nushdb files among paths (folders searched), sorted."""
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            for d, _dirs, names in os.walk(p):
+                out += [os.path.join(d, n) for n in names if os.path.splitext(n)[1].lower() in LOOSE_EXT]
+        elif os.path.splitext(p)[1].lower() in LOOSE_EXT:
+            out.append(p)
+    return sorted(set(out))
+
+
+def find_loose_programs(files):
+    """Distinct programs of loose files, as find_programs makes them from data.arc."""
+    programs, ids = [], {}
+    for path in files:
+        with open(path, "rb") as f:
+            data = f.read()
+        step, start = LOOSE_EXT[os.path.splitext(path)[1].lower()]
+        add_file(programs, ids, data, step, start)
+    return programs
+
+
+def warm(exe, pack, cache):
+    """Every key of the pack whose file is in the cache dated now (the runtime's prewarm makes the files
+    the game has used, newest first: gpu_d3d11.c prewarm_main). -> (dated, keys)."""
+    keys, _untranslated = discover(exe, pack, cache)
+    version, now, dated = cache_version(), time.time(), 0
+    for k in keys:
+        path = os.path.join(cache, cache_file_name(k, version))
+        if os.path.exists(path):
+            os.utime(path, (now, now))
+            dated += 1
+    return dated, len(keys)
+
+
 def read_error_text(errors, tree=None):
     """What to say about the files the disk could not read."""
     files = list(dict.fromkeys(e.filename for e in errors if getattr(e, "filename", None)))
@@ -241,6 +301,9 @@ def build_tool(exe):
     headers = [os.path.join(ROOT, "runtime", n) for n in ("host.h", "gpu_shader.h", "gpu_shader_cache.h")]
     if LINUX:
         sources.append(os.path.join(ROOT, "runtime", "linux", "d3dcompile_vkd3d.c"))
+    else:   # (--spirv: the Vulkan back end's translator, through ssbu_glslang.dll beside the tool)
+        sources.append(os.path.join(ROOT, "runtime", "gpu_spirv.c"))
+        headers.append(os.path.join(ROOT, "runtime", "gpu_spirv.h"))
     if os.path.exists(exe) and os.path.getmtime(exe) > max(os.path.getmtime(p) for p in sources + headers):
         return
     os.makedirs(os.path.dirname(exe), exist_ok=True)
@@ -248,10 +311,40 @@ def build_tool(exe):
         build_tool_linux(exe, sources)
         return
     import cc
-    r = subprocess.run([cc.CLANG, "/nologo", "/O2", *cc.LINK_FLAGS, *cc.CFLAGS, *sources, "/Fe" + exe, "/link", *cc.LINK_OPTIONS, "d3dcompiler.lib"],
+    # (/U: gpu_spirv.c without its vkd3d-shader half, whose library a build that has it would need linked here)
+    r = subprocess.run([cc.CLANG, "/nologo", "/O2", *cc.LINK_FLAGS, *cc.CFLAGS, "/USSBU_HAVE_VKD3D", *sources, "/Fe" + exe, "/link", *cc.LINK_OPTIONS,
+                        "d3dcompiler.lib"],
                        capture_output=True, text=True, cwd=os.path.dirname(exe))
     if r.returncode:
         raise SystemExit("cannot build shaderaot:\n" + (r.stdout + r.stderr)[-3000:])
+
+
+SPIRV = None   # (main: the start of the SPIR-V files' names, "g<version>.<library>", when they are made too)
+
+
+def spirv_names(exe, log=print):
+    """Whether the tool can make the Vulkan back end's SPIR-V too (Windows: ssbu_glslang.dll beside it, which
+    the game's build puts in build\\ and tools/glslang_lib.py makes when deps/glslang is there): the start of
+    its files' names (shaderaot --spirv-version, "g<version>.<library>"), else None."""
+    if LINUX or os.environ.get("SSBU_AOT_SPIRV") == "0":
+        return None
+    try:
+        import glslang_lib
+        if glslang_lib.have():
+            glslang_lib.build(os.path.join(os.path.dirname(exe), glslang_lib.DLL_NAME), log=lambda *_: None)
+        r = subprocess.run([exe, "--spirv-version"], capture_output=True, text=True, timeout=60)
+    except (OSError, SystemExit, subprocess.SubprocessError, ImportError):
+        return None
+    m = re.fullmatch(r"g\d+\.[0-9a-f]{8}", r.stdout.strip())
+    if r.returncode or not m:
+        return None
+    log("the Vulkan renderer's shaders (SPIR-V) are made too")
+    return m.group(0)
+
+
+def tool_command(exe, pack, cache, *more):
+    """shaderaot's command line, with --spirv when the SPIR-V is made too."""
+    return [exe, pack, cache, *more, *(["--spirv"] if SPIRV else [])]
 
 
 def build_tool_linux(exe, sources):
@@ -286,11 +379,13 @@ def default_jobs():
     return jobs
 
 
-# (Windows priority class, Linux nice). High is above normal, not real-time: the installer stays usable.
+# (Windows priority class, Linux nice). Never above normal: high was Windows' high class on every core, which left
+# nothing to the launcher's window (its bar stayed at 0 while the shaders compiled) or to a game started meanwhile
+# (it stopped as Direct3D started, on a 4-core laptop). High is every core at normal priority instead.
 _PRIORITY = {
     "low": (0x00004000, 10),
     "medium": (0x00000020, 0),
-    "high": (0x00008000, -5),
+    "high": (0x00000020, 0),
 }
 
 
@@ -333,13 +428,71 @@ def jobs_for(priority, jobs):
     return default_jobs()
 
 
+def warm_shaders(cache, rewarm):
+    """Linux: draw every shader of the cache once through DXVK (ssbu --warm-shaders). DXVK and the
+    Vulkan driver then have each program's pipeline and GPU code before the game first uses it.
+    Its lines ([warm] ...) go to this console as they come; True when it warmed."""
+    exe = os.path.join(ROOT, "build-linux", "ssbu")
+    what = "DXVK/Vulkan"
+    if not os.path.isfile(exe):
+        print(f"warm: skipped: {os.path.relpath(exe, ROOT)} is not there (build the game first); the cache is compiled, "
+              "and the game will make the driver's code as it first uses each shader", flush=True)
+        return False
+    cmd = [exe, "--warm-shaders", cache] + (["rewarm"] if rewarm else [])
+    print(f"warm: drawing the cache once through {what} so the first use does not compile it"
+          + (" (rewarm: every shader again)" if rewarm else ""), flush=True)
+    try:
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1, **low_priority())
+    except OSError as e:
+        print(f"warm: not warmed: cannot start {os.path.relpath(exe, ROOT)}: {e}", flush=True)
+        return False
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            # (DXVK's device setup logs at info level: keep the console to the warm progress,
+            # its warnings and errors, not a page for each of its threads' devices)
+            if line.startswith(("[warm]", "warm:", "[gfx]", "warn:", "err:")):
+                print(line, flush=True)
+        code = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print("warm: stopped; the compiled shaders are kept", flush=True)
+        return False
+    if code:
+        print(f"warm: not warmed (the warm pass stopped with code {code}); the compiled shaders are kept, "
+              "and the game will make the driver's code as it first uses each shader", flush=True)
+        return False
+    print(f"warm: warmed: {what}'s pipelines and the driver's GPU code are in their caches", flush=True)
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--jobs", type=int, default=0)
     ap.add_argument("--priority", choices=("low", "medium", "high"), default="low")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--parts", action="store_true", help="split the keys between the processes by hash (the older way)")
+    warm_args = ap.add_mutually_exclusive_group()
+    warm_args.add_argument("--no-warm", action="store_true",
+                           help="do not draw the cache through the graphics driver after compiling")
+    warm_args.add_argument("--rewarm", action="store_true",
+                           help="draw every shader through the driver again, even ones warm.done has "
+                                "(a driver update does this by itself)")
+    ap.add_argument("--files", nargs="+", help="loose .eff/.nushdb/.arc files or folders instead of data.arc")
+    ap.add_argument("--tree", default=ROOT, help="with --files: the tree whose dump/shadercache gets the files")
+    ap.add_argument("--warm", action="store_true", help="with --files: date their cache files now (the start's prewarm makes them)")
+    ap.add_argument("--no-spirv", action="store_true", help="leave out the Vulkan renderer's SPIR-V files (Windows makes them "
+                    "when ssbu_glslang.dll is there; SSBU_AOT_SPIRV=0 does the same)")
     a = ap.parse_args()
+    if a.no_spirv:
+        os.environ["SSBU_AOT_SPIRV"] = "0"
+    if a.files:
+        return main_files(a)
     tree = ROOT
     global _POPEN_PRIORITY, PRIORITY_SAID
     _POPEN_PRIORITY, PRIORITY_SAID = apply_priority(a.priority), a.priority
@@ -368,6 +521,8 @@ def main():
     write_pack(programs, pack)
     exe = os.path.join(ROOT, "build-linux", "shaderaot") if LINUX else os.path.join(ROOT, "build", "shaderaot.exe")
     build_tool(exe)
+    global SPIRV
+    SPIRV = spirv_names(exe)
     cache = os.path.join(tree, "dump", "shadercache")
     os.makedirs(cache, exist_ok=True)
     marker = os.path.join(cache, "complete.txt")   # (the launcher: every shader compiled once)
@@ -383,9 +538,79 @@ def main():
         return 1
     if not a.dry and ok:
         with open(marker, "w", encoding="utf-8", newline="\n") as f:
-            f.write(f"version {cache_version()}\n")
+            f.write(marker_text(cache_version(), SPIRV))
+    state = "skipped"
+    if a.dry:
+        print("warm: skipped (--dry)", flush=True)
+    elif not ok:
+        print("warm: skipped: the compile did not finish", flush=True)
+    elif not LINUX:
+        print("warm: on Windows the game draws the cache for AMD's driver when it closes", flush=True)
+    elif a.no_warm:
+        print("warm: skipped (--no-warm): the game makes the driver's pipeline and GPU code at first use", flush=True)
+    else:
+        state = "warmed" if warm_shaders(cache, a.rewarm) else "not warmed"
+    print(f"done in {time.time() - t0:.0f} s; driver cache {state}")
+    return 0
+
+
+def main_files(a):
+    global _POPEN_PRIORITY, PRIORITY_SAID
+    _POPEN_PRIORITY, PRIORITY_SAID = apply_priority(a.priority), a.priority
+    t0 = time.time()
+    files = loose_files(a.files)
+    if not files:
+        print("no .eff / .nushdb / .arc file in " + ", ".join(a.files))
+        return 0
+    programs = find_loose_programs(files)
+    nvs = sum(1 for p in programs if p[0] == 0)
+    print(f"{len(programs)} distinct programs ({nvs} vertex, {len(programs) - nvs} pixel) in {len(files)} files", flush=True)
+    if not programs:
+        return 0
+    work = os.path.join(a.tree, "dump", "aot")
+    os.makedirs(work, exist_ok=True)
+    pack = os.path.join(work, "programs_files.pack")
+    write_pack(programs, pack)
+    exe = os.path.join(ROOT, "build-linux", "shaderaot") if LINUX else os.path.join(ROOT, "build", "shaderaot.exe")
+    build_tool(exe)
+    global SPIRV
+    SPIRV = spirv_names(exe)
+    cache = os.path.join(a.tree, "dump", "shadercache")
+    os.makedirs(cache, exist_ok=True)
+    try:
+        run_queue(exe, pack, cache, jobs_for(a.priority, a.jobs), a.dry)
+    except KeyboardInterrupt:
+        return 1
+    if a.warm and not a.dry:
+        dated, total = warm(exe, pack, cache)
+        print(f"{dated} of {total} keys dated now: the next start's prewarm makes them")
+    if not a.dry:
+        start_driver_warm(cache)
     print(f"done in {time.time() - t0:.0f} s")
     return 0
+
+
+def start_driver_warm(cache, game=None):
+    """AMD's Direct3D 11 driver makes a shader's GPU code at its first draw, not when it is created (runtime/gpu_d3d11.c,
+    "first draws"), so a fresh cache still stutters in the first matches. The game draws the cache once for the driver's
+    own cache when it closes (ssbu --warm-shaders); this starts that pass now too, in the background at idle priority, so
+    the first match already finds the shaders it needs (the game's own list first). The exe decides: with no AMD card it
+    exits at once. It must be the exe the game runs as (the driver's cache goes by the exe), so build\\ssbu.exe. Returns
+    the process, or None."""
+    if LINUX or os.environ.get("SSBU_SHADER_WARM") == "0":
+        return None
+    game = game or os.path.join(ROOT, "build", "ssbu.exe")
+    if not os.path.exists(game):
+        return None
+    # (CREATE_NO_WINDOW alone: Windows ignores it next to DETACHED_PROCESS)
+    flags = getattr(subprocess, "IDLE_PRIORITY_CLASS", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        p = subprocess.Popen([game, "--warm-shaders", cache, "auto"], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, creationflags=flags)
+    except OSError:
+        return None
+    print("the graphics driver's own shader cache is being filled in the background (AMD cards only; it stops while the game runs)")
+    return p
 
 
 STOPPED = "stopped: what is done stays done; run this again to carry on"
@@ -394,7 +619,7 @@ STOPPED = "stopped: what is done stays done; run this again to carry on"
 def run_parts(exe, pack, cache, jobs):
     """The older way: N processes, each translating every vertex program and compiling the keys
     that are its by hash (shaderaot <part> <parts>)."""
-    procs = [subprocess.Popen([exe, pack, cache, str(i), str(jobs)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    procs = [subprocess.Popen(tool_command(exe, pack, cache, str(i), str(jobs)), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                               text=True, **low_priority()) for i in range(jobs)]
     print(f"compiling with {jobs} processes at {PRIORITY_SAID} priority (stop it with " + ("Ctrl+C" if LINUX else "closing this window") + ": "
           "what is done stays done)", flush=True)
@@ -412,8 +637,13 @@ def run_queue(exe, pack, cache, jobs, dry):
     """Discovery once, then the keys not cached yet through N workers pulling from one queue."""
     print("getting ready: listing the shaders (translating the vertex programs)...", flush=True)
     keys, untranslated = discover(exe, pack, cache)
-    have = cached_keys(cache)
-    todo = [k for k in keys if k.key not in have]
+    known = {k.key for k in keys}
+    drawn = [k for k in drawn_keys(cache) if k.key not in known]   # (the variants the game drew that the files don't say)
+    if drawn:
+        print(f"{len(drawn):,} more keys the game compiled at a first draw ({DRAWN_KEYS})", flush=True)
+    keys = keys + drawn
+    have = cached_keys(cache, spirv=SPIRV)
+    todo = [k for k in keys if not cached(k, have)]
     if dry:
         print(f"the cache has {len(have)} vertex/pixel keys; {len(have & {k.key for k in keys})} of them are among the {len(keys)} found here"
               + (f"; {untranslated} programs not translated (no key)" if untranslated else ""))
@@ -443,7 +673,7 @@ def run_queue(exe, pack, cache, jobs, dry):
             if kept:
                 print(f"compile times kept for {kept[-1]:,} shaders ({os.path.join(os.path.relpath(times_dir, ROOT), TIMES_FILE)})", flush=True)
         try:
-            totals.update(serve(exe, pack, cache, todo, jobs, times, Progress(sys.stdout, window=None), save=save))
+            totals.update(serve(exe, pack, cache, todo, jobs, times, Progress(sys.stdout, window=None), save=save, paused=game_running))
         except KeyboardInterrupt:
             print("\n" + STOPPED)
             kept_said()
@@ -454,7 +684,7 @@ def run_queue(exe, pack, cache, jobs, dry):
 
 
 # ---- the queue: discovery, ordering, the workers ---------------------------------------------------------
-Key = collections.namedtuple("Key", "kind hash mask size")   # kind "vs" or "ps"; mask None for a vertex program
+Key = collections.namedtuple("Key", "kind hash mask size")   # kind "vs", "ps" or "pa" (alpha-tested pixel); mask None for a vertex program
 TIMES_FILE = "compile_times.txt"   # (in dump/aot, with the pack: "<kind> <hash> [<mask>] <ms>" per key compiled)
 
 
@@ -473,9 +703,37 @@ def parse_key_line(line):
     p = line.split()
     if len(p) >= 2 and p[0] == "vs" and len(p[1]) == 16:
         return Key("vs", p[1].lower(), None, int(p[2]) if len(p) > 2 and p[2].isdigit() else 0)
-    if len(p) >= 3 and p[0] == "ps" and len(p[1]) == 16 and len(p[2]) == 8:
-        return Key("ps", p[1].lower(), p[2].lower(), int(p[3]) if len(p) > 3 and p[3].isdigit() else 0)
+    if len(p) >= 3 and p[0] in ("ps", "pa") and len(p[1]) == 16 and len(p[2]) == 8:
+        return Key(p[0], p[1].lower(), p[2].lower(), int(p[3]) if len(p) > 3 and p[3].isdigit() else 0)
     return None
+
+
+ALPHA_SALT = 0x616C706861743032   # (gpu_d3d11.c find_shader_ex: an alpha-tested variant's cache key)
+
+
+def alpha_file_hash(hash_):
+    """The cache file's hash of a program's alpha-tested variant."""
+    return f"{((int(hash_, 16) ^ ALPHA_SALT) * 1099511628211) & 0xFFFFFFFFFFFFFFFF:016x}"
+
+
+def cached(key, have):
+    """Whether a key's file is in the cache (an alpha-tested variant under its salted hash)."""
+    if key.kind == "pa":
+        return key_of("ps", alpha_file_hash(key.hash), key.mask) in have
+    return key.key in have
+
+
+DRAWN_KEYS = "drawn_keys.txt"   # (in the cache folder: the renderer's programs compiled at their first draw)
+
+
+def drawn_keys(cache):
+    """The keys the game compiled at a first draw (gpu_d3d11.c writes them), once each."""
+    try:
+        with open(os.path.join(cache, DRAWN_KEYS), encoding="ascii", errors="replace") as f:
+            keys = [k for k in (parse_key_line(line) for line in f) if k]
+    except OSError:
+        return []
+    return list({k.key: k for k in keys}.values())
 
 
 def parse_done_line(line):
@@ -484,8 +742,8 @@ def parse_done_line(line):
     p = line.split()
     if len(p) == 5 and p[0] == "done" and p[1] == "vs":
         return key_of("vs", p[2].lower(), None), p[3], int(p[4]) if p[4].isdigit() else 0
-    if len(p) == 6 and p[0] == "done" and p[1] == "ps":
-        return key_of("ps", p[2].lower(), p[3].lower()), p[4], int(p[5]) if p[5].isdigit() else 0
+    if len(p) == 6 and p[0] == "done" and p[1] in ("ps", "pa"):
+        return key_of(p[1], p[2].lower(), p[3].lower()), p[4], int(p[5]) if p[5].isdigit() else 0
     return None
 
 
@@ -507,15 +765,32 @@ def cache_file_name(key, version):
     return f"v{version}_{key.kind}_{key.hash}_{key.mask or '00000000'}_{'0' * 16}.dxbc"
 
 
-def cached_keys(cache, version=None):
-    """The keys of this version's files in the cache folder."""
+def cached_keys(cache, version=None, spirv=None):
+    """The keys of this version's files in the cache folder; with `spirv` (the start of the SPIR-V files'
+    names: spirv_names), the keys that have that file as well."""
     version = cache_version() if version is None else version
-    have = set()
+    have, have_spirv = set(), set()
     for name in os.listdir(cache):
         k = parse_cache_file_name(name, version)
         if k:
             have.add(k)
-    return have
+        elif spirv:
+            k = parse_spirv_file_name(name, spirv)
+            if k:
+                have_spirv.add(k)
+    return have & have_spirv if spirv else have
+
+
+def spirv_file_name(key, spirv):
+    """The SPIR-V file of a key (runtime/gpu_shader_cache.h's shader_cache_file_spv: jump-table hash 0)."""
+    return f"{spirv}_{key.kind}_{key.hash}_{key.mask or '00000000'}_{'0' * 16}.spv"
+
+
+def parse_spirv_file_name(name, spirv):
+    parts = name[:-4].split("_") if name.endswith(".spv") else []
+    if len(parts) == 5 and parts[0] == spirv and parts[1] in ("vs", "ps") and parts[4] == "0" * 16:
+        return key_of(parts[1], parts[2], parts[3])
+    return None
 
 
 def parse_cache_file_name(name, version):
@@ -568,7 +843,7 @@ def weights(keys, times):
         timed = [(times[k.key], k.size) for k in keys if k.kind == kind and k.key in times and k.size > 0]
         if timed:
             rate[kind] = sum(ms for ms, _size in timed) / sum(size for _ms, size in timed)
-    return {k.key: float(times[k.key]) if k.key in times else k.size * rate[k.kind] + 1.0 for k in keys}
+    return {k.key: float(times[k.key]) if k.key in times else k.size * rate.get(k.kind, rate["ps"]) + 1.0 for k in keys}   # ("pa": a pixel program)
 
 
 def order(keys, times):
@@ -598,7 +873,7 @@ class Worker:
 
     def _drain_stderr(self):   # (the compiler's own chatter would fill the pipe and stop the worker)
         for line in self.proc.stderr:
-            if ("shader compiler failed" in line or "could not be written" in line) and len(self.errors) < 50:
+            if ("shader compiler failed" in line or "glslang failed" in line or "could not be written" in line) and len(self.errors) < 50:
                 self.errors.append(line.rstrip())
 
     def send(self, key):
@@ -623,6 +898,26 @@ class Worker:
             pass
 
 
+GAME_RUNNING = "Local\\ssbu-game-running"   # (runtime/gpu_d3d11.c WARM_GAME: the game holds it while it runs)
+PAUSE_POLL = 1.0   # seconds between looks at whether the game still runs
+
+
+def game_running():
+    """Whether the game runs (Windows: its mutex is there). The compile pauses meanwhile: its workers on
+    every core left the game nothing as it started."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenMutexW.restype = ctypes.c_void_p
+    k.OpenMutexW.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p)
+    k.CloseHandle.argtypes = (ctypes.c_void_p,)
+    h = k.OpenMutexW(0x00100000, 0, GAME_RUNNING)   # (SYNCHRONIZE)
+    if h:
+        k.CloseHandle(h)
+    return bool(h)
+
+
 def offer(worker, todo):
     """The queue's next key to the worker; False when the queue is empty or the worker is gone."""
     try:
@@ -637,11 +932,13 @@ def offer(worker, todo):
     return True
 
 
-def feed(worker, todo, report):
+def feed(worker, todo, report, paused=None):
     """(a thread) The worker's share of the queue: whatever is next, once it has answered its last,
     until the queue is empty. report(key, outcome, ms) for each answer; a worker that stops with a
-    key pending reports it as "died"."""
+    key pending reports it as "died". While paused() (the game runs) it sends no new key."""
     while True:
+        while paused and not worker.pending and not todo.empty() and paused():
+            time.sleep(PAUSE_POLL)
         while len(worker.pending) < Worker.IN_FLIGHT and offer(worker, todo):
             pass
         if not worker.pending:
@@ -658,15 +955,17 @@ def feed(worker, todo, report):
     worker.close()
 
 
-def serve(exe, pack, cache, todo, jobs, times, show, every=1.0, popen=None, out=None, save=None, save_every=30.0):
+def serve(exe, pack, cache, todo, jobs, times, show, every=1.0, popen=None, out=None, save=None, save_every=30.0, paused=None):
     """The keys compiled by `jobs` workers pulling from one queue, the progress shown through
     `show` ([(done, of)], work=(done, of) in compile time, by weights()) and the compiler's
     failures printed to `out`; compile times recorded in `times`, and given to save(times, last)
     every save_every seconds and once at the end - from a thread of its own, which a Ctrl+C (a
     KeyboardInterrupt lands in the main thread alone, and twice when pressed twice) cannot cut
-    short: the last save is waited for before the interrupt goes on. Returns the outcomes counted."""
+    short: the last save is waited for before the interrupt goes on. While paused() (game_running)
+    no new key is sent, said once on `out` when it pauses and once when it goes on. Returns the
+    outcomes counted."""
     out = out or sys.stdout
-    popen = popen or (lambda: subprocess.Popen([exe, pack, cache, "--serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    popen = popen or (lambda: subprocess.Popen(tool_command(exe, pack, cache, "--serve"), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                                stderr=subprocess.PIPE, text=True, bufsize=1, **low_priority()))
     q = queue.Queue()
     for k in todo:
@@ -705,7 +1004,8 @@ def serve(exe, pack, cache, todo, jobs, times, show, every=1.0, popen=None, out=
     saver = threading.Thread(target=saving) if save else None
     workers = [Worker(p) for p in procs]   # (each is given one key, and its next once that is answered: longest
                                            # first, so the longest compiles go to as many workers as there are)
-    feeders = [threading.Thread(target=feed, args=(w, q, report), daemon=True) for w in workers]
+    feeders = [threading.Thread(target=feed, args=(w, q, report, paused), daemon=True) for w in workers]
+    was_paused = False
     try:
         if saver:
             saver.start()
@@ -713,7 +1013,14 @@ def serve(exe, pack, cache, todo, jobs, times, show, every=1.0, popen=None, out=
             t.start()
         while any(t.is_alive() for t in feeders):
             show([(done[0], len(todo))], work=(work[0], work_of))
+            now_paused = bool(paused and not q.empty() and paused())
+            if now_paused != was_paused:
+                print("paused: the game is running; the compile goes on when it closes" if now_paused
+                      else "the game has closed: the compile goes on", file=out, flush=True)
+                was_paused = now_paused
             time.sleep(every)
+        if was_paused:   # (the workers all finished between two looks: the game had closed)
+            print("the game has closed: the compile goes on", file=out, flush=True)
         for w in workers:
             w.proc.wait()
             w.drain.join()
@@ -764,9 +1071,12 @@ def share(done, of, work=None):
 
 class Progress:
     """Shows the progress (the parts' combined, or the queue's): one line drawn over itself in a
-    console, else a line every percent (for a log, and the launcher's bar)."""
+    console, else a line every percent (for a log, and the launcher's bar), and one at least every
+    LOG_EVERY seconds the count has moved: by work, the queue's first percent is its longest
+    compiles, which a 4-core PC takes many minutes over (the launcher said "0 of 65,189" meanwhile)."""
 
-    WINDOW = 120   # seconds of recent pace the time left goes by (the parts' pace picks up after the start);
+    LOG_EVERY = 5.0   # seconds: the longest a log goes without a line while shaders are being done
+    WINDOW = 120  # seconds of recent pace the time left goes by (the parts' pace picks up after the start);
                    # None for the pace since the start (the queue's, by work: steadier than a window a long compile lands in)
 
     def __init__(self, out, console=None, window=WINDOW):
@@ -777,6 +1087,8 @@ class Progress:
         self.ready_said = False
         self.shown = -1     # (the last percent a log line was written for)
         self.last = None
+        self.last_at = None   # (when the last log line was written, and its count)
+        self.last_done = None
         self.width = 0
 
     def rate(self, now, done):
@@ -804,10 +1116,12 @@ class Progress:
         else:
             wdone, wof = work if work and work[1] else (done, of)
             step = int(min(100, 100 * wdone // wof)) if wof else 100   # (100 * done // of: exact for counts)
-            if step > self.shown or (final and text != self.last):
+            moved = self.last_at is not None and done != self.last_done and now - self.last_at >= self.LOG_EVERY
+            if step > self.shown or (final and text != self.last) or moved:
                 self.out.write(text + "\n")
                 self.out.flush()
                 self.shown, self.last = step, text
+                self.last_at, self.last_done = now, done
 
 
 def follow(procs, show, every=1.0):
@@ -853,12 +1167,18 @@ def summary(totals):
     """One line of what was done, from the outcomes counted (serve(), totals_from_parts())."""
     t = collections.Counter(totals)
     text = (f"{t['keys']:,} shaders: {t['compiled']:,} compiled, {t['existing']:,} already there, "
-            f"{t['tables']:,} left out (jump tables), {t['failed']:,} that fxc could not compile, "
+            f"{t['tables']:,} left out (jump tables), {t['failed']:,} that {'fxc or glslang' if SPIRV else 'fxc'} could not compile, "
             f"{t['untranslated']:,} not translated")
     extra = {k: v for k, v in t.items() if v and k in ("missing", "died")}
     if extra:
         text += " (" + ", ".join(f"{v:,} {'not in the pack' if k == 'missing' else 'lost when a worker stopped'}" for k, v in extra.items()) + ")"
     return text
+
+
+def marker_text(version, spirv):
+    """complete.txt: the cache's version, and "spirv <names>" when the Vulkan renderer's SPIR-V was made too
+    (the launcher asks for Prepare Shaders again when Vulkan may draw and the marker lacks it)."""
+    return f"version {version}\n" + (f"spirv {spirv}\n" if spirv else "")
 
 
 def cache_version():

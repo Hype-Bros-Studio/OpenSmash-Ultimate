@@ -30,10 +30,18 @@ class OnlineMatch(unittest.TestCase):
         self.assertIn('ok = rbl_open_relay(RBL_ONLINE, net_n);', core, 'the link opens with no number')
         self.assertIn('if (net_online) net_armed = net_armed && online_setup(st);', core, 'only an agreed Online match is armed')
 
+    def test_no_controls_left_from_the_last_fight(self):
+        core = src('hle_rb_core.c')
+        start = core.index('rbn_reset(net_mode == 2 ? net_n : 2')
+        self.assertIn('net_live_pad = (RbnPad){0};', core[start:core.index('rbn_local(key, net_live == 1', start)],
+                      'a fight\'s first local pad starts empty, not as the last fight ended')
+
     def test_setup(self):
         core = src('hle_rb_core.c')
         self.assertIn('#define ONLINE_MELEE 14', core)
-        self.assertIn('if (mode != ONLINE_MELEE)', core, 'other matches are played alone')
+        self.assertIn('#define ARENA_MELEE 20', core)
+        self.assertIn('if (mode != ONLINE_MELEE && mode != ARENA_MELEE)', core,
+                      'other matches (not Quickplay or a Battle Arena) are played alone or as a room match')
         self.assertIn('peers = net_recent_peers(seen, 8, 30000);', core, 'the other game: the one Pia talks to')
         self.assertIn('if (peers != 1)', core, 'more than 2 players: the game\'s own netcode')
         self.assertIn('int own = ld32(st + 0x78) == 0 && !ld8(st + 0x451) ? 0 : 1;', core, 'player 1 is the network player or this game')
@@ -50,6 +58,11 @@ class OnlineMatch(unittest.TestCase):
         self.assertIn('memcpy(online_rec[idx], P(u8, rec), ONLINE_REC); online_rec_have[idx] = 1;', core)
         self.assertIn('online_restore();   /* (an Online match: the game\'s own set-up back for its results) */', core)
         self.assertIn('memcpy(P(u8, MELEE_INFO), online_hdr, ONLINE_HDR);', core)
+        # a Local Wireless room's match: its results on rollback's set-up, every player local (#180)
+        self.assertIn('online_match = 1; online_lw = mode != ONLINE_MELEE && mode != ARENA_MELEE;', core,
+                      'Quickplay and Battle Arena matches get the game set-up back; Local Wireless room matches do not')
+        self.assertIn('if (online_lw) {', core)
+        self.assertIn('getenv("SSBU_RB_LW_RESTORE")', core)
         self.assertIn('if (net_online) { online_forget("the results are over"); net_armed = 0; }', core,
                       'the next match may have other players')
 

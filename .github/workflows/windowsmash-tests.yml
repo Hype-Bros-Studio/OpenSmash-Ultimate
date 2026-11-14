@@ -29,6 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The launcher's process tests compile the production C# helper without opening a window.
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: '8.0.x'
+
       # 3.14: the Python the Windows installer puts in deps/python
       - uses: actions/setup-python@v5
         with:
@@ -45,13 +51,15 @@ jobs:
       - name: Linux packages
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld llvm
+          # (the runners' Azure apt mirror stopped resolving, 2026-11-11: fall back to archive.ubuntu.com and retry)
+          sudo sed -i 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          for i in 1 2 3; do sudo apt-get update -qq -o Acquire::Retries=3 && break; sleep 20; done
+          sudo apt-get install -y -qq -o Acquire::Retries=3 clang lld llvm
 
       # bash 5 for the Linux launchers' tests (macOS's own bash is 3.2); an LLVM for tools/linux/toolchain.py
       # (SSBU_LLVM_BIN: it searches for one only on Linux and Windows); 127.0.0.2 for test_ssbu_relay's second
       # address; SDL3 3.4.18's DMG (the SHA-256 tools/mac/install_mac.py pins) and the framework in it, as
-      # Install WindowSmash.command puts them, for test_mac_installer and test_mac_build
+      # tools/mac/install.sh puts them, for test_mac_installer and test_mac_build
       - name: macOS packages
         if: runner.os == 'macOS'
         run: |
@@ -64,6 +72,11 @@ jobs:
             https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.dmg
           echo "c1adf3da91108dbc3e4205da5dacebc203085d283fa89e86eb2c889abd03a853  deps/downloads/SDL3-3.4.18.dmg" | shasum -a 256 -c
           python -c "import sys; sys.path.insert(0, 'tools/mac'); import install_mac; install_mac.install_sdl3_framework('deps/downloads/SDL3-3.4.18.dmg', 'deps/SDL3')"
+
+      # Exercise the real ENet/Zstd client on Windows, with synthetic loopback data.
+      - name: yuzu client libraries
+        if: runner.os == 'Windows'
+        run: python tools/yuzu_client_deps.py
 
       # gfxtest (the Metal renderer) skips on the runner's paravirtual GPU, where it never finished; a manual run
       # (workflow_dispatch) runs it anyway and shows what it printed before its 300 s timeout

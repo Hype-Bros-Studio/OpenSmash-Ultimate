@@ -192,6 +192,54 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertIn('--game D:\\G --keys D:\\K --no-firmware', out)
         self.assertIn('--game D:\\G --keys D:\\K --firmware D:\\F', out)
 
+    def test_update_build_answers_use_saved_game_folders(self):
+        got = ps("$global:saved = @{ game = 'D:\\Game'; keys = 'D:\\Keys'; firmware = 'D:\\Firmware' }; "
+                 "function Get-SavedFolders { $global:saved }; "
+                 "function Get-FolderCandidates { @{ Game = @(); Keys = @(); Firmware = @() } }; "
+                 "$a = Get-UpdateBuildAnswers; "
+                 "@{ game = $a.Game; keys = $a.Keys; firmware = $a.Firmware }")
+        self.assertEqual(got, {'game': 'D:\\Game', 'keys': 'D:\\Keys', 'firmware': 'D:\\Firmware'})
+
+        out = ps_text("$global:saved = @{ game = 'D:\\Game' }; "
+                      "function Get-SavedFolders { $global:saved }; "
+                      "function Get-FolderCandidates { @{ Game = @(); Keys = @(); Firmware = @() } }; "
+                      "try { Get-UpdateBuildAnswers } catch { 'ERROR: ' + $_.Exception.Message }")
+        self.assertIn('ERROR: The saved keys folder could not be found.', out)
+
+    def test_update_game_build_checks_prerequisites_before_build(self):
+        out = ps_text("$global:steps = [Collections.Generic.List[string]]::new(); "
+                      "function Step-CheckPc { $global:steps.Add('pc') }; "
+                      "function Step-Python { $global:steps.Add('python') }; "
+                      "function Test-Compiler { $global:steps.Add('compiler'); @{ Ok = $true; Output = '' } }; "
+                      "function Step-Sdl3 { $global:steps.Add('sdl') }; "
+                      "function Step-Codecs { $global:steps.Add('codecs') }; "
+                      "function Get-UpdateBuildAnswers { $global:steps.Add('answers'); @{ Game = 'D:\\Game'; Keys = 'D:\\Keys' } }; "
+                      "function Step-Build { param($Answers) $global:steps.Add('build:' + $Answers.Game) }; "
+                      "Invoke-UpdateGameBuild; $global:steps -join ','")
+        self.assertIn('pc,python,compiler,sdl,codecs,answers,build:D:\\Game', out)
+
+        out = ps_text("$global:steps = [Collections.Generic.List[string]]::new(); "
+                      "function Step-CheckPc { $global:steps.Add('pc') }; "
+                      "function Step-Python { $global:steps.Add('python') }; "
+                      "function Test-Compiler { $global:steps.Add('compiler'); @{ Ok = $false; Output = 'missing clang' } }; "
+                      "function Step-Sdl3 { $global:steps.Add('sdl') }; "
+                      "function Step-Codecs { $global:steps.Add('codecs') }; "
+                      "function Get-UpdateBuildAnswers { @{ Game = 'D:\\Game'; Keys = 'D:\\Keys' } }; "
+                      "function Step-Build { $global:steps.Add('build') }; "
+                      "try { Invoke-UpdateGameBuild } catch { 'ERROR: ' + $_.Exception.Message }; "
+                      "'STEPS: ' + ($global:steps -join ',')")
+        self.assertIn('ERROR: The game compiler is not ready.', out)
+        self.assertIn('STEPS: pc,python,compiler', out)
+
+    def test_update_game_build_skips_current_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'build'))
+            Path(tmp, 'build', 'ssbu.exe').write_bytes(b'current game')
+            out = ps_text(f"$Root = '{tmp}'; $DryRun = $false; $Rebuild = $false; $SkipBuild = $false; "
+                          "function Invoke-Python { return 0 }; "
+                          "Step-Build @{ Game = 'D:\\Game'; Keys = 'D:\\Keys'; Firmware = '' } | Out-Null")
+        self.assertIn('nothing that goes into the game changed: no build', out)
+
     def test_firmware_question_optional(self):
         # -NoWizard: the question says it is optional and what for; Enter on nothing, or none over the one found, is none
         mocks = ("$global:prompts = @(); "
@@ -576,6 +624,26 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertEqual(got['d1'], 35)
         self.assertEqual(got['d2'], 0)
 
+    def test_venv_base(self):
+        # deps\venv is made from 3.10 up to $PythonMinor (the tested one), never the Microsoft Store's Python
+        store = 'C:\\Users\\a\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_q\\python.exe'
+        got = ps("@{ ok = (Test-VenvBase '3.13.3' 'C:\\Python313\\python.exe'); top = (Test-VenvBase '3.14.2' 'C:\\Python314\\python.exe'); "
+                 "new = (Test-VenvBase '3.15.0a1' 'C:\\Python315\\python.exe'); old = (Test-VenvBase '3.9.13' 'C:\\Python39\\python.exe'); "
+                 f"store = (Test-VenvBase '3.13.3' '{store}'); none = (Test-VenvBase '3.13.3' ''); minor = $PythonMinor }}")
+        self.assertEqual(got['minor'], '3.14')
+        self.assertEqual([got[k] for k in ('ok', 'top', 'new', 'old', 'store', 'none')], [True, True, False, False, False, False])
+
+    def test_toml_check_before_python_311(self):
+        check = re.search(r"^\$TomlCheck = '(.*)'\r?$", SCRIPT.read_text(encoding='utf-8'), re.M).group(1).replace("''", "'")
+        older = "import sys; sys.version_info = (3, 10, 12, 'final', 0); "
+        r = subprocess.run([sys.executable, '-c', older + "import importlib.util as u; "
+                            "u.find_spec = lambda n, _f=u.find_spec: None if n == 'tomli' else _f(n); " + f'exec({check!r})'],
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stderr), (1, ''))          # 3.10 without tomli: a plain no
+        if sys.version_info >= (3, 11):                              # (the tools still run on 3.10, maybe without tomli)
+            r = subprocess.run([sys.executable, '-c', check], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)              # this Python (3.11 or newer): tomllib
+
 
 class InstallerPatternTests(unittest.TestCase):
     """Test-Sse42ByName's patterns, read from the installer and tried with Python's re where PowerShell is not there to
@@ -593,14 +661,9 @@ class InstallerPatternTests(unittest.TestCase):
             self.assertEqual(got, want, name)
 
 
-    def test_config_path_as_the_launcher(self):
-        """The installer finds online_name.txt by the launcher's rule (tests/test_launcher_ini.py runs that one)."""
-        def rule(text):
-            body = text[text.index('function Get-ConfigPath'):]
-            body = body[body.index('$inFolder ='):]
-            return body[:body.index('\n}\n')].replace('\r', '')
+    def test_config_path_used_for_settings(self):
+        """Installer settings use the same migrated locations as the game and shared launcher."""
         text = SCRIPT.read_text(encoding='utf-8')
-        self.assertEqual(rule(text), rule((ROOT / 'tools/launcher.ps1').read_text(encoding='utf-8')))
         self.assertIn("$nameFile = Get-ConfigPath $Root 'online_name.txt'", text)
         self.assertNotRegex(text, r"Join-Path \$Root '(display\.ini|controllers\.ini|launcher\.ini|online_name\.txt|online_direct\.txt)'")
 

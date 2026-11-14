@@ -40,8 +40,12 @@
 #include "display.h"
 #include "host.h"
 #include "testrun.h"
+#include <wchar.h>
 #ifndef __APPLE__
 #include <dxgi.h>
+#endif
+#ifdef _WIN32
+#include "gpu_display_loading.inc"   /* (the loading animation until the game's first present, Windows) */
 #endif
 
 enum { MODE_WINDOWED = DISPLAY_WINDOWED, MODE_BORDERLESS = DISPLAY_BORDERLESS, MODE_FULLSCREEN = DISPLAY_FULLSCREEN };
@@ -54,7 +58,13 @@ static struct {
     float render_scale;   /* 0: auto */
     double speed;         /* SSBU_SPEED (test runs): 1 normal */
     int renderer;         /* RENDERER_* (renderer.h) */
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, 1, PACING_CLOCK, 0, "auto", 1.0f, 1.0, RENDERER_DEFAULT};
+} cfg = {MODE_BORDERLESS, 1920, 1080, 3, 1, 1, 1, PACING_DISPLAY, 0, "auto", 1.0f, 1.0,
+#ifdef _WIN32
+    RENDERER_VULKAN
+#else
+    RENDERER_DEFAULT
+#endif
+};
 
 static int cfg_runahead;   /* display.ini's runahead (display_runahead) */
 
@@ -81,7 +91,7 @@ static const char DEFAULT_INI[] =
 #ifndef __APPLE__
     "; F11 or Alt+Enter switches between the window and full screen while playing.\n"
 #endif
-    "window = windowed\n"
+    "window = borderless\n"
 #ifdef _WIN32
     "; width, height: the window's inside, at 100% display scaling (scaled with Windows' setting).\n"
 #elif defined __APPLE__
@@ -89,8 +99,8 @@ static const char DEFAULT_INI[] =
 #else
     "; width, height: the window's inside, in the desktop's units (scaled ones on a scaled Wayland desktop).\n"
 #endif
-    "width = 1280\n"
-    "height = 720\n"
+    "width = 1920\n"
+    "height = 1080\n"
     "\n"
     "; pacing = clock | vrr | display\n"
 #ifdef _WIN32
@@ -114,20 +124,15 @@ static const char DEFAULT_INI[] =
     ";            every frame stays on screen exactly 16.7 ms. Best with window = fullscreen.\n"
     ";   display: as clock (Linux has no wait for the monitor's refresh here).\n"
 #endif
-    "pacing = clock\n"
+    "pacing = display\n"
     "; latency = 1-3: how many frames the graphics card may work ahead. Lower is more responsive.\n"
+    ";   (the Vulkan renderer keeps 2 at least: with 1 the processor and the card wait for each other every frame)\n"
     "latency = 3\n"
     "; low_latency = 1: the game starts each frame later, as late as it can and still be ready for the next\n"
     ";   refresh, so it reads the controller later: up to most of a frame less input delay. 0: at the refresh.\n"
     "low_latency = 1\n"
     "; hide_cursor = 1: hide the mouse pointer over the game after 2 seconds without moving it.\n"
     "hide_cursor = 1\n"
-#ifdef _WIN32
-    "; runahead = 0-3: in fights, show each frame this many frames ahead (less input delay; the settings menu's\n"
-    ";   Display page: off, 1, 2). 1 shows the real frame one frame sooner, 2 also predicts one frame on the\n"
-    ";   controls held now. Each frame ahead costs a frame of the game's work more per frame shown, and a savestate.\n"
-    "runahead = 0\n"
-#endif
     "; overlay = 1: show the frame rate in the corner from the start (F1 shows or hides it while playing).\n"
     "overlay = 1\n"
     "; volume = 0-100: the game's whole sound, over its own sound settings (0 is silent). The settings menu changes it while playing.\n"
@@ -157,15 +162,22 @@ static const char DEFAULT_INI[] =
 #ifndef __APPLE__
     "\n"
 #ifdef _WIN32
-    "; renderer = d3d11 | vulkan\n"
-    ";   d3d11:  Direct3D 11, the renderer the game is played and tested with.\n"
+    "; renderer = auto | direct3d11 | vulkan\n"
+    ";   auto:       Vulkan on an AMD, NVIDIA or Intel graphics card, Direct3D 11 on any other (and whenever Vulkan cannot\n"
+    ";               start, or stopped the game in its first seconds twice in a row).\n"
+    ";   direct3d11: Direct3D 11 on any card.\n"
+    ";   vulkan:     Vulkan on any card (Direct3D 11 if it cannot start; the log says why).\n"
 #else
     "; renderer = dxvk | vulkan\n"
     ";   dxvk:   Direct3D 11 through DXVK, the renderer the game is played and tested with.\n"
-#endif
     ";   vulkan: the Vulkan renderer, in development. Until it can draw the game, the game checks Vulkan\n"
     ";           on this PC at its start, says what it found in its log, and draws as before.\n"
+#endif
+#ifdef _WIN32
+    "renderer = vulkan\n"
+#else
     "renderer = " RENDERER_DEFAULT_NAME "\n"
+#endif
 #endif
     ;
 
@@ -195,7 +207,11 @@ static void parse_render_scale(const char *v) {
 /* renderer = d3d11 | dxvk | metal (the system's own: renderer.h) | vulkan */
 static void parse_renderer(const char *v, const char *where) {
     int r = renderer_parse(v);
+#ifdef _WIN32
+    if (r < 0) fprintf(stderr, "[display] %s: renderer is auto, direct3d11 or vulkan, not '%s': auto it is\n", where, v);
+#else
     if (r < 0) fprintf(stderr, "[display] %s: renderer is %s or vulkan, not '%s': %s it is\n", where, RENDERER_DEFAULT_NAME, v, RENDERER_DEFAULT_NAME);
+#endif
     cfg.renderer = r < 0 ? RENDERER_DEFAULT : r;
 }
 
@@ -243,7 +259,7 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "pacing")) parse_pacing(value);
         else if (!_stricmp(key, "latency")) cfg.latency = atoi(value);
         else if (!_stricmp(key, "low_latency")) cfg.low_latency = atoi(value) != 0;
-        else if (!_stricmp(key, "runahead")) cfg_runahead = atoi(value);
+        else if (!_stricmp(key, "runahead")) (void)value;   /* (ignored: run-ahead is off for everyone, issue #250; SSBU_RUNAHEAD only) */
         else if (!_stricmp(key, "hide_cursor")) cfg.hide_cursor = atoi(value) != 0;
         else if (!_stricmp(key, "overlay")) cfg.overlay = atoi(value) != 0;
         else if (!_stricmp(key, "overlay_scale")) parse_overlay_scale(value);
@@ -297,16 +313,20 @@ static float saved_render_scale;
 static int render_scale_saved;
 void display_set_render_scale(float scale) { saved_render_scale = scale; render_scale_saved = 1; }
 static int saved_renderer = -1;   /* (the same for the renderer: -1 none saved) */
-void display_set_renderer(int renderer) { saved_renderer = renderer == RENDERER_VULKAN ? RENDERER_VULKAN : RENDERER_DEFAULT; }
+void display_set_renderer(int renderer) { saved_renderer = renderer == RENDERER_VULKAN || renderer == RENDERER_D3D11 ? renderer : RENDERER_DEFAULT; }
 int display_overlay(void) { load(); return cfg.overlay; }
 float display_overlay_scale(void) { load(); return overlay_scale; }
 
 /* ---- the settings menu's changes ------------------------------------------------------- */
 static volatile LONG asked_mode = -1, asked_latency;
+/* The mode the window is in or was last asked for, for the menu. cfg.mode can't say: it keeps the
+ * full-screen mode F11 goes back to, so it stays there while the window is windowed. */
+static volatile int shown_mode = -1;
+void display_note_mode(int mode) { shown_mode = mode; }
 
 void display_settings(DisplaySettings *out) {
     load();
-    *out = (DisplaySettings){cfg.mode, cfg.width, cfg.height, cfg.latency, cfg.hide_cursor, cfg.overlay, cfg.pacing, "", render_scale_saved ? saved_render_scale : cfg.render_scale};
+    *out = (DisplaySettings){shown_mode >= 0 ? shown_mode : cfg.mode, cfg.width, cfg.height, cfg.latency, cfg.hide_cursor, cfg.overlay, cfg.pacing, "", render_scale_saved ? saved_render_scale : cfg.render_scale};
     snprintf(out->gpu, sizeof out->gpu, "%s", cfg.gpu);
     out->renderer = saved_renderer >= 0 ? saved_renderer : cfg.renderer;
 }
@@ -385,6 +405,7 @@ static void set_mode(HWND h, int mode) {
     if (mode == current_mode || win_headless()) return;
     if (current_mode == MODE_WINDOWED) have_place = GetWindowPlacement(h, &windowed_place);
     current_mode = mode;
+    display_note_mode(mode);
     if (mode == MODE_WINDOWED) {
         SetWindowLongPtrW(h, GWL_STYLE, WINDOWED_STYLE);
         if (have_place) {
@@ -410,6 +431,7 @@ static void set_mode(HWND h, int mode) {
 void display_set_mode(int mode) {
     load();
     if (mode != MODE_WINDOWED) cfg.mode = mode;
+    display_note_mode(mode);
     HWND h = (HWND)gfx_window_handle();
     if (h) PostMessageW(h, WM_DISPLAY_MODE, (WPARAM)mode, 0);
 }
@@ -435,6 +457,7 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
         SetWindowPos(h, NULL, -32000, -32000, 640, 360, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         /* (not shown: a test watchdog takes any visible window for one on screen; Direct3D draws and presents a hidden one alike) */
         SetTimer(h, 1, 500, NULL);
+        InterlockedExchange(&g_la_off, 1);   /* (no loading animation off screen) */
         return h;
     }
     RECT r = windowed_rect(h);
@@ -443,6 +466,7 @@ HWND display_create_window(HINSTANCE inst, const wchar_t *cls, const wchar_t *ti
     if (!probe && cfg.mode != MODE_WINDOWED) set_mode(h, cfg.mode);
     if (!probe) ShowWindow(h, SW_SHOW);
     SetTimer(h, 1, 500, NULL);   /* the idle pointer */
+    la_start(h, !probe);         /* the loading animation (gpu_display_loading.inc) */
     return h;
 }
 
@@ -475,6 +499,7 @@ void display_fit(unsigned w, unsigned h, unsigned *x, unsigned *y, unsigned *fw,
 
 #ifdef _WIN32
 int display_message(HWND h, UINT msg, WPARAM w, LPARAM l, LRESULT *result) {
+    if (la_wndproc(h, msg, w)) { *result = 0; return 1; }   /* (the loading animation's paint and timer) */
     switch (msg) {
     case WM_KEYDOWN:
         if (w != VK_F11 || (l & (1 << 30))) return 0;
@@ -590,6 +615,7 @@ int display_window_mode(void) { load(); return cfg.mode; }
 void display_set_mode(int mode) {   /* (the window's loop takes it: display_take_mode) */
     load();
     if (mode != MODE_WINDOWED) cfg.mode = mode;
+    display_note_mode(mode);
     InterlockedExchange(&asked_mode, mode);
 }
 void display_window_size(int *width, int *height) { load(); *width = cfg.width; *height = cfg.height; }
@@ -628,12 +654,15 @@ static int monitor_hz(void) {
 /* `display` pacing: the next vblank the game should see, or 0 to use the clock this time. */
 static int vblank_tick(void) {
     static IDXGIOutput *output;
-    static int divisor, failed;
+    static int divisor, failed, hz_now;
+    static LONGLONG last;   /* (the refresh the last tick returned at, performance counter; 0 none) */
     if (failed) return 0;
     if (InterlockedExchange(&monitor_changed, 0) || !output) {
         if (output) IDXGIOutput_Release(output);
         output = (IDXGIOutput *)gfx_display_output();
         int hz = monitor_hz();
+        hz_now = hz;
+        last = 0;
         divisor = hz >= 58 && hz <= 61 ? 1 : hz >= 118 && hz <= 121 ? 2 : hz >= 238 && hz <= 241 ? 4 : 0;
         static int logged_hz = -1;
         if (hz != logged_hz && output) {
@@ -641,13 +670,24 @@ static int vblank_tick(void) {
             fprintf(stderr, "[display] %d Hz monitor: %s\n", hz, divisor ? "display pacing" : "clock pacing (display pacing needs 60, 120 or 240 Hz)");
         }
     }
-    if (!output || !divisor) return 0;
+    if (!output || !divisor) { last = 0; return 0; }
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
-    for (int i = 0; i < divisor; i++)
+    /* The divisor-th refresh after the one the last tick returned at, not after now: the vsync thread comes
+     * back here late when its frame's work - or low_latency's held signal, up to most of a 60 Hz frame - ran
+     * past the monitor's next refresh, and "two refreshes from now" at 120 Hz was then three after the last
+     * tick, 25 ms (a fight on a 120 Hz monitor: up to ~1 frame in 100 shown 1.5 frames late). Refreshes are counted
+     * by their times, so a wait that returns at once or misses one is counted as what it was. */
+    LONGLONG period = freq.QuadPart / hz_now;
+    for (int waits = 0;;) {
         if (FAILED(IDXGIOutput_WaitForVBlank(output))) { failed = 1; break; }
+        QueryPerformanceCounter(&t1);
+        if (!last || ++waits >= 2 * divisor + 2) break;   /* (the first tick; and never more than a few refreshes) */
+        if ((t1.QuadPart - last + period / 2) / period >= divisor) break;
+    }
     QueryPerformanceCounter(&t1);
+    last = t1.QuadPart;
     if (!failed && (t1.QuadPart - t0.QuadPart) * 1000 / freq.QuadPart > 50 * divisor) failed = 1;
     if (failed) fprintf(stderr, "[display] waiting for the monitor's refresh failed: clock pacing from now on\n");
     return !failed;
@@ -750,4 +790,19 @@ void display_speed_tick(void) {
         if (left * 1000 > 2 * freq.QuadPart) Sleep(1);
         else YieldProcessor();
     }
+}
+
+void display_loading_note(const char *note) {
+#ifdef _WIN32
+    la_note(note);
+#else
+    (void)note;
+#endif
+}
+
+/* (both renderers, just before each present: the loading animation stops at the first) */
+void display_before_present(void) {
+#ifdef _WIN32
+    if (!g_la_first) la_stop();
+#endif
 }

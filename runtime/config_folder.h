@@ -17,13 +17,14 @@
 enum ConfigFile {
     CONFIG_DISPLAY,         /* display.ini (gpu_display.c) */
     CONFIG_CONTROLLERS,     /* controllers.ini (hle_pad.c) */
-    CONFIG_LAUNCHER,        /* launcher.ini (tools/launcher.ps1 only) */
+    CONFIG_LAUNCHER,        /* launcher.ini (OpenSmash settings) */
     CONFIG_ONLINE_SERVER,   /* online_server.txt: config/'s once there is one, else the port's own */
     CONFIG_ONLINE_NAME,     /* online_name.txt */
     CONFIG_ONLINE_DIRECT,   /* online_direct.txt */
     CONFIG_ONLINE_PROTOCOL, /* online_protocol.txt (net_relay.c: the netplay version) */
     CONFIG_ONLINE_ROLLBACK, /* online_rollback.txt (net_relay.c: "off" turns rollback netplay's default off) */
     CONFIG_ONLINE_HOST_MODS_DOWNLOAD,   /* online_host_mods_download.txt (hle_hostmods.c: "on" saves an open host pack's mods) */
+    CONFIG_ONLINE_DELAY,    /* online_delay.txt (hle_online_delay.c: the game's own netcode's input delay, "auto" or 0-25) */
     CONFIG_FILES
 };
 

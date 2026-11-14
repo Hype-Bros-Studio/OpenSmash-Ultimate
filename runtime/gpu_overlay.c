@@ -16,6 +16,7 @@
 
 #include "gpu_overlay.h"
 #include "gpu_menu.h"
+#include "net.h"
 
 #define CELL_W 24                 /* the atlas's cells */
 #define CELL_H 48
@@ -190,8 +191,72 @@ static int lines_of(const char *s, int *widest) {
     return n;
 }
 
+/* A message in the middle of the picture (the start-up shader preparation): text and a bar. */
+static char message[160];
+static float message_progress = -1;
+void overlay_message(const char *text, float progress) {
+    if (!text || !*text) { message[0] = 0; message_progress = -1; return; }
+    snprintf(message, sizeof message, "%s", text);
+    message_progress = progress;
+}
+
+static void message_draw(float w, float h) {
+    if (!message[0]) return;
+    int widest = 0, lines = lines_of(message, &widest);
+    float size = 30, tw = widest * size / 2;
+    float bw = tw + 64;
+    if (bw < 520) bw = 520;
+    if (bw > w - 40) bw = w - 40;
+    float bh = 20 + lines * size + (message_progress >= 0 ? 34 : 0);
+    float x = (w - bw) / 2, y = (h - bh) / 2;
+    rect(x, y, bw, bh, RGBA(0, 0, 0, 210));
+    rect(x, y, bw, 2, RGBA(120, 200, 255, 255));
+    float ty = text_sized(x + 24, y + 20, size, RGBA(240, 240, 240, 255), message);
+    if (message_progress >= 0) {
+        float p = message_progress < 0 ? 0 : message_progress > 1 ? 1 : message_progress;
+        float bx = x + 24, by = ty + 8, bw2 = bw - 48, bh2 = 16;
+        rect(bx, by, bw2, bh2, RGBA(40, 40, 40, 255));
+        rect(bx, by, bw2 * p, bh2, RGBA(90, 200, 120, 255));
+    }
+}
+
 /* ---- the frame ---------------------------------------------------------------------- */
 static void hud(const char *detail);
+int game_fight_on(void);   /* (hle_fight_test.c) */
+
+/* The other players' ping in a room, top right, outside fights (on the character select, the stage vote, the
+ * results): a dot coloured by the connection's quality and the round trip. After saad-script's
+ * ssbu-online-deluxe (its idea; nothing taken from its code). Returns 1 when something is to be drawn. */
+static NetPeerQ badge_peers[4];
+static int badge_n;
+static int badge_wanted(void) {
+    static u64 next;
+    u64 t = GetTickCount64();
+    if (t >= next) {   /* (twice a second) */
+        int was = badge_n;
+        next = t + 500;
+        badge_n = net_peer_quality(badge_peers, 4);
+        if (badge_n && !was)
+            fprintf(stderr, "[net] ping badge: %d player%s (%s: %d ms%s, quality %d)\n", badge_n, badge_n == 1 ? "" : "s", badge_peers[0].name,
+                    badge_peers[0].rtt_ms, badge_peers[0].relayed ? ", relayed" : "", badge_peers[0].quality);
+    }
+    return badge_n > 0 && !game_fight_on();
+}
+static float text_sized(float x, float y, float size, unsigned color, const char *s);
+static void badge(float w) {
+    static const unsigned dot[3] = {OVL_RGBA(90, 220, 110, 255), OVL_RGBA(250, 210, 70, 255), OVL_RGBA(240, 80, 70, 255)};
+    float size = 18, row = size + 6, bw = 300, x = w - bw - 12, y = 12;
+    rect(x - 8, y - 6, bw + 8, row * badge_n + 6, OVL_RGBA(0, 0, 0, 150));
+    for (int i = 0; i < badge_n; i++) {
+        const NetPeerQ *p = &badge_peers[i];
+        char line[96];
+        if (p->rtt_ms >= 0) snprintf(line, sizeof line, "%.24s  %d ms", p->name, p->rtt_ms);
+        else snprintf(line, sizeof line, "%.24s  relayed", p->name);
+        int q = p->quality < 0 ? 0 : p->quality > 2 ? 2 : p->quality;
+        rect(x, y + row * i + 4, size - 6, size - 6, dot[q]);
+        text_sized(x + size + 2, y + row * i, size, OVL_RGBA(235, 235, 235, 255), line);
+    }
+}
 static void draw(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, unsigned x0, unsigned y0, unsigned w, unsigned h);
 static double history[HISTORY];   /* milliseconds per frame, newest at [head - 1] */
 static unsigned head, filled;
@@ -208,13 +273,15 @@ void overlay_present(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11RenderTa
         if (filled < HISTORY) filled++;
     }
     last = now;
-    int menu = menu_visible();
-    if (!show && !menu) return;
+    int menu = menu_visible(), ping = !menu && badge_wanted(), msg = message[0] != 0;
+    if (!show && !menu && !ping && !msg) return;
     if (!state) state = init(dev) ? 1 : -1;
     if (state < 0) return;
     nverts = 0;
     if (show && !menu_blocks_input()) hud(detail);   /* (an open menu instead of the overlay) */
+    if (ping) badge((float)w);
     if (menu) menu_draw((float)w, (float)h);
+    if (msg) message_draw((float)w, (float)h);
     draw(ctx, rtv, x0, y0, w, h);
 }
 
@@ -232,12 +299,14 @@ unsigned overlay_quads(unsigned w, unsigned h, int show, const char *detail, con
         if (filled < HISTORY) filled++;
     }
     last = now;
-    int menu = menu_visible();
+    int menu = menu_visible(), ping = !menu && badge_wanted(), msg = message[0] != 0;
     *verts = (const OverlayVertex *)verts_out();
-    if (!show && !menu) return 0;
+    if (!show && !menu && !ping && !msg) return 0;
     nverts = 0;
     if (show && !menu_blocks_input()) hud(detail);
+    if (ping) badge((float)w);
     if (menu) menu_draw((float)w, (float)h);
+    if (msg) message_draw((float)w, (float)h);
     return nverts;
 }
 

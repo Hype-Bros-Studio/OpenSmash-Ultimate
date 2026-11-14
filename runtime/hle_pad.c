@@ -89,6 +89,8 @@ typedef struct DevCfg {
     int deadzone, rumble, trigger;   /* percent; -1 unset */
     int outer;                    /* percent of the stick's travel that already counts as fully pushed; -1 unset */
     int invert;                   /* the stick axes turned round: 1 LX, 2 LY, 4 RX, 8 RY; -1 unset */
+    int stick_taunts;             /* the left stick's four directions press the D-pad buttons (taunts); -1 unset */
+    int dpad_moves;               /* the D-pad drives the left stick (and no longer presses its own buttons); -1 unset */
     Source map[16][MAXSRC]; u8 nmap[16], has_map[16];
 } DevCfg;
 
@@ -115,7 +117,7 @@ static void config_defaults(void) {
     cfg.keyboard_slot = 0;
     cfg.background = 1;
     cfg.rumble = 1;
-    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.outer = cfg.def.invert = -1;
+    cfg.def.layout = cfg.def.style = cfg.def.deadzone = cfg.def.rumble = cfg.def.trigger = cfg.def.outer = cfg.def.invert = cfg.def.dpad_moves = cfg.def.stick_taunts = -1;
     memcpy(cfg.path, path, sizeof path);
     kb_defaults();
 }
@@ -198,6 +200,13 @@ static const char DEFAULT_INI[] =
     "; invert = the stick axes turned round, any of lx ly rx ry (or leftx lefty rightx righty; e.g. invert = ry).\n"
     ";          none: as the pad reports them.\n"
     "invert = none\n"
+    "; dpad_moves = on: the D-pad drives the left stick (full tilt, tap to walk, double-tap to dash; the stick and\n"
+    ";              the D-pad together: the larger wins) and no longer presses the D-pad's own buttons (the taunts).\n"
+    ";              off: the D-pad is the D-pad.\n"
+    "dpad_moves = off\n"
+    "; stick_taunts = on: the left stick's four directions (pushed past half way) press the D-pad's buttons, the taunts,\n"
+    ";              and the stick no longer moves; best with dpad_moves = on. off: the stick is the stick.\n"
+    "stick_taunts = off\n"
     "; rumble = 0-100, percent strength. 0: off.\n"
     "rumble = 100\n"
     "; trigger_threshold = 1-99, percent: how far a trigger is pulled to press ZL / ZR. (As a GameCube controller,\n"
@@ -226,7 +235,13 @@ static const char DEFAULT_INI[] =
     "; invert = rightx, righty\n"
     "; (the game's log line for each player names the pad with its GUID, as does padtest)\n"
     "; Nintendo's own adapter (USB 057e:0337) never needs a section: SDL reads it with its\n"
-    "; GameCube driver and the C-stick is already the right way up.\n";
+    "; GameCube driver and the C-stick is already the right way up.\n"
+    "; A worn stick that never reaches the edge (a dash or a smash needs about 80%): in Wii U\n"
+    "; mode the adapter is recalibrated from Esc > Controllers > Sticks..., with nothing to set\n"
+    "; here. In PC mode, if the driver does not already scale the stick to the edge, read how\n"
+    "; far it goes on that page and set outer_zone to a little under it, e.g.:\n"
+    "; [device gamecube]\n"
+    "; outer_zone = 88\n";
 
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -262,6 +277,16 @@ static void config_line(DevCfg *dc, const char *key, char *value, int line) {
         else fprintf(stderr, "[input] controllers.ini line %d: style is auto, pro or gamecube, not '%s'\n", line, value);
     } else if (!_stricmp(key, "deadzone")) dc->deadzone = atoi(value) < 0 ? 0 : atoi(value) > 50 ? 50 : atoi(value);
     else if (!_stricmp(key, "outer_zone")) dc->outer = atoi(value) < 50 ? 50 : atoi(value) > 100 ? 100 : atoi(value);
+    else if (!_stricmp(key, "stick_taunts")) {
+        if (!_stricmp(value, "on") || !_stricmp(value, "yes") || !_stricmp(value, "true") || !strcmp(value, "1")) dc->stick_taunts = 1;
+        else if (!_stricmp(value, "off") || !_stricmp(value, "no") || !_stricmp(value, "false") || !strcmp(value, "0")) dc->stick_taunts = 0;
+        else fprintf(stderr, "[input] controllers.ini line %d: stick_taunts is on or off, not '%s'\n", line, value);
+    }
+    else if (!_stricmp(key, "dpad_moves")) {
+        if (!_stricmp(value, "on") || !_stricmp(value, "yes") || !_stricmp(value, "true") || !strcmp(value, "1")) dc->dpad_moves = 1;
+        else if (!_stricmp(value, "off") || !_stricmp(value, "no") || !_stricmp(value, "false") || !strcmp(value, "0")) dc->dpad_moves = 0;
+        else fprintf(stderr, "[input] controllers.ini line %d: dpad_moves is on or off, not '%s'\n", line, value);
+    }
     else if (!_stricmp(key, "invert")) {
         dc->invert = 0;
         static const char *const AXES[4] = {"lx", "ly", "rx", "ry"};
@@ -469,7 +494,7 @@ static DevCfg *dev_cfg(const char *what) {
     if (cfg.ndev == (int)(sizeof cfg.dev / sizeof *cfg.dev)) return NULL;
     DevCfg *dc = &cfg.dev[cfg.ndev++];
     memset(dc, 0, sizeof *dc);
-    dc->layout = dc->style = dc->deadzone = dc->rumble = dc->trigger = dc->outer = dc->invert = -1;
+    dc->layout = dc->style = dc->deadzone = dc->rumble = dc->trigger = dc->outer = dc->invert = dc->dpad_moves = dc->stick_taunts = -1;
     snprintf(dc->match, sizeof dc->match, "%s", what);
     return dc;
 }
@@ -820,13 +845,16 @@ typedef struct Dev {
 #endif
     char guid[40], name[96], type[24], serial[64], path[192];
     int deadzone, rumble, trigger, layout;
-    int outer, invert;            /* (DevCfg's) */
+    int outer, invert, dpad_moves, stick_taunts;   /* (DevCfg's) */
     int gc;                       /* plays as a GameCube controller */
     int labels[4], has_labels;    /* the letters on its face buttons (dev_configure) */
     char section[96];             /* the [device ...] it takes settings from ("" = only default) */
     Mapping map;
     u16 sent_low, sent_high;      /* rumble last sent, and when */
     ULONGLONG sent_at;
+    i32 axis_lo[RA_COUNT], axis_hi[RA_COUNT];   /* the least and most each raw axis has read */
+    int axes_seen;                /* axis_lo/hi hold a first read */
+    volatile LONG axes_reset;     /* pad_reset_axes asked: they start over from the next read */
 } Dev;
 
 static Dev devs[16];
@@ -873,16 +901,25 @@ static void dev_configure(Dev *d, const int labels[4]) {
     const DevCfg *layers[2] = {&cfg.def, best};
     snprintf(d->section, sizeof d->section, "%s", best ? best->match : "");
     int layout = 0, style = 0, gamecube = dev_is_gamecube(d);
-    d->deadzone = 0; d->rumble = 100; d->trigger = 25; d->outer = 100; d->invert = 0;
+    d->deadzone = 0; d->rumble = 100; d->trigger = 25; d->outer = 100; d->invert = 0; d->dpad_moves = 0; d->stick_taunts = 0;
     for (int l = 0; l < 2; l++) {
         if (!layers[l]) continue;
         if (layers[l]->outer >= 0) d->outer = layers[l]->outer;
         if (layers[l]->invert >= 0) d->invert = layers[l]->invert;
+        if (layers[l]->stick_taunts >= 0) d->stick_taunts = layers[l]->stick_taunts;
+        if (layers[l]->dpad_moves >= 0) d->dpad_moves = layers[l]->dpad_moves;
         if (layers[l]->layout >= 0) layout = layers[l]->layout;
         if (layers[l]->style >= 0) style = layers[l]->style;
         if (layers[l]->deadzone >= 0) d->deadzone = layers[l]->deadzone;
         if (layers[l]->rumble >= 0) d->rumble = layers[l]->rumble;
         if (layers[l]->trigger >= 0) d->trigger = layers[l]->trigger;
+    }
+    /* (issue #153: a GameCube stick's dashes came out uneven with no dead zone and the whole travel; testers measured
+     * missed dashes 12 % -> 1 % with ssbu-recomp's 10 / 98. A GameCube pad gets those unless its own section sets them;
+     * [general]'s 0 / 100 - the file's defaults - don't count as a choice for it) */
+    if (gamecube) {
+        if ((!best || best->deadzone < 0) && d->deadzone == 0) d->deadzone = 10;
+        if ((!best || best->outer < 0) && d->outer == 100) d->outer = 98;
     }
     /* positional: the console's A is the right face button, B the bottom, X the top, Y the left */
     static const struct { int npad; Source src; } POSITIONAL[16] = {
@@ -983,7 +1020,16 @@ static i32 dev_trigger(const Dev *d, const Raw *raw, int b) {
     return v;
 }
 
-static void dev_state(const Dev *d, const Raw *raw, PadState *o) {
+static void dev_state(Dev *d, const Raw *raw, PadState *o) {
+    if (!d->axes_seen || InterlockedExchange(&d->axes_reset, 0)) {
+        memcpy(d->axis_lo, raw->axis, sizeof d->axis_lo);
+        memcpy(d->axis_hi, raw->axis, sizeof d->axis_hi);
+        d->axes_seen = 1;
+    } else
+        for (int a = 0; a < RA_COUNT; a++) {
+            if (raw->axis[a] < d->axis_lo[a]) d->axis_lo[a] = raw->axis[a];
+            if (raw->axis[a] > d->axis_hi[a]) d->axis_hi[a] = raw->axis[a];
+        }
     i32 threshold = d->trigger * 32767 / 100;
     o->connected = 1;
     o->gc = (u32)d->gc;
@@ -1003,6 +1049,22 @@ static void dev_state(const Dev *d, const Raw *raw, PadState *o) {
         if (d->invert >> a & 1) ax[a] = ax[a] <= -32768 ? 32767 : -ax[a];
     stick(d->deadzone, d->outer, ax[0], ax[1], &o->lx, &o->ly);
     stick(d->deadzone, d->outer, ax[2], ax[3], &o->rx, &o->ry);
+    u64 taunts = 0;
+    if (d->stick_taunts) {   /* the left stick's directions as the D-pad's buttons (the taunts); past half way, the stick itself goes still */
+        if (o->ly > 16383) taunts |= 1ull << N_UP;
+        if (o->ly < -16383) taunts |= 1ull << N_DOWN;
+        if (o->lx < -16383) taunts |= 1ull << N_LEFT;
+        if (o->lx > 16383) taunts |= 1ull << N_RIGHT;
+        o->lx = o->ly = 0;
+    }
+    if (d->dpad_moves) {   /* the D-pad as the left stick: full tilt (diagonals on the circle), the larger of it and the stick wins */
+        int dx = (int)(o->buttons >> N_RIGHT & 1) - (int)(o->buttons >> N_LEFT & 1), dy = (int)(o->buttons >> N_UP & 1) - (int)(o->buttons >> N_DOWN & 1);
+        i32 mag = dx && dy ? 23170 : 32767, vx = dx * mag, vy = dy * mag;
+        if (abs(vx) > abs(o->lx)) o->lx = vx;
+        if (abs(vy) > abs(o->ly)) o->ly = vy;
+        o->buttons &= ~(1ull << N_UP | 1ull << N_DOWN | 1ull << N_LEFT | 1ull << N_RIGHT);
+    }
+    o->buttons |= taunts;
 }
 
 /* ---- the slot table, shared with guest threads ------------------------------------- */
@@ -1021,7 +1083,7 @@ static void dev_info(const Dev *d, const Raw *raw, PadInfo *o) {
     snprintf(o->type, sizeof o->type, "%s", d->type);
     snprintf(o->guid, sizeof o->guid, "%s", d->guid);
     snprintf(o->section, sizeof o->section, "%s", d->section);
-    o->layout = d->layout; o->deadzone = d->deadzone; o->rumble = d->rumble; o->trigger = d->trigger;
+    o->layout = d->layout; o->deadzone = d->deadzone; o->rumble = d->rumble; o->trigger = d->trigger; o->dpad_moves = d->dpad_moves; o->stick_taunts = d->stick_taunts;
     o->xinput = d->xinput >= 0;
     for (int b = 0; b < 16; b++) {
         int n = 0;
@@ -1037,6 +1099,10 @@ static void dev_info(const Dev *d, const Raw *raw, PadInfo *o) {
     o->raw = raw->buttons & ((1u << RB_COUNT) - 1);
     if (raw->axis[RA_LEFT_TRIGGER] > 16384) o->raw |= PAD_RAW_LEFT_TRIGGER;
     if (raw->axis[RA_RIGHT_TRIGGER] > 16384) o->raw |= PAD_RAW_RIGHT_TRIGGER;
+    o->usb_port = d->usb - 1;
+    memcpy(o->axis, raw->axis, sizeof o->axis);
+    memcpy(o->axis_lo, d->axis_lo, sizeof o->axis_lo);
+    memcpy(o->axis_hi, d->axis_hi, sizeof o->axis_hi);
 }
 
 static void publish(const PadState fresh[PAD_SLOTS], const char names[PAD_SLOTS][48], const PadInfo info[PAD_SLOTS]) {
@@ -1503,6 +1569,11 @@ int pad_info(u32 slot, PadInfo *out) {
     *out = slot_info[slot];
     ReleaseSRWLockShared(&lock);
     return out->connected;
+}
+
+void pad_reset_axes(u32 slot) {
+    for (int i = 0; i < (int)(sizeof devs / sizeof *devs); i++)
+        if (devs[i].used && devs[i].slot == (int)slot) InterlockedExchange(&devs[i].axes_reset, 1);
 }
 
 const char *pad_raw_name(int bit) {

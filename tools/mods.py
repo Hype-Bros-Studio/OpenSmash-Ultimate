@@ -63,6 +63,8 @@ Limits, as against ARCropolis on a Switch: a file in a folder the game doesn't h
 config.json telling of its directory, is skipped and listed.
 """
 import argparse
+import contextlib
+import contextvars
 import filecmp
 import hashlib
 import json
@@ -243,20 +245,48 @@ def arc_path(rel):
     return rel
 
 
-def mod_files(folder):
-    """(arc path, file) of every file a mod's folder holds (not its code plugins: plugins())."""
-    out = []
+_WALKS = contextvars.ContextVar("mod_walks", default=None)
+
+
+@contextlib.contextmanager
+def walk_once():
+    """Inside it each mod folder is walked once: status reads the same folders several times over."""
+    token = _WALKS.set({})
+    try:
+        yield
+    finally:
+        _WALKS.reset(token)
+
+
+def _walk(folder):
+    """(mod_files, plugins) of a folder, in one walk."""
+    cache = _WALKS.get()
+    if cache is not None and folder in cache:
+        return cache[folder]
+    out, code = [], []
     for dp, dirs, files in os.walk(folder):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        rel_dir = os.path.relpath(dp, folder)
         for n in sorted(files):
+            full = os.path.join(dp, n)
+            rel = n if rel_dir == "." else os.path.join(rel_dir, n)
+            path = arc_path(rel)
+            if is_plugin(path):
+                code.append(rel.replace(os.sep, "/"))
             if n.startswith(".") or n.lower() in SKIP_FILES:
                 continue
-            full = os.path.join(dp, n)
-            path = arc_path(os.path.relpath(full, folder))
             if is_plugin(path) or path.split("/", 1)[0].lower() in PLUGIN_DATA or "/" not in path:
                 continue   # (and a file at the mod's top - victory.toml, config_param.toml: its plugins' settings, not data.arc's)
             out.append((path, full))
-    return out
+    walked = (tuple(out), tuple(sorted(code)))
+    if cache is not None:
+        cache[folder] = walked
+    return walked
+
+
+def mod_files(folder):
+    """(arc path, file) of every file a mod's folder holds (not its code plugins: plugins())."""
+    return list(_walk(folder)[0])
 
 
 def is_plugin(path):
@@ -267,14 +297,7 @@ def is_plugin(path):
 
 def plugins(folder):
     """The code plugins a mod's folder holds (paths in it)."""
-    out = []
-    for dp, dirs, files in os.walk(folder):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for n in files:
-            rel = os.path.relpath(os.path.join(dp, n), folder)
-            if is_plugin(arc_path(rel)):
-                out.append(rel.replace(os.sep, "/"))
-    return sorted(out)
+    return list(_walk(folder)[1])
 
 
 def find_roots(top):
@@ -311,6 +334,14 @@ def extract(archive, into):
             if os.path.exists(seven):
                 r = subprocess.run([seven, "x", "-y", f"-o{into}", archive], capture_output=True, text=True)
                 break
+    if r.returncode and os.name != "nt":   # (Linux's GNU tar reads neither .7z nor .rar: the unpackers it may have)
+        for cmd in unpack_commands(archive, into):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+            except OSError:
+                continue
+            if not r.returncode:
+                break
     if r.returncode and archive.lower().endswith(".7z"):   # (no 7-Zip: py7zr, which the installer adds)
         try:
             import py7zr
@@ -325,8 +356,33 @@ def extract(archive, into):
                 z.extractall(into)
             return
     if r.returncode:
-        hint = " (install 7-Zip, from 7-zip.org, to open .7z and .rar files)" if os.name == "nt" else ""
+        if os.name == "nt":
+            hint = " (install 7-Zip, from 7-zip.org, to open .7z and .rar files)"
+        elif sys.platform == "darwin":
+            hint = ""
+        else:
+            hint = (" (install 7-Zip or bsdtar from your distribution - the 7zip, p7zip or libarchive-tools package - to "
+                    "open .7z and .rar files)")
         raise Error(f"cannot unpack {os.path.basename(archive)}{hint}: {(r.stderr or r.stdout).strip()[-400:]}")
+
+
+# (unpacker, its arguments) for .7z, .rar and the rest where tar can't: libarchive's bsdtar, 7-Zip (7zz: 7-Zip's own
+# Linux build, 7z / 7za: p7zip's), unrar, The Unarchiver's unar
+UNPACKERS = (("bsdtar", ["-xf", "{archive}", "-C", "{into}"]), ("7zz", ["x", "-y", "-o{into}", "{archive}"]),
+             ("7z", ["x", "-y", "-o{into}", "{archive}"]), ("7za", ["x", "-y", "-o{into}", "{archive}"]),
+             ("unrar", ["x", "-o+", "-y", "{archive}", "{into}/"]), ("unar", ["-f", "-q", "-o", "{into}", "{archive}"]))
+
+
+def unpack_commands(archive, into, which=shutil.which):
+    """The commands that may unpack `archive` into `into`, of the unpackers installed (unrar only for a .rar)."""
+    out = []
+    for name, args in UNPACKERS:
+        if name == "unrar" and not archive.lower().endswith(".rar"):
+            continue
+        exe = which(name)
+        if exe:
+            out.append([exe] + [a.format(archive=archive, into=into) for a in args])
+    return out
 
 
 def safe_name(name):
@@ -352,16 +408,33 @@ def install(tree, archive, name=None, meta=None):
             raise Error(f"{os.path.basename(archive)} has no files laid out as the game's (fighter/, ui/, sound/, stream;/ ...) "
                         "and no Skyline plugin (.nro)")
         base = safe_name(name or os.path.splitext(os.path.basename(archive))[0])
+        on = []   # (the game files of each of this pack's mods turned on)
         for root in roots:
             leaf = os.path.basename(root)
             label = base if len(roots) == 1 else f"{base} - {safe_name(leaf)}"
             final, k = label, 2
+            old = None
             while os.path.exists(os.path.join(tree.mods, final)):
+                # (the same download again - the same file, by its checksum: it replaces the copy there,
+                # turned on or off as it was, not a second copy "(2)" turned on beside it, the two
+                # changing the same files: Knuckles' 914)
+                if (meta or {}).get("md5") and state["mods"].get(final, {}).get("md5") == meta["md5"]:
+                    old = state["mods"][final]
+                    shutil.rmtree(os.path.join(tree.mods, final))
+                    break
                 final, k = f"{label} ({k})", k + 1
             inner = {os.path.normcase(r) for r in nested_roots(root, roots)}
             shutil.copytree(root, os.path.join(tree.mods, final),
                             ignore=lambda d, names: [n for n in names if os.path.normcase(os.path.join(d, n)) in inner])
-            entry = {"enabled": True}
+            # (a pack's choices - a moveset's Battle and Modern styles, one victory pose of several: a
+            # mod most of whose files another of the pack's turned-on mods changes too is the other's
+            # alternative, installed turned off; an add-on shares few. Both on, the later one's files
+            # won, and both movesets' plugins ran on the one fighter)
+            files = {p.lower() for p, _src in mod_files(os.path.join(tree.mods, final))}
+            choice = files and any(len(files & other) >= len(files) / 2 for other in on)
+            entry = {"enabled": old.get("enabled", True) if old else not choice}
+            if entry["enabled"]:
+                on.append(files)
             entry.update(meta or {})
             state = tree.load()
             state["mods"][final] = entry
@@ -2008,10 +2081,12 @@ def apply(tree, log=print):
     lines = vanilla_cfg(tree)
     state = tree.load()
     on = [n for n in state["order"] if state["mods"].get(n, {}).get("enabled")]
+    prcxml_redirects(tree, on, log)
     if os.path.exists(os.path.join(tree.root, "skyline", "plugins", "libarcropolis.nro")):
         # the real ARCropolis is among the standard plugins: it reads the turned-on mods from
         # sd:/ultimate/mods (runtime/hle_fs.c) as the game loads, so the game keeps its own data
         characters_mod(tree, log)
+        hide_shadowed_sources(tree, on, log)
         missing_shares(tree, on, log)
         select_screen_arcropolis(tree, on, log)
         sync_plugins(tree, log)
@@ -2132,6 +2207,89 @@ def characters_mod(tree, log):
         f.writelines(h + "\n" for h in hidden)
     if hidden:
         log("the new characters' select-screen files include these mods' own copies: " + ", ".join(hidden))
+
+
+def motion_list_text_unreadable(path):
+    """Whether ARCropolis' motion_list reader turns down this motion_list.yml: an older format, whose
+    motions' flags lack unk_800, unk_1000 and unk_2000 (Knuckles': "list.wait.flags: missing field
+    `unk_800`"). One in the current format is the mod's own motion list, often newer than the .bin
+    beside it (Electivire's and Zeraora's name their moves' scripts only there)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return False
+    flags = len(re.findall(r"^\s*flags:\s*$", text, re.M))
+    return any(len(re.findall(rf"^\s*{k}:", text, re.M)) < flags for k in ("unk_800", "unk_1000", "unk_2000"))
+
+
+COLOR_START = prc.hash40("color_start_index")
+UI_CHARA_ID = prc.hash40("ui_chara_id")
+CHARA_DB = ("ui", "param", "database", "ui_chara_db.prcxml")
+
+
+def prcxml_redirects(tree, on, log):
+    """The characters the turned-on mods add with their ui_chara_db.prcxml alone - no plugin, so no
+    CSK Collection call - on another fighter's extra costumes (Popple: Mario's c24-c31, its
+    color_start_index 24), into dump/skyline/prcxml_redirects.txt, a line each: the ui_chara hash40
+    and its first costume. runtime/hle_skyline.c adds them to the characters it redirects, as the
+    CSK Collection does on the console; without it such a character played its fighter's c00."""
+    found = {}
+    for name in on:
+        for root in find_roots(os.path.join(tree.mods, name)) or [os.path.join(tree.mods, name)]:
+            path = os.path.join(root, *CHARA_DB)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "rb") as f:
+                    kind, db = prc.read_xml(f.read())
+            except (prc.Error, ET.ParseError, ValueError) as e:
+                log(f"{name}: its {'/'.join(CHARA_DB)} could not be read ({e}): its characters keep costume 0")
+                continue
+            if kind != prc.STRUCT:
+                continue
+            for _key, (list_kind, entries) in db:
+                if list_kind != prc.LIST:
+                    continue
+                for entry_kind, entry in entries:
+                    if entry_kind != prc.STRUCT:
+                        continue
+                    fields = dict(entry)
+                    chara, start = fields.get(UI_CHARA_ID, (None, 0))[1], fields.get(COLOR_START, (None, 0))[1]
+                    if chara and start:
+                        found[chara] = start
+    path = os.path.join(tree.root, "dump", "skyline", "prcxml_redirects.txt")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.writelines(f"{chara:#x} {start}\n" for chara, start in found.items())
+    if found:
+        log(f"{len(found)} character(s) of .prcxml files on their own costumes (prcxml_redirects.txt)")
+
+
+def hide_shadowed_sources(tree, on, log):
+    """A mod that ships a file both whole and as ARCropolis' text source next to it - Knuckles'
+    fighter/sonic/motion/body/c120/motion_list.bin and motion_list.yml - has ARCropolis build the
+    file from the text, and a .yml of an older format than this ARCropolis reads (missing a field)
+    then left the file unloaded and the match crashed. For such a .yml the whole file is what the
+    mod's author tested: it is added to dump/skyline/hidden.txt (runtime/hle_fs.c hides it from
+    ARCropolis). A .yml ARCropolis reads stays, as on the console: it is the motion list the mod uses."""
+    hidden_path = os.path.join(tree.root, "dump", "skyline", "hidden.txt")
+    shadowed = []
+    for name in on:
+        for root in find_roots(os.path.join(tree.mods, name)) or [os.path.join(tree.mods, name)]:
+            for dp, _dirs, files in os.walk(root):
+                lower = {f.lower() for f in files}
+                for f in files:
+                    stem, ext = os.path.splitext(f)
+                    if (f.lower() == "motion_list.yml" and (stem + ".bin").lower() in lower
+                            and motion_list_text_unreadable(os.path.join(dp, f))):
+                        shadowed.append(os.path.relpath(os.path.join(dp, f), tree.mods).replace(os.sep, "/"))
+    if not shadowed:
+        return
+    with open(hidden_path, "a", encoding="utf-8", newline="\n") as f:
+        f.writelines(h + "\n" for h in shadowed)
+    log(f"{len(shadowed)} text source(s) left to the whole file beside them (ARCropolis would build that "
+        "file from the text): " + ", ".join(shadowed[:5]) + (" ..." if len(shadowed) > 5 else ""))
 
 
 ARRANGEMENT = ("ui", "param", "menu", "chara_icon_arrangement.prc")

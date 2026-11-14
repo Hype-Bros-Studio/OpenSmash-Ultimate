@@ -48,12 +48,19 @@ typedef struct PadInfo {
     int connected, slot, xinput;
     char name[96], type[24], guid[40], section[96];
     int layout, deadzone, rumble, trigger;    /* layout 0 positional, 1 labels */
+    int stick_taunts;                         /* the left stick's directions press the D-pad's buttons */
+    int dpad_moves;                           /* the D-pad drives the left stick */
     char map[16][40];
     u32 raw;
+    int usb_port;              /* the GameCube-adapter port it is read over (0-3), -1 not one */
+    i32 axis[6];               /* the device's own stick/trigger values, as last read (lx, ly, rx, ry, lt, rt) */
+    i32 axis_lo[6], axis_hi[6];   /* the lowest and highest each has been since plugged in or reset */
 } PadInfo;
 int pad_info(u32 slot, PadInfo *out);                     /* returns out->connected */
+void pad_reset_axes(u32 slot);                            /* axis_lo/hi start over from the next read */
 const char *pad_raw_name(int bit);                        /* "south", ..., "lefttrigger" */
 const char *pad_button_name(int npad);                    /* "A", ..., "DOWN" */
 const char *pad_ini_path(void);
 void pad_reload(void);                                    /* controllers.ini read again, pads set up again (soon) */
 int menu_blocks_input(void);                              /* (gpu_menu.c) the menu is open: the game sees no input */
+void pad_input_gate_set(int on);                          /* (hle_hid.c) hold the game's own input while shaders prepare */

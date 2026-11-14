@@ -41,7 +41,7 @@ class StateMap(unittest.TestCase):
         self.assertIn('if (m.State == MEM_COMMIT) VirtualProtect(p, (SIZE_T)(stop - p), prot, &old);', state)
         self.assertIn('sm_protect(c->base + ((u64)k << 12), (u64)(e - k) << 12, PAGE_READWRITE);', state, 'at the fight end too')
         # a cold page is present for the savestate, and a page committed since is hot
-        self.assertIn('if (sm_on && m.State == MEM_COMMIT && m.Protect == PAGE_READONLY && sm_alias(p)) {', state)
+        self.assertIn('if ((sm_on || lazy_pages) && m.State == MEM_COMMIT && m.Protect == PAGE_READONLY && sm_alias(p)) {', state)
         self.assertIn('{ sm_present(p); settle_page(p, 1, to_shadow); }', state)
         self.assertIn('sm_gone(p);', state)
         # the end: every cold page writable again
@@ -71,14 +71,15 @@ class RunAhead(unittest.TestCase):
         gpu, queue, core = src('gpu.c'), src('gpu_queue.c'), src('hle_rb_core.c')
         self.assertIn('if (!gpu_job_hidden) gfx_draw(e->regs, e->cb, e->indexed);', gpu)
         self.assertIn('if (!gpu_job_hidden) gfx_clear(e->regs, arg);', gpu)
-        self.assertIn('j->hide = j->fast && gpu_hide_fast;', queue, 'decided when the frame submits')
+        self.assertIn('j->hide = gpu_hide_fast == 2 ? rb_fast > 1 : j->fast && gpu_hide_fast;', queue, 'decided when the frame submits')
         self.assertIn('gpu_job_hidden = j->hide;', queue)
         self.assertIn('gpu_hide_fast = hide && !draw_hidden;', core, 'SSBU_RA_DRAW_HIDDEN=1 draws them')
         self.assertIn('gpu_hide_fast = 0;', core, 'off when the fight ends')
 
     def test_save_on_own_fibers(self):
         state, core = src('hle_rb_state.c'), src('hle_rb_core.c')
-        self.assertIn('if (rb_save_home_only && away_from_home(c->thread)) {', state)
+        self.assertIn('if ((rb_save_home_only || save_home) && away_from_home(c->thread)) {', state)
+        self.assertIn('getenv("SSBU_RB_SAVE_HOME")', state, 'net rollback saves wait for the jobs too (off: =0)')
         self.assertIn('getenv("SSBU_RB_SAVE_RETRY_MS")', state)
         self.assertIn('rb_save_home_only = 1;\n        int r = rb_save(c, frame);\n        rb_save_home_only = 0;', core,
                       'run-ahead\'s saves only')

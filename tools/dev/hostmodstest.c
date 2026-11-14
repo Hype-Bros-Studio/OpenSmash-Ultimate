@@ -29,6 +29,7 @@ void rb_guest_writing(void *p, u64 n) { (void)p; (void)n; }
 u64 rt_native(GuestFn *fn, const char *name) { (void)fn; (void)name; return 0; }
 u64 rt_hook_function(u64 target, u64 replace) { (void)target; (void)replace; return 0; }
 void account_save_id(u64 uid[2]) { (void)uid; }
+char rt_romfs_warning[320];   /* (host.c's, not linked here: hle_fs.c fills it) */
 /* (hle_config.c, hle_settings.c: the download setting's file and its first line) */
 const char *config_path(enum ConfigFile file) {
     return file == CONFIG_ONLINE_HOST_MODS_DOWNLOAD && getenv("HOSTMODSTEST_SETTING") ? getenv("HOSTMODSTEST_SETTING") : "/nonexistent/setting";

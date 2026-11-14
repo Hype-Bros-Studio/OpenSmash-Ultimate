@@ -25,15 +25,15 @@ WindowSmash plays the game's **Local Wireless** mode over the internet. To the g
 
 | Way | Best for | Router setup | Start with |
 | :--- | :--- | :--- | :--- |
-| [**Online lobby**](#online-lobby) | Playing with anyone | None | `Play SSBU.bat` |
-| [**Lobby code**](#friends-only-a-lobby-code) | Friends only, through the lobby | None | `Play SSBU.bat` |
-| [**Online mode**](#online-mode-quickplay) | Quickplay with anyone searching (new) | None | `Play SSBU.bat` |
+| [**Online lobby**](#online-lobby) | Playing with anyone | None | `OpenSmash.exe` |
+| [**Lobby code**](#friends-only-a-lobby-code) | Friends only, through the lobby | None | `OpenSmash.exe` |
+| [**Online mode**](#online-mode-quickplay) | Quickplay with anyone searching (new) | None | `OpenSmash.exe` |
 | [**Private room**](#private-room) | A group with one host | The host may need to open a port | `launchers\Host SSBU Netplay.bat` and `launchers\Join SSBU Netplay.bat` |
-| [**Your own lobby**](#run-your-own-lobby) | Communities with a server | The server's port | `Play SSBU.bat` |
+| [**Your own lobby**](#run-your-own-lobby) | Communities with a server | The server's port | `OpenSmash.exe` |
 
 The online lobby is the easiest: nobody hosts anything outside the game, and nobody touches their router.
 
-On Linux ([Linux guide](LINUX.md)), `run.sh`, `run-offline.sh`, `host-netplay.sh` and `join-netplay.sh` do what `Play SSBU.bat`, `launchers\Play SSBU Offline.bat`, `launchers\Host SSBU Netplay.bat` and `launchers\Join SSBU Netplay.bat` do. Windows and Linux players play together.
+On Linux ([Linux guide](LINUX.md)), `run.sh`, `run-offline.sh`, `host-netplay.sh` and `join-netplay.sh` do what `OpenSmash.exe`, the launcher's Offline lobby setting, `launchers\Host SSBU Netplay.bat` and `launchers\Join SSBU Netplay.bat` do. Windows and Linux players play together.
 
 ## Before you play
 
@@ -42,22 +42,22 @@ Whichever way you choose:
 1. **Everyone uses the same WindowSmash, with the game at version 13.0.5.** WindowSmash builds no other version, so every player can play with every other. The online lobby turns away a game an older WindowSmash built from another version: its overlay says `Netplay: WindowSmash needs game 13.0.5: run the installer again` ([what to do](UPDATES.md#a-folder-built-from-another-version)).
 2. **Every PC is set up with its own game data**, following the [setup guide](BUILDING.md). Match the DLC between players too.
 3. **Every PC keeps its own save and its own `netplay_id.txt`.** Never copy `netplay_id.txt` to another PC: two PCs with the same one look like one player.
-4. **Check the game works offline first** with `launchers\Play SSBU Offline.bat`, then close it.
+4. **Check the game works offline first** with the launcher's Offline lobby setting, then close it.
 
 Each WindowSmash window is one player. A private room holds up to eight members, and the game's own room rules decide how many can play a match.
 
 ## Online lobby
 
-This is what `Play SSBU.bat` does by default. Every Local Wireless room that anyone creates shows up for every player in the lobby.
+This is what `OpenSmash.exe` does by default. Every Local Wireless room that anyone creates shows up for every player in the lobby.
 
-1. Double-click **`Play SSBU.bat`**. The first time, the game picks the name other players see, such as `Player1234`, and shows it at the bottom of the screen. To change it, press <kbd>Esc</kbd> in the game, go to **Online**, choose **Your name**, then **Game → Restart the game** ([settings](PLAYING.md#settings)).
+1. Double-click **`OpenSmash.exe`**. The first time, the game picks the name other players see, such as `Player1234`, and shows it at the bottom of the screen. To change it, press <kbd>Esc</kbd> in the game, go to **Online**, choose **Your name**, then **Game → Restart the game** ([settings](PLAYING.md#settings)).
 2. If Windows Security asks about `ssbu.exe`, click **Allow**. No port forwarding is needed: your game only sends to the lobby.
 3. In the game's main menu, choose **Local Wireless**.
    - **To host:** choose **Create a Room**. When a challenger appears, accept them.
    - **To join:** open **Rooms List** and pick a room. Open rooms come first, fuller ones before emptier ones. The list shows up to 24 rooms (the game on its own stops at 10); scroll down for the rest. With more rooms than that in the lobby, any of them can be reached from the settings' **Lobby** page (version 3, below): pick a room there and it comes first in your Rooms List, or page the Rooms List 24 rooms at a time.
 4. Press <kbd>F1</kbd> to see the connection, for example `Online: 37 players, 4 rooms - you are Alpha, ping 48 ms`. A second line lists the other players in your room and how each one is reached ([see below](#direct-connections-and-your-internet-address)).
 
-`online_server.txt`, in the WindowSmash folder, names the lobby. Its first line that doesn't start with `#` is the lobby's address, `smash.recomps.wtf:39421` (the public lobby) unless you change it. Port 39421 is the lobby with the game server for [Online mode](#online-mode-quickplay); port 39420 is the older lobby without it, which older WindowSmash versions use. Rooms on one don't show up on the other, so everyone in a group should use the same one.
+`online_server.txt`, in the WindowSmash folder, names the lobby. Its first line that doesn't start with `#` is the lobby's address. The default, `auto`, joins the public lobby this PC reaches fastest: Europe (`opensmash-lobby.duckdns.org:39421`) or North America (`smash.recomps.wtf:39421`), timed by a connect to each at start; `eu` or `na` pins one. The two lobbies don't share rooms or Quickplay yet, but a room code reaches its host from either. The North American address alone, the old default, now means `auto` too. Port 39421 is the lobby with the game server for [Online mode](#online-mode-quickplay); port 39420 is the older lobby without it, which older WindowSmash versions use. Rooms on one don't show up on the other, so everyone in a group should use the same one.
 
 ### Friends only: a lobby code
 
@@ -67,7 +67,7 @@ A lobby code hides your rooms from everyone who doesn't use the same code.
 2. Set **Play online in** to **private lobby**, choose **Lobby code**, and type your code.
 3. Choose **Restart now**. Everyone in your group does the same, with the same code.
 
-The window `Play SSBU.bat` opens before the game does the same: set **Lobby** to **Private lobby (a code)** and type your code.
+The window `OpenSmash.exe` opens before the game does the same: set **Lobby** to **Private lobby (a code)** and type your code.
 
 Capital letters count: `OurCode` and `ourcode` are two different lobbies.
 
@@ -94,8 +94,8 @@ With version 3 set, a lobby or private room of version 2 still works: the game j
 
 ### Playing offline
 
-- `launchers\Play SSBU Offline.bat` never goes online.
-- To make `Play SSBU.bat` start offline too, set **Play online in** to **offline** in the settings (**Online** page), or write `off` in `online_server.txt` in place of the address.
+- the launcher's Offline lobby setting never goes online.
+- To make `OpenSmash.exe` start offline too, set **Play online in** to **offline** in the settings (**Online** page), or write `off` in `online_server.txt` in place of the address.
 - If the lobby doesn't answer for five seconds, the game plays offline by itself and keeps trying in the background.
 
 ## Online mode (Quickplay)
@@ -105,7 +105,7 @@ The game's own **Online** menu works with WindowSmash's game server, which runs 
 > [!WARNING]
 > Online mode is new. Tested on one PC (two games, a lobby of their own): logging in, the Online menus, Quickplay's search, two players matched, the whole match with the game's own netcode and with [rollback](#rollback-in-online-mode), the results with GSP, and both games back in Quickplay for the next search. Not tested yet: two PCs, more than two players. The Linux version has Online mode built in, but it hasn't been tried there.
 
-1. Start the game with **`Play SSBU.bat`**. `online_server.txt` must name a lobby with the game server: `smash.recomps.wtf:39421`, the default, has one.
+1. Start the game with **`OpenSmash.exe`**. `online_server.txt` must name a lobby with the game server: `smash.recomps.wtf:39421`, the default, has one.
 2. In the main menu, choose **Online**, then **Smash**, then **Quickplay**.
 3. Choose your rules and fighter, then **Ready to fight**. The game waits in its practice room until it finds another player.
 
@@ -115,15 +115,28 @@ The game's own **Online** menu works with WindowSmash's game server, which runs 
 
 | What you see | What to check |
 | :--- | :--- |
-| An error as soon as you choose **Online** | Start the game with `Play SSBU.bat`, not `launchers\Play SSBU Offline.bat`, and check that the overlay (<kbd>F1</kbd>) says `Online`. |
+| An error as soon as you choose **Online** | Start the game with `OpenSmash.exe`, not the launcher's Offline lobby setting, and check that the overlay (<kbd>F1</kbd>) says `Online`. |
 | An error code starting with **2306** | The game can't reach the game server. The lobby in `online_server.txt` has none (port 39420, or a lobby of your own run with `ssbu_relay.py`), or something blocks TCP to it. |
 | Quickplay keeps waiting | Nobody with your lobby code is searching right now. Find players on the [OpenSmash-Ultimate Discord](https://discord.gg/pkgyYGf3YB). |
 | "The connection was interrupted due to excessive inactivity" or "... self-destructs" | The game's own Online rules: a player who stands still or falls off too often is sent back to the menu. |
 
+### Battle Arenas
+
+**Online > Smash > Battle Arenas** works with the same game server: make an arena with your own rules, find one, join it, and play its matches in turn.
+
+> [!WARNING]
+> Battle Arenas are newer still. Tested on one PC (two games, a lobby of their own): making an arena (its rules, name and arena ID), finding it with **Advanced search**, joining it, both players' tokens in the ring, **Start**, the match, its results, and the next match. Not tested yet: more than two players, two PCs.
+
+- **Make one:** **Create Arena**, choose the rules, **Next** (<kbd>+</kbd>), type a name, **Create Arena**. The arena ID in the top-right corner is the one the game server gave it.
+- **Find one:** **Find Arena > Advanced search** lists the open arenas with room of players with your lobby code (or none) that fit the search, the fullest first.
+- **Join:** pick it, **Join**. Your token waits on the waiting platform; the fighter button by your name chooses your fighter.
+- **Play:** pick up your token with the hand (<kbd>A</kbd>) and put it in the ring (<kbd>A</kbd> again, where it says **Join**). With two in the ring, **Start** (<kbd>+</kbd>) begins the match; each player confirms their fighter (<kbd>A</kbd>) before the seconds run out. Matches with two players are played with [rollback](#rollback-in-online-mode), as Quickplay's.
+- **Not yet:** **Arena ID** search (wired, not tried from the game), friends' arenas (the game server has no friend lists), arenas with a password (not tried).
+
 ### Rollback in Online mode
 
 > [!NOTE]
-> On by default: a game started with `Play SSBU.bat` (or the launcher, which starts it with `--online`) plays Quickplay and [Local Wireless room](#rollback-in-local-wireless-rooms) matches with rollback whenever the other player's game has it on too. To play with the game's own netcode instead, set **Online > Rollback netcode** to **off** in the settings (Esc; it writes `online_rollback.txt`, and counts from the next start), or start the game with `SSBU_RB=0`. A game started offline has no rollback at all and costs nothing for it.
+> On by default again (2026-11-11, after v0.3.0-alpha.4 had it off): a rollback's catch-up now fits in one frame almost always (over 16.7 ms in under 1 % of them at 40 ms one way, about 3-4 % at 120-150 ms), and the input delay grows with the measured trip, up to 9 frames online. **Online > Rollback netcode** set to **off** in the settings (Esc; it writes `off` in `online_rollback.txt`, from the next start) plays the game's own netcode, as `SSBU_RB=0` does. A match uses rollback only when both players have it on. A game started offline has no rollback at all and costs nothing for it.
 
 With it, a Quickplay match is played with rollback netplay ([technical guide](TECHNICAL.md#rollback-netplay-ssbu_rb)) instead of the game's own delay-based netcode: your own inputs answer at once (after a small input delay), the other player's are guessed until they arrive, and the game quietly re-runs the few frames a wrong guess touched. Everything around the fight stays the game's own: matchmaking, the character screen, the results with GSP, the next search.
 
@@ -141,15 +154,17 @@ How it behaves at a given round trip (two games on one PC, normal speed, the rou
 | ~110 ms | 1 (forced) | 770-1300 | mostly 3-5 | 17-20 ms (40 ms and more) | none | identical |
 | ~115 ms | 2 (auto) | 790-1280 | mostly 2-3 | 13-15 ms (41 ms) | none | identical |
 
-A re-run under 16.7 ms is not seen; one over it shows as a frame late. That is why the delay is the one-way trip in frames less one (up to ~85 ms round trip 1, up to ~115 ms 2, up to ~150 ms 3, at most 4): with less, the re-runs get longer than a frame; with more, every press waits longer. The bots of these tests press something every few frames, far more changes than a person makes, so a real match rolls back less. "Fight hashes at the end": every frame's hash, as each game kept it once both players' inputs were known, compared over the whole match.
+A re-run under 16.7 ms is not seen; one over it shows as a frame late. That is why the delay is the one-way trip in frames less one (1 only under 15 ms round trip, a home network; otherwise at least 2, up to ~115 ms 2, up to ~150 ms 3), and from 100 ms one way the whole trip in frames, at most 9: there a frame less made rollbacks of 4-6 frames, a fifth of them over the frame (120 ms one way: delay 6, 25 % of catch-ups over 16.7 ms; delay 7, under 5 %): with less, the re-runs get longer than a frame; with more, every press waits longer. The floor of 2 comes from a live two-PC match at a 40 ms round trip, with people playing: delay 1 made 1263 rollbacks in one fight, ran at about 50 frames a second and desynced; delay 2 made 15 rollbacks in two fights, 60 frames a second, in sync. The table above is from before it. The bots of these tests press something every few frames, far more changes than a person makes, so a real match rolls back less. "Fight hashes at the end": every frame's hash, as each game kept it once both players' inputs were known, compared over the whole match.
 
 Two games on one PC against a lobby of your own, for a test (each game in a folder of its own, with its own save and `netplay_id.txt`):
 
 ```powershell
 python tools/ssbu_online_lobby.py --bind 127.0.0.1 --port 39421 --state online-state --verbose
 # both games: started with --online, online_server.txt (or SSBU_NET_RELAY) naming 127.0.0.1:39421: rollback is on by default
-# tests only: SSBU_RB_NET_BOT=calm (a bot plays each game's player and stays on the stage; without it, the controllers play), SSBU_NET_SIM=<ms>[,<loss %>[,<jitter ms>]] (each game holds what it receives that long)
+# tests only: SSBU_RB_NET_BOT=calm (a bot plays each game's player and stays on the stage; without it, the controllers play), SSBU_RB_DELAY_RULE=online (the Online mode's delay rule on the direct link: a pair under SSBU_NET_SIM chooses its own delay), SSBU_RB_NET_BOT_CSTICK=<player 1-8> (that player's bot jumps and pushes the C-stick in the air, its magnitude changing every frame: #181's case), SSBU_NET_SIM=<ms>[,<loss %>[,<jitter ms>]] (each game holds what it receives that long)
 ```
+
+Rollback's catch-up switches (each restores the older behaviour, for comparisons): `SSBU_RB_NET_HIDE=0` draws every frame run again (by default only a catch-up's last frame is drawn); `SSBU_RB_RERUN_LAZY=0` saves every frame run again (by default a catch-up keeps one state, at the newest frame whose pads are all real, and the next normal frame saves); `SSBU_RB_RERUN_KEEP_BACK=<n>` (8) keeps a state anyway once the newest would be more than n frames back; `SSBU_RB_LOAD_BESIDE_GPU=0` copies a load's memory only after the GPU's queue is drained (by default the pages the GPU cannot touch are copied while it drains).
 
 ## Direct connections and your internet address
 
@@ -183,7 +198,7 @@ Direct connections need a lobby running this version of `tools/ssbu_relay.py`. W
 > [!NOTE]
 > **Your internet address.** The players in a room with you learn your internet (IP) address, as they would when playing online on a console. The lobby introduces only players whose games are already playing together in a room, and introduces each player in at most 20 rooms an hour.
 >
-> To keep your address to yourself, turn **Direct connections** off in the settings (**Online** page), then restart the game. Or create a file named `online_direct.txt` next to `Play SSBU.bat` (on Linux, next to `run.sh`) containing the word `off`. All your traffic then goes through the lobby, which gives your address to nobody.
+> To keep your address to yourself, turn **Direct connections** off in the settings (**Online** page), then restart the game. Or create a file named `online_direct.txt` next to `OpenSmash.exe` (on Linux, next to `run.sh`) containing the word `off`. All your traffic then goes through the lobby, which gives your address to nobody.
 
 Private rooms always go through the host.
 
@@ -252,7 +267,7 @@ If your internet provider uses carrier-grade NAT, or your router sits behind ano
 | The overlay stays on `connecting` | The host's address and port, that the host's game is still running, the host's firewall rule for incoming UDP, the router's port mapping, and whether the relay can be reached. |
 | `Netplay: no room on this network yet (still looking)` | Set to this network, the game hasn't heard a host of its version yet. Check that the host's game is hosting, that both PCs are on the same network (not a guest Wi-Fi that keeps devices apart), and that the host's **Direct connections** is on. With `SSBU_NET_LOG=1` the log names every room heard. |
 | `no answer from … - playing offline` | The lobby in `online_server.txt` hasn't answered for five seconds. Check the address with `python tools/ssbu_relay.py --probe <address>`. |
-| `Netplay: WindowSmash needs game 13.0.5: run the installer again` | Your game was built from another version of the game, by an older WindowSmash. Put the game's 13.0.5 update in your game folder and run `Install WindowSmash.bat` again: it sets the folder up again as 13.0.5, keeping your save and settings ([how](UPDATES.md#a-folder-built-from-another-version)). |
+| `Netplay: WindowSmash needs game 13.0.5: run the installer again` | Your game was built from another version of the game, by an older WindowSmash. Put the game's 13.0.5 update in your game folder and run `OpenSmash.exe` again: it sets the folder up again as 13.0.5, keeping your save and settings ([how](UPDATES.md#a-folder-built-from-another-version)). |
 | `Netplay: the host runs other mods` (or `another game version`, `another WindowSmash version`) | The lines under it say what differs: the mods only the room has, the ones you have in another copy, the ones only you have, or the code patches on one side only. Turn mods on or off on the settings' **Mods** page (or in the launcher) to match, and restart. |
 | Online, a room is missing from the list | Both players need the same lobby code (or none), and both overlays must say `Online`. The list refreshes every few seconds. |
 | Both are connected, but in different groups | Private-room names must match exactly. |
@@ -274,7 +289,7 @@ python tools/ssbu_relay.py --port 39420 --verbose
 ```
 
 1. Let incoming UDP 39420 through that machine's firewall, and any network firewall in front of it, and UDP 39430 too: the lobby's NAT port (`--nat-port`, the lobby's port + 10 unless given; `0` for none), where games compare their routers' ports for direct paths. ssbu-recomp's games on `--su-port` 39500 use 39510 (`--su-nat-port`).
-2. Every player puts the lobby's address in `online_server.txt` and starts the game with `Play SSBU.bat`.
+2. Every player puts the lobby's address in `online_server.txt` and starts the game with `OpenSmash.exe`.
 3. One player creates a Local Wireless room; the others pick it.
 
 `launchers\Join SSBU Netplay.bat` with the lobby's address works too; the room name then acts as the lobby code.
@@ -298,7 +313,7 @@ The lobby checks where messages come from, limits how fast each player can send,
 
 ## Rollback in Local Wireless rooms
 
-Started with `Play SSBU.bat` (or the launcher), a Local Wireless room's 1-on-1 match is played with rollback too, by default: the room is made and joined as usual (in the lobby, or in a private room), and as the match is set up the two games agree on rollback within 15 seconds, exactly as a [Quickplay match](#rollback-in-online-mode) does. The character screen, the stage and the results stay the room's own. When the other game has rollback off (or is an older build), or the room has three or four players, the match is played with the game's own netcode. The same switch turns it off: **Online > Rollback netcode** in the settings, or `SSBU_RB=0`.
+Started with `OpenSmash.exe` (or the launcher), a Local Wireless room's 1-on-1 match is played with rollback too when both players have turned it on: the room is made and joined as usual (in the lobby, or in a private room), and as the match is set up the two games agree on rollback within 15 seconds, exactly as a [Quickplay match](#rollback-in-online-mode) does. The character screen, the stage and the results stay the room's own. When the other game has rollback off (or is an older build), or the room has three or four players, the match is played with the game's own netcode. The same switch turns it on: **Online > Rollback netcode** in the settings (off by default).
 
 ## Rollback netplay through the lobby or a private room
 
@@ -335,7 +350,7 @@ The game server's log (`--nex-log`: `0` quiet, `1` each call, `2` every packet, 
 | `SSBU_NET_BIND` | Limit which address the built-in relay listens on; used by local tests. A relay on `127.0.0.1` announces its room to this PC's loopback only. |
 | `SSBU_NET_LAN=0` | Hosting, don't announce the room on the local network. |
 | `SSBU_NET_LAN_PORT`, `SSBU_NET_LAN_TEST=1` | Local tests: the announcements' port (default `39501`), and announcements to `127.0.0.1` only, the looking game listening there. |
-| `SSBU_NET_DIRECT=0` | Online, send all traffic through the lobby. `Play SSBU.bat` sets it when `online_direct.txt` says `off`. |
+| `SSBU_NET_DIRECT=0` | Online, send all traffic through the lobby. `OpenSmash.exe` sets it when `online_direct.txt` says `off`. |
 | `SSBU_NET_PROTOCOL=3` | Being tried out: join the lobby in netplay version 3, which has the [room browser and matchmaking](#room-browser-and-matchmaking-being-tried-out). A lobby of version 2 says no, and the game joins it in version 2. `2`, the default, is version 2 only. Without it, `online_protocol.txt` decides (`3` or `2`; the settings' **Online → Netplay version** writes it). Hosting a private room is always version 2. |
 | `SSBU_NET_UPNP=0` | Leave the router alone: no UPnP for a hosted room, and online no port mapping (UPnP, NAT-PMP, PCP) of the game's port. |
 | `SSBU_NET_TEST_NAT=1`..`4`, `SSBU_NET_TEST_BLOCK=<seconds>` | Local tests: a router simulated in the game, `1` one that keeps the port and lets in only what comes from where it sent, `2` one that changes ports for every destination (at random), `3` the same in turn, `4` one that lets in anything from an address it sent to; or cut direct paths that many seconds after the start. `SSBU_NET_TEST_UPNP=1`: that router forwards the game's port. `SSBU_NET_TEST_LEARN=0`: no address learnt from a player's hellos. `SSBU_NET_TEST_GATEWAY=<ip:port>`: the PCP / NAT-PMP gateway to ask (no UPnP). |
@@ -347,4 +362,4 @@ The game server's log (`--nex-log`: `0` quiet, `1` each call, `2` every packet, 
 | `SSBU_ONLINE_COUNTRY` | The country Online mode reports, as two letters such as `GB`. Default `US`. |
 | `SSBU_ONLINE_SERVER` | `off` turns Online mode off. Otherwise the game server's address inside the lobby, `10.13.0.1:60000` by default; only for tests. |
 
-Without a host or relay setting, the game stays offline. `launchers\Play SSBU Offline.bat` clears both; `Play SSBU.bat` takes the relay from `online_server.txt`; the host and join launchers set their own.
+Without a host or relay setting, the game stays offline. the launcher's Offline lobby setting clears both; `OpenSmash.exe` takes the relay from `online_server.txt`; the host and join launchers set their own.

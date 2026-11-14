@@ -108,8 +108,44 @@ static int rom_read(u64 at, void *buf, u64 size) {
 
 static HANDLE rom_file_open(const char *path) {
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
-    if (h == INVALID_HANDLE_VALUE) rt_fatal("cannot open the game's RomFS at %s", path);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* (the folder was moved or copied: romfs.cfg names its own files by their old full path. A file inside the
+         * old dump folder is looked for in this one's - "cannot find the path" after a move, 2026-11-03's report) */
+        const char *rest = NULL;
+        for (const char *s = path; (s = strstr(s, "dump")) != NULL; s += 4)
+            if ((s == path || s[-1] == '/' || s[-1] == '\\') && (s[4] == '/' || s[4] == '\\')) rest = s + 5;   /* (the last dump folder named) */
+        if (rest && !_strnicmp(rest, "modules", 7) && (rest[7] == '/' || rest[7] == '\\')) {   /* (only this folder's own dump\modules files: the game's files elsewhere are not guessed) */
+            char moved[1100];
+            snprintf(moved, sizeof moved, "%s/../%s", rt_data_dir, rest);
+            h = CreateFileA(moved, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+            if (h != INVALID_HANDLE_VALUE) fprintf(stderr, "[fs] romfs.cfg names %s, which is not there: using %s (the folder was moved)\n", path, moved);
+        }
+    }
+    if (h == INVALID_HANDLE_VALUE) rt_fatal("cannot open the game's RomFS at %s (moved the folder to another PC? run the installer there once)", path);
     return h;
+}
+
+/* romfs.unverified.txt beside romfs.cfg (tools/update.py): 16 KB blocks of the updated RomFS whose
+ * bytes could not be confirmed against the update's hashes, one "<block> <image offset>" line each
+ * (what each holds indented below it). A player's merged base left LoupeSubstance's model files
+ * wrong there, and the game crashed at boot with nothing to say why: every crash report now
+ * carries this line (host.c). Empty when there is no such file. */
+/* (rt_romfs_warning: host.c's, which every build links - a crash report reads it) */
+
+static void rom_unverified_note(void) {
+    char path[1100], line[512];
+    snprintf(path, sizeof path, "%s/romfs.unverified.txt", rt_data_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    unsigned blocks = 0;
+    while (fgets(line, sizeof line, f))
+        if (line[0] >= '0' && line[0] <= '9') blocks++;   /* (not "#" notes, nor the indented lines under a block) */
+    fclose(f);
+    if (!blocks) return;
+    snprintf(rt_romfs_warning, sizeof rt_romfs_warning,
+             "game data: %u blocks of 16 KB unconfirmed (dump/modules/romfs.unverified.txt) - the base had an update "
+             "merged in; a crash may come from them", blocks);
+    fprintf(stderr, "[fs] warning: %s\n", rt_romfs_warning);
 }
 
 /* romfs.cfg: "<file>\n<byte offset>\n" (the image in place in one file), or "layered\n<layer
@@ -191,6 +227,7 @@ static void rom_open(void) {
         rom.file = rom_file_open(path);
     }
     fclose(f);
+    rom_unverified_note();
     u64 h[10];
     if (!rom_read(0, h, sizeof h) || h[0] != 0x50) rt_fatal("%s: no RomFS image there", cfg);
     rom.dirs = malloc(h[4]);
@@ -1415,7 +1452,20 @@ HLE(_ZN2nn2fs15CreateDirectoryEPKc) {
     }
     char path[1024];
     host_path(path, sizeof path, m, rest);
-    c->x[0] = CreateDirectoryA(path, NULL) ? 0 : GetLastError() == ERROR_ALREADY_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND;
+    BOOL made = CreateDirectoryA(path, NULL);
+    if (!made && (GetLastError() == ERROR_PATH_NOT_FOUND || GetLastError() == ERROR_FILE_NOT_FOUND)) {   /* (POSIX: ENOENT, runtime/linux/win32.c) */
+        /* (its parents too: Skyline's create_dir_all makes only the last folder, so a plugin that
+         * writes under sd:/atmosphere/contents/<title>/ - skyline-web's pages - counts on a console
+         * SD card having the rest; here the SD card starts empty) */
+        for (char *p = strchr(path, '\\'); p; p = strchr(p + 1, '\\')) {
+            if (p == path || p[-1] == ':' || !p[1]) continue;
+            *p = 0;
+            CreateDirectoryA(path, NULL);
+            *p = '\\';
+        }
+        made = CreateDirectoryA(path, NULL);
+    }
+    c->x[0] = made ? 0 : GetLastError() == ERROR_ALREADY_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND;
 }
 HLE(_ZN2nn2fs15DeleteDirectoryEPKc) {
     const char *rest;
