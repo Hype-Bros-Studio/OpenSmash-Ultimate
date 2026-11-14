@@ -361,7 +361,20 @@ static void pseudo_device_id(Cpu *c) {
  * that aren't here: their dispatch entries get these when plugins load (plugin_shims). */
 static void show_application_error(Cpu *c) {   /* (ApplicationErrorArg: the dialog's text at 0x10, the full screen's at 0x810) */
     u64 arg = c->x[0];   /* (on the console the player closes it and the game goes on: a panic aborts by itself after) */
-    fprintf(stderr, "[skyline] a plugin showed an error: %.1000s\n  %.1500s\n", P(char, arg + 0x10), P(char, arg + 0x810));
+    char text[2][1600];
+    for (int t = 0; t < 2; t++) {   /* (UTF-8 as the SDK has it; some plugins' text is UTF-16: a letter, then 0) */
+        const u8 *src = P(u8, arg + (t ? 0x810 : 0x10));
+        int lim = t ? 1500 : 1000, n = 0, wide = src[0] && !src[1];
+        for (int i = 0; n < lim; i++) {
+            u8 ch = wide ? src[2 * i] : src[i];
+            if (!ch || (wide && src[2 * i + 1])) break;
+            text[t][n++] = (char)ch;
+        }
+        text[t][n] = 0;
+    }
+    fprintf(stderr, "[skyline] a plugin showed an error: %s\n  %s\n[skyline]   (the error's first bytes:", text[0], text[1]);
+    for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", *P(u8, arg + i));
+    fprintf(stderr, ")\n");
     fflush(stderr);
 }
 static void exit_application(Cpu *c) { (void)c; fprintf(stderr, "[skyline] a plugin exited the game\n"); fflush(stderr); ExitProcess(0); }
