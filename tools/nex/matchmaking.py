@@ -242,6 +242,7 @@ class Matchmaking:
         r(109, 41, self.find_by_gid)
         r(109, 49, self.find_by_gid)
         r(109, 48, self.find_by_gids)
+        r(109, 52, self.browse)
         r(109, 44, self.update_part)
         r(109, 55, self.arena_id)
         r(109, 56, self.arena_by_id)
@@ -544,6 +545,25 @@ class Matchmaking:
         now = datetime_now()
         for ms in found:
             ms.encode(out, now, conn.pid in ms.participants)
+        return out.get()
+
+    MAX_BROWSE = 50
+
+    def browse(self, conn, s):
+        """BrowseMatchmakeSessionNoHolderNoResultRange: one search criteria -> List<MatchmakeSession>
+        (Battle Arenas' arena list: the open gatherings that fit, newest first)."""
+        criteria = Criteria(read_levels_one(s))
+        part = conn.user.get("part")
+        found = [ms for ms in self.sessions.values()
+                 if ms.part == part and ms.open and conn.pid not in ms.participants and criteria.matches(ms, 1)]
+        found.sort(key=lambda ms: -ms.created)
+        found = found[:self.MAX_BROWSE]
+        self.info(f"{self.nex.name(conn)}: browse {criteria} -> {[ms.gid for ms in found]}")
+        out = StreamOut()
+        out.u32(len(found))
+        now = datetime_now()
+        for ms in found:
+            ms.encode(out, now, False)
         return out.get()
 
     def update_part(self, conn, s):
