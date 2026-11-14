@@ -142,6 +142,116 @@ static int recv_all(HmSock s, u8 *p, u64 n) {
     return 1;
 }
 
+/* ---- the pack's download, shown -----------------------------------------------------------
+ * The pack is fetched at the RomFS's opening, before the game has a window: a big pack took minutes
+ * with nothing on screen and nothing in the log (a player saw only a background process whose memory
+ * grew). So the fetch says how far it is in the log, and on Windows in a small window of its own
+ * (closing it stops the game). */
+static volatile u64 dl_got, dl_want;
+static volatile int dl_done;
+
+static void dl_text(char *t, size_t n) {
+    double got = (double)dl_got / (1 << 20), want = (double)dl_want / (1 << 20);
+    snprintf(t, n, "Getting the host's mods: %.0f of %.0f MB (%.0f%%)", got, want, want > 0 ? got * 100 / want : 0.0);
+}
+
+#ifdef _WIN32
+static LRESULT CALLBACK dl_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_TIMER) {
+        if (dl_done) { DestroyWindow(h); return 0; }
+        InvalidateRect(h, NULL, TRUE);
+        return 0;
+    }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT r;
+        GetClientRect(h, &r);
+        char t[200];
+        dl_text(t, sizeof t);
+        SetBkMode(dc, TRANSPARENT);
+        SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+        RECT tr = {16, 16, r.right - 16, 40};
+        DrawTextA(dc, t, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        RECT bar = {16, 52, r.right - 16, 72};
+        FrameRect(dc, &bar, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        if (dl_want) {
+            RECT fill = bar;
+            InflateRect(&fill, -2, -2);
+            fill.right = fill.left + (LONG)((double)(fill.right - fill.left) * (double)dl_got / (double)dl_want);
+            HBRUSH b = CreateSolidBrush(RGB(0, 120, 215));
+            FillRect(dc, &fill, b);
+            DeleteObject(b);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (msg == WM_CLOSE) {
+        if (dl_done) { DestroyWindow(h); return 0; }
+        fprintf(stderr, "[hostmods] the download window was closed: the game stops\n");
+        fflush(stderr);
+        ExitProcess(1);
+    }
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcA(h, msg, w, l);
+}
+
+static DWORD WINAPI dl_window(LPVOID unused) {
+    (void)unused;
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = dl_proc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+    wc.lpszClassName = "ssbu_hostmods_download";
+    RegisterClassA(&wc);
+    RECT r = {0, 0, 460, 90};
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&r, style, FALSE);
+    int w = r.right - r.left, hgt = r.bottom - r.top;
+    HWND h = CreateWindowExA(WS_EX_APPWINDOW, wc.lpszClassName, "Super Smash Bros. Ultimate (native) - host's mods", style,
+                             (GetSystemMetrics(SM_CXSCREEN) - w) / 2, (GetSystemMetrics(SM_CYSCREEN) - hgt) / 2, w, hgt,
+                             NULL, NULL, wc.hInstance, NULL);
+    if (!h) return 0;
+    ShowWindow(h, SW_SHOWNORMAL);
+    SetForegroundWindow(h);
+    SetTimer(h, 1, 250, NULL);
+    MSG m;
+    while (GetMessageA(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageA(&m); }
+    return 0;
+}
+#endif
+
+/* recv_all for the pack itself: its progress in the log every 10% (and in the window) */
+static int recv_pack(HmSock s, u8 *p, u64 n) {
+    dl_got = 0; dl_want = n; dl_done = 0;
+    fprintf(stderr, "[hostmods] getting the host's pack from the lobby: %.0f MB\n", (double)n / (1 << 20));
+    fflush(stderr);
+#ifdef _WIN32
+    const char *headless = getenv("SSBU_HEADLESS");
+    HANDLE t = headless && !strcmp(headless, "1") ? NULL : CreateThread(NULL, 0, dl_window, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+#endif
+    int tenth = 0, ok = 1;
+    while (n) {
+        int r = (int)recv(s, (char *)p, n > (1u << 20) ? (1 << 20) : (int)n, 0);
+        if (r <= 0) { ok = 0; break; }
+        p += r; n -= (u64)r;
+        dl_got += (u64)r;
+        int now = (int)(dl_got * 10 / dl_want);
+        if (now > tenth) {
+            tenth = now;
+            char line[200];
+            dl_text(line, sizeof line);
+            fprintf(stderr, "[hostmods] %s\n", line);
+            fflush(stderr);
+        }
+    }
+    dl_done = 1;
+    return ok;
+}
+
 static HmSock lobby_connect(char *why, size_t why_len) {
     const char *v = net_relay_address();
     char host[256];
@@ -214,7 +324,7 @@ static u8 *fetch_pack(const char *id, u64 *len, void *(*alloc)(u64), char *why, 
     if (!ok) snprintf(why, why_len, "the lobby (%s) has no pack service (an older lobby?)", net_relay_address());
     else if (!want) { ok = 0; snprintf(why, why_len, "no host has a pack up for that invite code (is the host's tools/hostmods.py serve running?)"); }
     else if (want > (8ull << 30) || !(buf = alloc(want))) { ok = 0; snprintf(why, why_len, "a pack of %llu bytes: no memory for it", (unsigned long long)want); }
-    else if (!recv_all(s, buf, want)) { ok = 0; snprintf(why, why_len, "the lobby stopped sending the pack"); }
+    else if (!recv_pack(s, buf, want)) { ok = 0; snprintf(why, why_len, "the lobby stopped sending the pack"); }
     hm_close(s);
     if (!ok) return NULL;   /* (buf: the pack's memory, left - the game is stopping) */
     *len = want;
