@@ -1810,6 +1810,9 @@ void skyline_load_plugins(Cpu *c) {
         line[strcspn(line, "\r\n#")] = 0;
         if (!*line) continue;
         u64 base = rt_load_nro_named(c, line);
+        if (!base && hostmods_on())   /* (the host's mods without a plugin they need would be vanilla here, and online a mismatch) */
+            rt_fatal("Host mods: the host's game runs the plugin %s, and neither this game nor the host's pack has it.\n"
+                     "The host can add it: tools/hostmods.py windows-plugins, then serve again.", line);
         if (!base) { fprintf(stderr, "[skyline] plugin %s is not recompiled into this build: left out\n", line); missing++; continue; }
         snprintf(names[count], sizeof names[count], "%s", line);
         bases[count++] = base;

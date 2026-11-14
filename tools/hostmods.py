@@ -612,6 +612,20 @@ def mod_plugin_modules(root, names):
     return out
 
 
+def pack_plugin_modules(root, listed):
+    """[(what, module)] for every plugin the host's game runs: the mods' own (mod_plugin_modules) and the framework
+    ones dump/skyline/plugins.txt names (ARCropolis, CSK, Smashline, ...), whose translated C is build/nro/<module>.
+    A player's game that has a module built in runs its own copy (runtime/host.c load_host_plugins)."""
+    out = mod_plugin_modules(root, listed)
+    have = {m for _, m in out}
+    for m in _cfg_lines(os.path.join(root, "dump", "skyline", "plugins.txt")):
+        m = m.split("#")[0].strip()
+        if m and m not in have and os.path.isdir(os.path.join(root, "build", "nro", m)):
+            out.append((f"plugin {m}", m))
+            have.add(m)
+    return out
+
+
 def pack_arcropolis(root, applied, with_plugins=True, open_pack=False):
     """The pack of a tree whose mods run through ARCropolis (version 4): no overlay - the players' games read their own
     data - and each mod folder ARCropolis lists (dump/skyline/mods.txt, in its order) whole, which their SD card's
@@ -629,7 +643,7 @@ def pack_arcropolis(root, applied, with_plugins=True, open_pack=False):
     if with_plugins:
         with open(os.path.join(root, "dump", "skyline", "plugins.txt"), "rb") as f:
             plugin_list = f.read()
-        for name, module in mod_plugin_modules(root, listed):
+        for name, module in pack_plugin_modules(root, listed):
             dll = os.path.join(root, "build", "plugins", module + ".dll")
             image = os.path.join(root, "dump", "modules", module + ".reloc.bin")
             if not os.path.isfile(dll):
@@ -723,7 +737,7 @@ def windows_plugins(root, jobs=4, log=print):
     flags = [*cc.base_cflags("x86-64-v2"), "/I", cc.RUNTIME]
     listed = _cfg_lines(os.path.join(root, "dump", "skyline", "mods.txt"))
     built = []
-    for name, module in mod_plugin_modules(root, listed):
+    for name, module in pack_plugin_modules(root, listed):
         src_dir = os.path.join(root, "build", "nro", module)
         work = os.path.join(root, "build", "plugins-win", module)
         os.makedirs(work, exist_ok=True)
@@ -770,7 +784,7 @@ def main(argv=None):
     sv.add_argument("--no-plugins", action="store_true", help="the data mods only (players use their own plugins)")
     sv.add_argument("--open", action="store_true", help="send the pack unsealed, with the mods' folders, so players can "
                     "save them (F1 > Online > Download host's mods): no deterrent at all")
-    wp = sub.add_parser("windows-plugins", help="build the ARCropolis mods' plugins for Windows players (build/plugins)")
+    wp = sub.add_parser("windows-plugins", help="build the host's plugins (the mods' and the framework ones in plugins.txt) for Windows players (build/plugins)")
     wp.add_argument("--tree", default=".", help="the port's folder (default: here)")
     wp.add_argument("-j", "--jobs", type=int, default=4, help="compiles at once (default 4)")
     o = ap.parse_args(argv)
