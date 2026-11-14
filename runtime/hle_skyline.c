@@ -303,9 +303,14 @@ static u64 cave_site(u64 at) {
     return 0;
 }
 
+int hostmods_on(void);   /* (hle_hostmods.c) */
 static void note_code_patch(u64 dest, u64 src, u64 n, u64 caller) {
     char path[1200], line[240], have[240];
     u64 at;
+    /* A host's plugins (host mods, memory only) leave nothing in this tree: their patches written here would be
+     * lifted into this game's own code by its next build, with those plugins gone (an older game's code with
+     * another mod set's patches in it: crashed at the next start, host mods or not). */
+    if (hostmods_on()) return;
     const char *by = rt_code_offset(caller, &at);
     snprintf(path, sizeof path, "%s/../skyline/patches.txt", rt_data_dir);
     for (u64 w = dest & ~3ull; w < dest + n; w += 4) {
