@@ -601,6 +601,32 @@ def write_if_changed(path, text):
     return True
 
 
+# The lifter's mode for this module (build: a Skyline plugin is lifted with every register in the context). lift.py
+# reads these when it is imported, and a pool's workers can come from a fork server that started for an earlier
+# module (Python 3.14's default on Linux), so each pool hands them over and each worker sets them again.
+_LIFT_ENV = ("SSBU_REGCACHE", "SSBU_DYNAMIC_JUMPS", "SSBU_FLAGS_XFER")
+
+
+def _lift_mode():
+    return {k: os.environ.get(k) for k in _LIFT_ENV}
+
+
+def _apply_lift_mode(mode):
+    import lift
+    for k, v in mode.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    lift.REGCACHE = os.environ.get("SSBU_REGCACHE", "1") != "0"
+    lift.DYNAMIC_JUMPS = os.environ.get("SSBU_DYNAMIC_JUMPS") == "1"
+
+
+def _init_mode(mode, args):
+    _apply_lift_mode(mode)
+    _init(*args)
+
+
 def _init(image_path, entries, base, forward, setjmp=None, pads=None, exact_callees=None, exact_callers=None,
           hookable=None, patches=None, inline=None):
     f = open(image_path, "rb")
@@ -970,7 +996,7 @@ def coverage(path, jobs):
     chunks = [funcs[i:i + step] for i in range(0, len(funcs), step)]
     ok = ok_insns = insns = bad = tables = tails = table_like = assumed = 0
     reasons, blocked, unresolved = Counter(), Counter(), []
-    with Pool(jobs, _init, (image_file(mod), set(found), base_of(path), {})) as pool:
+    with Pool(jobs, _init_mode, (_lift_mode(), (image_file(mod), set(found), base_of(path), {}))) as pool:
         for r in pool.imap_unordered(_cover, chunks):
             ok += r[0]; ok_insns += r[1]; insns += r[2]; bad += r[3]
             reasons.update(r[4]); blocked.update(r[5])
@@ -1138,6 +1164,7 @@ def build(path, outdir, jobs, per_file, imports=None):
         os.environ["SSBU_REGCACHE"] = "0"
         os.environ["SSBU_DYNAMIC_JUMPS"] = "1"
         os.environ["SSBU_FLAGS_XFER"] = "1"
+        _apply_lift_mode(_lift_mode())
     try:
         _build(mod, found, funcs, path, outdir, jobs, per_file, imports)
     finally:
@@ -1148,6 +1175,7 @@ def build(path, outdir, jobs, per_file, imports=None):
                 del os.environ["SSBU_REGCACHE"]
             else:
                 os.environ["SSBU_REGCACHE"] = regcache_was
+            _apply_lift_mode(_lift_mode())
 
 
 def plugin_modules():
@@ -1209,8 +1237,8 @@ def _build(mod, found, funcs, path, outdir, jobs, per_file, imports):
     defined = {a for a, _ in funcs}
     missing, manifest, bad, unresolved, problems = set(), [], 0, [], []
     inline = set(inline_points(name)) & {pc for a, size in funcs for pc in range(a, a + size, 4)}
-    with Pool(jobs, _init, (image_file(mod), set(found), base, forward, setjmp, pads, exact_callees, exact_callers,
-                            slots, patches, inline)) as pool:
+    with Pool(jobs, _init_mode, (_lift_mode(), (image_file(mod), set(found), base, forward, setjmp, pads, exact_callees,
+                                                exact_callers, slots, patches, inline))) as pool:
         tasks = [(i, c, outdir) for i, c in enumerate(chunks)]
         done, total, started, last = 0, max(1, len(tasks)), time.time(), 0.0
         for fname, ext, insns, biggest, b, unres, probs in pool.imap_unordered(_emit, tasks):
