@@ -117,6 +117,8 @@ So the pack carries what ARCropolis reads there:
 - `mods:/` as the host's game sees it (the `SSBUHMI1` index);
 - the host's `plugins.txt`, and for each mod's `plugin.nro` its Windows build, `build/plugins/<module>.dll` with `dump/modules/<module>.reloc.bin`. The module comes from the NRO's build id (`dump/skyline/plugins.json`).
 
+A Linux host builds those DLLs with `tools/hostmods.py windows-plugins` (`-j4` by default). It compiles each listed plugin's translated C (`build/nro/<module>`) for Windows, for any x86-64-v2 processor, into `build/plugins-win/<module>`, and links `build/plugins/<module>.dll`. That takes the system's `clang-cl` and `lld-link` with Microsoft's C runtime and Windows SDK in `deps/msvc`. `tools/msvc_deps.py install` sets that up after you accept Microsoft's license. Off Windows it unpacks the SDK with msitools' `msiextract` (`sudo pacman -S msitools`) and adds lower-case links for the headers and libraries, since the Linux file system minds case.
+
 On the player's side, `hle_fs.c` serves `sd:/ultimate/mods` from the pack in memory (`hostmods_sd_entry`/`hostmods_sd_list`), read only.
 ARCropolis, run from the host's plugin list, reads it there. The `plugin.nro` files it chainloads run as the pack's DLLs (Windows), matched by build id.
 On Linux they run as the game's own built-in copies, where it has them: a Linux player of a pack whose plugins are all Windows builds gets a log line, not a stop.

@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import subprocess
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 
 import codec_libs   # (this folder, which every importer of cc puts on sys.path)
@@ -27,6 +28,9 @@ def _deps_record(folder):
         return None
 
 
+CROSS = os.name != "nt"   # (cross-building off Windows: the system's clang-cl with deps/msvc)
+
+
 def _find_toolchain():
     """(clang-cl, the /winsysroot folder or None, which toolchain that is, in words):
     SSBU_CLANG if set; else deps\\llvm's with deps\\msvc as the system root, when tools/msvc_deps.py
@@ -36,6 +40,9 @@ def _find_toolchain():
     if os.environ.get("SSBU_CLANG"):
         return os.environ["SSBU_CLANG"], None, "SSBU_CLANG"
     llvm, msvc = _deps_record(DEPS_LLVM), _deps_record(DEPS_MSVC)
+    if CROSS and msvc is not None:   # (cross-building off Windows: the system's clang-cl)
+        return (shutil.which("clang-cl") or "clang-cl", DEPS_MSVC,
+                f"clang-cl on the PATH with deps/msvc (MSVC {msvc.get('msvc')}, Windows SDK {msvc.get('sdk')})")
     clang = os.path.join(DEPS_LLVM, "bin", "clang-cl.exe")
     if llvm is not None and msvc is not None and os.path.isfile(clang):
         return clang, DEPS_MSVC, (f"deps\\llvm (LLVM {llvm.get('version')}) with deps\\msvc (MSVC {msvc.get('msvc')}, "
@@ -86,7 +93,8 @@ GAME_CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
 # hides this).
 def link_flags(root):
     """(LINK_FLAGS, LINK_OPTIONS) for a system root, or for None."""
-    lld = ["-fuse-ld=lld"] if os.path.exists(os.path.join(os.path.dirname(CLANG), "lld-link.exe")) else []
+    here = os.path.dirname(shutil.which(CLANG) or CLANG)
+    lld = ["-fuse-ld=lld"] if any(os.path.exists(os.path.join(here, n)) for n in ("lld-link.exe", "lld-link")) else []
     return (lld + (["/winsysroot", root] if root else []), ["/winsysroot:" + root] if root else [])
 
 
@@ -173,6 +181,9 @@ def compile_command(src, obj, opt, flags=None, header=None):
     """The command compile_each compiles a file with (and what objcache.py keys its object on);
     flags: CFLAGS unless given (GAME_CFLAGS for the generated C); header: the ladder's optnone header,
     given before the file (/FI), when it has one."""
+    if CROSS:   # (off Windows a path starts with '/', which clang-cl would read as an option)
+        return [CLANG, "/c", opt, *(CFLAGS if flags is None else flags), NO_CRASH_FILES, *(["/FI" + header] if header else []),
+                "/Fo" + obj, "--", src]
     return [CLANG, "/c", opt, *(CFLAGS if flags is None else flags), NO_CRASH_FILES, *(["/FI" + header] if header else []),
             src, "/Fo" + obj]
 

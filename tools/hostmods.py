@@ -691,6 +691,56 @@ def _exact(s, n):
     return buf
 
 
+def windows_plugins(root, jobs=4, log=print):
+    """build/plugins/<module>.dll for each mod plugin ARCropolis lists (dump/skyline/mods.txt): its translated C
+    (build/nro/<module>) compiled for Windows, as the Windows game does (tools/skyline.py cache_mod_plugins), here
+    also off Windows (tools/cc.py: clang-cl with deps/msvc, from tools/msvc_deps.py install). For any x86-64-v2
+    processor, whatever the players' builds take. Returns the modules built."""
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+    import cc
+    import skyline
+    if not cc.WINSYSROOT and os.name != "nt":
+        raise Error("no Windows C runtime and SDK here: tools/msvc_deps.py install (Microsoft's license) first")
+    flags = [*cc.base_cflags("x86-64-v2"), "/I", cc.RUNTIME]
+    listed = _cfg_lines(os.path.join(root, "dump", "skyline", "mods.txt"))
+    built = []
+    for name, module in mod_plugin_modules(root, listed):
+        src_dir = os.path.join(root, "build", "nro", module)
+        work = os.path.join(root, "build", "plugins-win", module)
+        os.makedirs(work, exist_ok=True)
+        srcs = sorted(n for n in os.listdir(src_dir) if n.endswith(".c"))
+        if not srcs:
+            raise Error(f"build/nro/{module} has no C: start the game once with {name} on")
+        bind = os.path.join(work, "_bind.c")
+        with open(bind, "w", encoding="utf-8", newline="\n") as f:
+            f.write(skyline._BIND.format(name=module))
+        jobs_list = [(os.path.join(src_dir, n), os.path.join(work, n[:-2] + ".obj"),
+                      "/O1" if n == "g_module.c" or os.path.getsize(os.path.join(src_dir, n)) > (8 << 20) else "/O2")
+                     for n in srcs] + [(bind, os.path.join(work, "_bind.obj"), "/O1")]
+        def one(job):
+            src, obj, opt = job
+            if os.path.isfile(obj) and os.path.getmtime(obj) >= os.path.getmtime(src) and src != bind:
+                return None
+            r = subprocess.run(cc.compile_command(src, obj, opt, flags), capture_output=True, text=True)
+            return f"{os.path.basename(src)}:\n{(r.stdout + r.stderr)[-1500:]}" if r.returncode else None
+        log(f"{module}: compiling {len(jobs_list)} files")
+        with ThreadPoolExecutor(max(1, jobs)) as ex:
+            errors = [e for e in ex.map(one, jobs_list) if e]
+        if errors:
+            raise Error(f"{module} did not compile:\n" + "\n".join(errors[:3]))
+        out = os.path.join(root, "build", "plugins")
+        os.makedirs(out, exist_ok=True)
+        dll = os.path.join(out, module + ".dll")
+        try:
+            cc.link_library([j[1] for j in jobs_list], dll)
+        except RuntimeError as e:
+            raise Error(f"{module} did not link: {e}")
+        log(f"{module}: build/plugins/{module}.dll ({os.path.getsize(dll):,} bytes)")
+        built.append(module)
+    return built
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -702,10 +752,17 @@ def main(argv=None):
     sv.add_argument("--no-plugins", action="store_true", help="the data mods only (players use their own plugins)")
     sv.add_argument("--open", action="store_true", help="send the pack unsealed, with the mods' folders, so players can "
                     "save them (F1 > Online > Download host's mods): no deterrent at all")
+    wp = sub.add_parser("windows-plugins", help="build the ARCropolis mods' plugins for Windows players (build/plugins)")
+    wp.add_argument("--tree", default=".", help="the port's folder (default: here)")
+    wp.add_argument("-j", "--jobs", type=int, default=4, help="compiles at once (default 4)")
     o = ap.parse_args(argv)
     try:
         if o.cmd == "code":
             print(new_code())
+            return 0
+        if o.cmd == "windows-plugins":
+            built = windows_plugins(o.tree, o.jobs)
+            print(f"built {len(built)} plugin(s) for Windows")
             return 0
         code = o.code or new_code()
         plain, mods, plugins = pack_tree(o.tree, not o.no_plugins, o.open)

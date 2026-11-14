@@ -281,7 +281,8 @@ class InstallFlowTests(unittest.TestCase):
 
     def run_install(self, answer, accept=False, records=(None, None), agreed=None):
         calls = []
-        with mock.patch.object(msvc_deps, 'read_record', side_effect=lambda folder: records[folder == msvc_deps.MSVC_DIR]), \
+        with mock.patch.object(msvc_deps, 'CROSS', False), \
+                mock.patch.object(msvc_deps, 'read_record', side_effect=lambda folder: records[folder == msvc_deps.MSVC_DIR]), \
                 mock.patch.object(msvc_deps, 'read_channel', return_value=self.CHANNEL), \
                 mock.patch.object(msvc_deps, 'download', side_effect=AssertionError('downloaded')), \
                 mock.patch.object(msvc_deps, 'install_llvm', side_effect=lambda keep: calls.append('llvm') or self.LLVM), \
@@ -340,6 +341,7 @@ class ToolchainChoiceTests(unittest.TestCase):
     def choose(self, env=None):
         env = {'ProgramFiles': self.no_vs, 'ProgramFiles(x86)': self.no_vs, **(env or {})}
         with mock.patch.object(cc, 'DEPS_LLVM', self.llvm), mock.patch.object(cc, 'DEPS_MSVC', self.msvc), \
+                mock.patch.object(cc, 'CROSS', False), \
                 mock.patch.dict(os.environ, env):
             if 'SSBU_CLANG' not in env:
                 os.environ.pop('SSBU_CLANG', None)

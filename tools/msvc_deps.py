@@ -56,6 +56,7 @@ sys.path.insert(0, TOOLS)   # (for cc's test build, also under a Python that doe
 ROOT = os.path.dirname(TOOLS)
 DEPS = os.path.join(ROOT, "deps")
 LLVM_DIR = os.path.join(DEPS, "llvm")
+CROSS = os.name != "nt"   # (off Windows: for cross-building, with the system's clang-cl and lld-link)
 MSVC_DIR = os.path.join(DEPS, "msvc")
 DOWNLOADS = os.path.join(DEPS, "downloads")
 RECORD = "windowsmash.json"   # in each folder, written last (cc.py reads it too)
@@ -577,6 +578,14 @@ def msi_log_error(logfile):
 def run_msiexec(msi, target, logfile):
     """msiexec's administrative install of an .msi: its files into target, as they lie in it.
     One installation runs at a time on Windows (1618): wait for another for up to two minutes."""
+    if CROSS:   # (elsewhere: msitools' msiextract, which reads the .cab files beside it too)
+        tool = shutil.which("msiextract")
+        if not tool:
+            raise Failed("unpacking the Windows SDK off Windows takes msiextract (msitools: e.g. sudo pacman -S msitools)")
+        r = subprocess.run([tool, "-C", target, msi], capture_output=True, text=True, cwd=os.path.dirname(msi))
+        if r.returncode:
+            raise Failed(f"msiextract could not unpack {os.path.basename(msi)}:\n{(r.stdout + r.stderr)[-1500:]}")
+        return
     line = f'msiexec.exe /a "{msi}" /qn /norestart TARGETDIR="{target}" /L*v "{logfile}"'
     for attempt in range(7):
         code = subprocess.run(line).returncode
@@ -603,7 +612,7 @@ def install_msvc(channel, keep_downloads=False):
     # the C runtime's .vsix packages (zips with Contents\VC\Tools\MSVC\<version>\...) and the Windows
     # SDK's .msi files, then the .cab files those name (msiexec /a reads them from beside the .msi)
     def local(p):
-        return os.path.join(work, os.path.basename(payload_name(p)))
+        return os.path.join(work, payload_name(p).replace("\\", "/").split("/")[-1])
     first = vc + msis
     log(f"  downloading Microsoft's C runtime ({len(vc)} packages) and Windows SDK {sdk_version} ({len(msis)} .msi files) "
         f"from {first[0]['url'].split('/')[2]}")
@@ -627,6 +636,8 @@ def install_msvc(channel, keep_downloads=False):
         sdk_folder = collect_sdk(unpacked, partial)
     finally:
         shutil.rmtree(unpacked, ignore_errors=True)
+    if CROSS:
+        case_links(partial)
     check_msvc(partial, folder, sdk_folder)
     record = {"what": "Microsoft's C runtime and Windows SDK (x64)", "channel": CHANNEL_URL,
               "visual_studio": channel["version"], "msvc": folder, "sdk": sdk_folder,
@@ -672,6 +683,8 @@ def collect_sdk(unpacked, root):
         for n in names:
             src = os.path.join(d, n)
             rel = os.path.relpath(src, unpacked).replace(os.sep, "/")
+            if "/Windows Kits/" in "/" + rel:   # (msiextract puts it below Program Files)
+                rel = rel[rel.index("Windows Kits/"):]
             if sdk_member(rel):
                 out = os.path.join(root, *rel.split("/"))
                 os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -699,6 +712,48 @@ def check_msvc(root, folder, sdk_folder):
         missing += [lib for lib in ("libucrt.lib", "kernel32.lib", "uuid.lib", *cc.SYSTEM_LIBS) if lib.lower() not in libs]
     if missing:
         raise Failed("Microsoft's packages lacked " + ", ".join(missing))
+
+
+def case_links(root):
+    """Off Windows the file system minds case, and the SDK's headers and the libraries' names do not:
+    links for each #include "x" or <x> that only matches a file in another case, and a lower-case
+    link for each library (lld-link looks for the name as written, e.g. Kernel32.lib)."""
+    files = {}
+    for d, _dirs, names in os.walk(root):
+        for n in names:
+            files.setdefault(d, {})[n.lower()] = n
+    made = 0
+    def link(d, want, have):
+        nonlocal made
+        dst = os.path.join(d, want)
+        if not os.path.lexists(dst):
+            os.symlink(have, dst)
+            made += 1
+    inc = re.compile(rb'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
+    dirs = [d for d in files if os.sep + "include" in d.lower() + os.sep]
+    for d in dirs:
+        for n in list(files[d].values()):
+            if not n.lower().endswith((".h", ".hpp", ".inl", "")) or os.path.islink(os.path.join(d, n)):
+                continue
+            try:
+                with open(os.path.join(d, n), "rb") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for m in inc.finditer(text):
+                name = m.group(1).decode("latin-1").replace("\\", "/")
+                if "/" in name:
+                    continue
+                for e in dirs:
+                    have = files[e].get(name.lower())
+                    if have and have != name:
+                        link(e, name, have)
+                        files[e][name.lower()] = have
+    for d, names in files.items():   # (and a lower-case name for each header and library: <windows.h>, kernel32.lib)
+        for low, n in list(names.items()):
+            if n != low and (low.endswith(".lib") or d in dirs):
+                link(d, low, n)
+    log(f"  {made} case links for the headers and libraries")
 
 
 def test_build():
@@ -778,6 +833,10 @@ def install(accept=False, keep_downloads=False, agreed=None):
         log("Not accepted: nothing was downloaded.")
         return 2
     t0 = time.time()
+    if CROSS:   # (cross-building off Windows: the system's clang-cl and lld-link)
+        msvc = install_msvc(channel, keep_downloads) if channel else read_record(MSVC_DIR)
+        log(f"Done in {time.time() - t0:.0f} s: {msvc['disk_bytes'] / 1e6:.0f} MB in deps/msvc (for the system's clang-cl).")
+        return 0
     with ThreadPoolExecutor(1) as other:
         llvm = other.submit(install_llvm, keep_downloads)
         msvc = install_msvc(channel, keep_downloads) if channel else read_record(MSVC_DIR)
