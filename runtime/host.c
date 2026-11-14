@@ -1100,11 +1100,11 @@ static void load_host_plugins(void) {
         char why[256];
         MemDll *dll = memdll_load(lib, (size_t)lib_len, why, sizeof why);
         if (!dll) rt_fatal("host mods: the host's plugin %s didn't load: %s", name, why);
-        void (*bind)(GuestFn *(*)(u64), GuestFn *(*)(u64, RtCache *), void (*)(Cpu *, u64, const char *)) =
-            (void *)memdll_proc(dll, "ssbu_plugin_bind");
+        void (*bind)(GuestFn *(*)(u64), GuestFn *(*)(u64, RtCache *), void (*)(Cpu *, u64, const char *),
+                     void (*)(Cpu *, u32)) = (void *)memdll_proc(dll, "ssbu_plugin_bind");
         const RtModule *(*modfn)(void) = (void *)memdll_proc(dll, "ssbu_plugin_module");
         if (!bind || !modfn) rt_fatal("host mods: the host's plugin %s has no plugin entry", name);
-        bind(rt_lookup, rt_lookup_cached, rt_trap);
+        bind(rt_lookup, rt_lookup_cached, rt_trap, rt_svc);   /* (its svcs: smashline's unwinder asks svcQueryMemory) */
         const RtModule *mod = modfn();
         if (!mod || strcmp(mod->name, name)) rt_fatal("host mods: the host's plugin %s isn't the module it says", name);
         if (nro_linked(mod)) {   /* (this game has it built in: that copy runs) */
