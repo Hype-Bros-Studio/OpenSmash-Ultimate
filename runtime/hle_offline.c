@@ -56,8 +56,37 @@ HLE(_ZN2nn5album21CloseAlbumMovieStreamENS0_17MovieStreamHandleE) NOTHING
  * SSBU_BCAT_DIR=<folder> stands for the delivery cache: <folder>/<directory>/<file>. Without it
  * the cache cannot be mounted, as on a console that never synced. Every name the game asks for is
  * logged ([bcat]) - the Online Tourney's schedule arrives this way. */
-#include <dirent.h>
 #include <sys/stat.h>
+#ifdef _WIN32   /* (no dirent.h on Windows: the little of it used here, over FindFirstFile) */
+#include <windows.h>
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+struct dirent { char d_name[MAX_PATH]; };
+typedef struct { HANDLE h; WIN32_FIND_DATAA fd; int first; struct dirent e; } DIR;
+static DIR *opendir(const char *path) {
+    char pat[1100];
+    snprintf(pat, sizeof pat, "%s/*", path);
+    DIR *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->h = FindFirstFileA(pat, &d->fd);
+    if (d->h == INVALID_HANDLE_VALUE) { free(d); return NULL; }
+    d->first = 1;
+    return d;
+}
+static struct dirent *readdir(DIR *d) {
+    if (!d->first && !FindNextFileA(d->h, &d->fd)) return NULL;
+    d->first = 0;
+    snprintf(d->e.d_name, sizeof d->e.d_name, "%s", d->fd.cFileName);
+    return &d->e;
+}
+static void closedir(DIR *d) { FindClose(d->h); free(d); }
+#else
+#include <dirent.h>
+#endif
 #define R_BCAT_NOT_FOUND RESULT(122, 1)
 
 static const char *bcat_root(void) {
