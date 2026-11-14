@@ -586,6 +586,10 @@ class RuntimeRomfs(unittest.TestCase):
             plain = self.arc_pack(data, vmap, sources, folders)
             self.assertLess(len(plain), 2 * len(big))   # (the copy is a reference)
             self.assertEqual(hm.parse_plain(plain)["folders"], folders)
+            with open(vmap, "ab") as f:   # (this game's data laid out otherwise than the host's: ARCropolis reads it as it is)
+                f.write(b"!")
+            with open(sources[1], "ab") as f:
+                f.write(b"!")
             code = hm.new_code()
             sealed = hm.seal(code, plain, chunk=4096)
             kept = os.path.join(d, "hostmods_cache")

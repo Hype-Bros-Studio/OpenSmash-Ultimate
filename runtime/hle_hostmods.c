@@ -1074,6 +1074,13 @@ static void load(void) { InitOnceExecuteOnce(&hm_once, hm_load, NULL, NULL); }
 void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n, const u8 **map, u64 *map_len,
                     const u8 **overlay, u64 *overlay_len) {
     load();
+    if (hm.arcropolis) {
+        /* (no map or overlay of the host's: ARCropolis lays the mods over this game's own data as it is laid out
+         * here - a dump of the same game can be base + update or one data.arc, of other sizes and another map) */
+        *map = NULL; *map_len = 0;
+        *overlay = NULL; *overlay_len = 0;
+        return;
+    }
     FILE *f = fopen(vanilla_map, "rb");
     if (!f) rt_fatal("host mods: cannot read %s", vanilla_map);
     HmSha256 s;
