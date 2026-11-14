@@ -154,12 +154,13 @@ static void rom_unverified_note(void) {
  * With host mods (SSBU_HOST_MODS, hle_hostmods.c) the game's own data (romfs_vanilla.cfg, else
  * romfs.cfg) is read through the host's modded layer map, its overlay a source in memory. */
 int hostmods_on(void);
-int hostmods_mods_entry(const char *rest, const u8 **data, u64 *size);
+int hostmods_mods_entry(const char *rest, u64 *ref, u64 *size);
+int hostmods_read(u64 ref, u64 off, void *buf, u64 n);
 int hostmods_mods_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx);
 void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n, const u8 **map, u64 *map_len,
                     const u8 **overlay, u64 *overlay_len);
 int hostmods_arcropolis(void);
-int hostmods_sd_entry(const char *rest, const u8 **data, u64 *size);
+int hostmods_sd_entry(const char *rest, u64 *ref, u64 *size);
 int hostmods_sd_list(const char *rest, void (*add)(void *, const char *, size_t, int, u64), void *ctx);
 static void rom_open(void) {
     char cfg[1024], path[1024];
@@ -279,7 +280,7 @@ typedef struct Handle {
     u32 mount;                /* the mount's id */
     HANDLE host;              /* host file */
     u64 offset, size;         /* rom file: data offset in the RomFS image and length */
-    const u8 *mem;            /* a file in memory (the host's mods:/ under host mods): its bytes, `size` long */
+    u64 hm;                   /* a file of the host's mods (mods:/, the SD card's ultimate/mods): hostmods_read's ref, `size` long */
     char **names; u8 *types; u64 *sizes; i64 count, next;   /* directory listing */
 } Handle;
 static Handle handles[512];
@@ -1266,9 +1267,8 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
         if (r || !type) { c->x[0] = r ? r : R_PATH_NOT_FOUND; return; }
         st32(c->x[0], type == 2 ? DIR_ENTRY : FILE_ENTRY);
     } else if (host_mods_mount(m) || host_sd_mods(m, rest, &sub)) {
-        const u8 *data;
-        u64 size;
-        int e = host_mods_mount(m) ? hostmods_mods_entry(rest, &data, &size) : hostmods_sd_entry(sub, &data, &size);
+        u64 ref, size;
+        int e = host_mods_mount(m) ? hostmods_mods_entry(rest, &ref, &size) : hostmods_sd_entry(sub, &ref, &size);
         if (!e) { c->x[0] = R_PATH_NOT_FOUND; return; }
         st32(c->x[0], e == 2 ? DIR_ENTRY : FILE_ENTRY);
     } else {
@@ -1315,23 +1315,21 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         c->x[0] = 0;
         return;
     } else if (host_mods_mount(m)) {
-        const u8 *data;
-        u64 size;
-        if (hostmods_mods_entry(rest, &data, &size) != 1) { c->x[0] = R_PATH_NOT_FOUND; return; }
+        u64 ref = 0, size;
+        if (hostmods_mods_entry(rest, &ref, &size) != 1) { c->x[0] = R_PATH_NOT_FOUND; return; }
         if (mode & OPEN_WRITE) { c->x[0] = R_UNSUPPORTED; return; }
-        if (!data && size) {   /* (a big file: the pack has its name, not its bytes) */
+        if (!ref && size) {   /* (a big file: the pack has its name, not its bytes) */
             fprintf(stderr, "[fs] mods:/%s: the host's pack doesn't carry this file's bytes\n", rest + strspn(rest, "/"));
             c->x[0] = R_PATH_NOT_FOUND;
             return;
         }
-        h.mem = data;
+        h.hm = ref;
         h.size = size;
-    } else if (host_sd_mods(m, rest, &sub)) {   /* (the host's mod folders: in memory, read only) */
-        const u8 *data;
-        u64 size;
-        if (hostmods_sd_entry(sub, &data, &size) != 1) { c->x[0] = R_PATH_NOT_FOUND; return; }
+    } else if (host_sd_mods(m, rest, &sub)) {   /* (the host's mod folders: from its pack, read only) */
+        u64 ref = 0, size;
+        if (hostmods_sd_entry(sub, &ref, &size) != 1) { c->x[0] = R_PATH_NOT_FOUND; return; }
         if (mode & OPEN_WRITE) { c->x[0] = R_UNSUPPORTED; return; }
-        h.mem = data;
+        h.hm = ref;
         h.size = size;
     } else {
         char path[1024];
@@ -1358,7 +1356,7 @@ static u64 read_at(Handle *h, i64 offset, void *buf, u64 size) {
     if (offset < 0 || (u64)offset > total) return ~0ull;
     if (size > total - (u64)offset) size = total - (u64)offset;
     if (!size) return 0;
-    if (h->mem) { rb_guest_writing(buf, size); memcpy(buf, h->mem + offset, size); return size; }
+    if (h->hm) { rb_guest_writing(buf, size); return hostmods_read(h->hm, (u64)offset, buf, size) ? size : ~0ull; }
     int ok = h->host ? pread_all(h->host, (u64)offset, buf, size) : rom_read(h->offset + (u64)offset, buf, size);
     return ok ? size : ~0ull;
 }

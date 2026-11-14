@@ -1,8 +1,8 @@
 /* Host-only mods (docs/HOST_MODS.md): with SSBU_HOST_MODS=<invite code>, the game's mods are the
  * room host's, sealed with that code and fetched from the lobby (tools/hostmods.py serve,
- * tools/hostmods_depot.py). The pack is opened in memory and stays there: the RomFS reads the
+ * tools/hostmods_depot.py). The pack is opened (see below for where it is kept): the RomFS reads the
  * overlay out of it (hle_fs.c), the online mod set is its mods' names and hashes (net_relay.c),
- * and nothing of it is written to disk by the runtime. (Not an HLE of anything: named hle_ so
+ * and nothing of it is written to disk in plain by the runtime. (Not an HLE of anything: named hle_ so
  * every build's runtime file pattern takes it.)
  *
  * A pack of version 2 also has the host's Skyline plugin list and its mods' plugins, translated
@@ -23,9 +23,14 @@
  * run as their Windows builds from the pack (host.c load_host_plugins, matched by build id) or as this
  * game's own built-in copies.
  *
- * The sealed pack as it came is kept in hostmods_cache/<id>.bin beside mods/ (still sealed: the code
+ * A pack of version 5 is a version 4 one whose files that are the same as an earlier file are sent once.
+ *
+ * The sealed pack is written to hostmods_cache/<id>.bin beside mods/ as it comes (still sealed: the code
  * opens it), with <id>.sum the depot's size and sha256 of it; the next start asks the lobby for those
- * (SUM) and reads the file instead of fetching a pack it has. SSBU_HOST_MODS_CACHE=0: no cache.
+ * (SUM) and uses the file instead of fetching a pack it has. The game reads the host's files out of that
+ * file as it needs them, opening only the chunks they lie in (pv_read): a pack of gigabytes isn't held in
+ * memory. SSBU_HOST_MODS_CACHE=0: no cache, and the pack is fetched into memory and played from there
+ * (as an open pack always is).
  *
  * A deterrent, not protection: the code, the key and the plain mods (plugins too) are in this
  * process's memory while it runs. An open pack is no deterrent at all. */
@@ -77,11 +82,19 @@ static struct {
     struct HmPlugin { char name[128]; const u8 *lib, *image; u64 lib_len, image_len; } *plugins;
     u32 other_os_plugins;      /* the host's plugins for other systems only */
     int open;                  /* an open pack (not sealed) */
-    const u8 *folders; u32 nfolders;   /* (version 3) the mods' folders, as in the pack */
-    struct HmModsFile { const char *path; u32 path_len; u64 size; const u8 *data; u32 data_len; } *mods_files;
+    const u8 *folders; u32 nfolders;   /* (version 3) the mods' folders, as in the pack (in memory only: NULL from disk) */
+    u64 folders_at;                    /* (their place in the plain pack) */
+    /* a file's bytes: `at`, their place in the plain pack (hm_read) */
+    struct HmModsFile { const char *path; u32 path_len; u64 size; u64 at; u32 data_len; } *mods_files;
     u32 nmods_files; int mods_index;   /* (the pack's last section, when there) mods:/ as the host's game sees it */
     int arcropolis;                    /* (version 4) the folders are the SD card's ultimate/mods */
+    int refs;                          /* (version 5) a folder's file may be "the same bytes as an earlier one" */
     struct HmModsFile *sd; u32 nsd;    /* their files as "<folder>/<path>", sorted without case (hm_build_sd) */
+    u64 plain;                         /* the plain pack's size */
+    /* the pack read from its kept file as the game asks (hm_read), not held in memory: a sealed pack, when the
+     * cache is on. Its 1 MiB chunks are opened one by one (their tags checked), the last few kept. */
+    FILE *file; u32 chunk; u64 nchunks; u8 key[32], head[HM_HEAD + 1];
+    char cache[1100], id[21];
 } hm;
 
 /* The system a pack's plugin was built for (tools/hostmods.py PLUGIN_OS) */
@@ -223,8 +236,10 @@ static DWORD WINAPI dl_window(LPVOID unused) {
 }
 #endif
 
-/* recv_all for the pack itself: its progress in the log every 10% (and in the window) */
-static int recv_pack(HmSock s, u8 *p, u64 n) {
+/* recv_all for the pack itself: its progress in the log every 10% (and in the window); into memory at p, or
+ * (p NULL) written to out as it comes. */
+static int recv_pack(HmSock s, u8 *p, FILE *out, u64 n) {
+    static u8 slab[1 << 20];
     dl_got = 0; dl_want = n; dl_done = 0;
     fprintf(stderr, "[hostmods] getting the host's pack from the lobby: %.0f MB\n", (double)n / (1 << 20));
     fflush(stderr);
@@ -235,9 +250,11 @@ static int recv_pack(HmSock s, u8 *p, u64 n) {
 #endif
     int tenth = 0, ok = 1;
     while (n) {
-        int r = (int)recv(s, (char *)p, n > (1u << 20) ? (1 << 20) : (int)n, 0);
+        int r = (int)recv(s, (char *)(p ? p : slab), n > (1u << 20) ? (1 << 20) : (int)n, 0);
         if (r <= 0) { ok = 0; break; }
-        p += r; n -= (u64)r;
+        if (p) p += r;
+        else if (fwrite(slab, 1, (size_t)r, out) != (size_t)r) { ok = 0; break; }
+        n -= (u64)r;
         dl_got += (u64)r;
         int now = (int)(dl_got * 10 / dl_want);
         if (now > tenth) {
@@ -307,8 +324,9 @@ static HmSock lobby_connect(char *why, size_t why_len) {
     return s;
 }
 
-/* The pack by its id, into memory from alloc; NULL, and why, when there is none. */
-static u8 *fetch_pack(const char *id, u64 *len, void *(*alloc)(u64), char *why, size_t why_len) {
+/* The pack by its id, into memory from alloc, or (out not NULL) written to out (returning out); NULL, and why,
+ * when there is none. */
+static void *fetch_pack(const char *id, u64 *len, void *(*alloc)(u64), FILE *out, char *why, size_t why_len) {
     HmSock s = lobby_connect(why, why_len);
     if (s == HM_NO_SOCK) return NULL;
     u8 head[16 + 64], size[8];
@@ -323,12 +341,13 @@ static u8 *fetch_pack(const char *id, u64 *len, void *(*alloc)(u64), char *why, 
     if (ok) for (int k = 0; k < 8; k++) want = want << 8 | size[k];
     if (!ok) snprintf(why, why_len, "the lobby (%s) has no pack service (an older lobby?)", net_relay_address());
     else if (!want) { ok = 0; snprintf(why, why_len, "no host has a pack up for that invite code (is the host's tools/hostmods.py serve running?)"); }
-    else if (want > (8ull << 30) || !(buf = alloc(want))) { ok = 0; snprintf(why, why_len, "a pack of %llu bytes: no memory for it", (unsigned long long)want); }
-    else if (!recv_pack(s, buf, want)) { ok = 0; snprintf(why, why_len, "the lobby stopped sending the pack"); }
+    else if (out ? want > (64ull << 30) : want > (8ull << 30) || !(buf = alloc(want)))
+        { ok = 0; snprintf(why, why_len, "a pack of %llu bytes: no memory for it", (unsigned long long)want); }
+    else if (!recv_pack(s, buf, out, want)) { ok = 0; snprintf(why, why_len, out ? "the lobby stopped sending the pack (or it can't be written)" : "the lobby stopped sending the pack"); }
     hm_close(s);
     if (!ok) return NULL;   /* (buf: the pack's memory, left - the game is stopping) */
     *len = want;
-    return buf;
+    return out ? (void *)out : buf;
 }
 
 /* The depot's size and sha256 of the pack by its id (SUM): 1, or 0 when it has none or can't say. */
@@ -362,6 +381,118 @@ static i64 path_size(const char *path) {
     struct stat st;
     return stat(path, &st) ? -1 : (i64)st.st_size;
 #endif
+}
+
+/* ---- the plain pack, in memory or read from its kept file (hm.file) ---------------------------------
+ * A sealed pack is a run of chunks (tools/hostmods.py seal), each opened on its own: so the game reads one
+ * of the host's files by opening only the chunks it lies in, and the pack never has to be in memory whole
+ * (a pack of mods with 4K textures is gigabytes). The last PV_SLOTS chunks opened are kept (the game reads
+ * a file in pieces); a read of a whole chunk is opened straight into the reader's buffer. */
+#define PV_SLOTS 16
+static struct { u64 index; u64 used; u8 *buf; } pv_slot[PV_SLOTS];
+static u64 pv_clock;
+static CRITICAL_SECTION pv_lock;
+static void cache_drop(const char *dir, const char *id);
+
+static int file_read_at(FILE *f, u64 at, void *dst, u64 n) {
+#ifdef _WIN32
+    if (_fseeki64(f, (i64)at, SEEK_SET)) return 0;
+#else
+    if (fseeko(f, (off_t)at, SEEK_SET)) return 0;
+#endif
+    return fread(dst, 1, (size_t)n, f) == (size_t)n;
+}
+
+/* Chunk i of the kept pack, opened into dst (its plain bytes: hm.chunk, or fewer for the last): 0 when it
+ * can't be read or its tag is wrong. (pv_lock held.) */
+static int pv_open_chunk(u64 i, u8 *dst) {
+    u64 m = hm.plain - i * hm.chunk < hm.chunk ? hm.plain - i * hm.chunk : hm.chunk;
+    u8 tag[16], nonce[12] = {0};
+    u64 at = HM_HEAD + i * ((u64)hm.chunk + 16);
+    if (!file_read_at(hm.file, at, dst, m) || fread(tag, 1, 16, hm.file) != 16) return 0;
+    for (int k = 0; k < 8; k++) nonce[4 + k] = (u8)(i >> (8 * k));
+    hm.head[HM_HEAD] = (u8)(i == hm.nchunks - 1);
+    return hm_aead_open(hm.key, nonce, hm.head, HM_HEAD + 1, dst, (size_t)m, tag);
+}
+
+static void pv_bad(u64 i) {
+    cache_drop(hm.cache, hm.id);
+    rt_fatal("host mods: the kept pack in %s is damaged (its chunk %llu doesn't open): it is fetched again at the next start",
+             hm.cache, (unsigned long long)i);
+}
+
+/* n bytes of the plain pack at `at` (inside it: the callers check) into dst. */
+static void pv_read(u64 at, void *dst, u64 n) {
+    if (!n) return;
+    if (!hm.file) { memcpy(dst, hm.mem + at, (size_t)n); return; }
+    u8 *out = dst;
+    EnterCriticalSection(&pv_lock);
+    while (n) {
+        u64 i = at / hm.chunk, from = at % hm.chunk;
+        u64 m = hm.plain - i * hm.chunk < hm.chunk ? hm.plain - i * hm.chunk : hm.chunk;
+        u64 take = m - from < n ? m - from : n;
+        int s = -1;
+        for (int k = 0; k < PV_SLOTS; k++)
+            if (pv_slot[k].used && pv_slot[k].index == i) { s = k; break; }
+        if (s < 0 && !from && take == m) {   /* (the whole chunk: opened where it goes) */
+            if (!pv_open_chunk(i, out)) pv_bad(i);
+        } else {
+            if (s < 0) {
+                s = 0;
+                for (int k = 1; k < PV_SLOTS; k++)
+                    if (pv_slot[k].used < pv_slot[s].used) s = k;
+                pv_slot[s].used = 0;
+                if (!pv_open_chunk(i, pv_slot[s].buf)) pv_bad(i);
+                pv_slot[s].index = i;
+            }
+            pv_slot[s].used = ++pv_clock;
+            memcpy(out, pv_slot[s].buf + from, (size_t)take);
+        }
+        out += take; at += take; n -= take;
+    }
+    LeaveCriticalSection(&pv_lock);
+}
+static u32 pv32(u64 at) { u8 b[4]; pv_read(at, b, 4); return rd32(b); }
+static u64 pv64(u64 at) { u8 b[8]; pv_read(at, b, 8); return rd64(b); }
+static u32 pv16(u64 at) { u8 b[2]; pv_read(at, b, 2); return (u32)b[0] | (u32)b[1] << 8; }
+/* n bytes at `at` that stay: in the pack's memory, or a copy of them read from its file */
+static const u8 *pv_keep(u64 at, u64 n) {
+    if (!hm.file) return hm.mem + at;
+    u8 *p = malloc(n ? (size_t)n : 1);
+    if (!p) rt_fatal("host mods: no memory");
+    pv_read(at, p, n);
+    return p;
+}
+
+/* The kept sealed pack at path (len bytes) opened to be read as the game asks: 1, or 0 when it isn't a sealed
+ * pack or doesn't open with the code (its first and last chunks are tried). */
+static int pv_open_file(const char *path, u64 len, const u8 *code, size_t cl) {
+    static const char kdf[] = "HypeSmash host mods v1";   /* (and its 0: hostmods_crypto.h hm_unseal) */
+    FILE *f = fopen(path, "rb");
+    u8 head[HM_HEAD];
+    if (!f) return 0;
+    if (len < HM_HEAD || fread(head, 1, HM_HEAD, f) != HM_HEAD || memcmp(head, "SSBUHME1", 8)) { fclose(f); return 0; }
+    u64 size = rd64(head + 24);
+    u32 chunk = rd32(head + 32);
+    u64 n = chunk ? (size ? (size + chunk - 1) / chunk : 1) : 0;
+    if (!chunk || size > len || n > len || len != HM_HEAD + size + n * 16) { fclose(f); return 0; }
+    HmSha256 s;
+    hm_sha256_init(&s);
+    hm_sha256_update(&s, kdf, sizeof kdf);
+    hm_sha256_update(&s, head + 8, 16);
+    hm_sha256_update(&s, code, cl);
+    hm_sha256_final(&s, hm.key);
+    memset(&s, 0, sizeof s);
+    memcpy(hm.head, head, HM_HEAD);
+    hm.file = f; hm.plain = size; hm.chunk = chunk; hm.nchunks = n;
+    InitializeCriticalSection(&pv_lock);
+    for (int k = 0; k < PV_SLOTS; k++)
+        if (!pv_slot[k].buf && !(pv_slot[k].buf = malloc(chunk))) rt_fatal("host mods: no memory");
+    u64 tries[2] = {0, n - 1};
+    for (int t = 0; t < 2; t++)
+        if (!pv_open_chunk(tries[t], pv_slot[t].buf)) { fclose(f); hm.file = NULL; return 0; }
+        else { pv_slot[t].index = tries[t]; pv_slot[t].used = ++pv_clock; }
+    return 1;
 }
 
 /* ---- an open pack's mod folders, saved into mods/ (the player's choice) ------------------- */
@@ -410,7 +541,9 @@ static int hm_safe_path(const char *s, size_t n) {
     return 1;
 }
 
-/* A folder of the pack (its place parsed and bounds-checked by hm_load). */
+/* A folder of the pack (its place parsed and bounds-checked by hm_load), in memory. A file's u64 length with
+ * HM_REF set (version 5) is followed by the u64 place of an earlier file's bytes in the plain pack, not bytes. */
+#define HM_REF (1ull << 63)
 typedef struct { const char *name; u32 name_len, nfiles; const u8 *files, *next; } HmFolder;
 static const u8 *hm_folder_at(const u8 *p, HmFolder *f) {
     f->name_len = (u32)p[0] | (u32)p[1] << 8;
@@ -420,7 +553,8 @@ static const u8 *hm_folder_at(const u8 *p, HmFolder *f) {
     f->files = p;
     for (u32 i = 0; i < f->nfiles; i++) {
         u32 l = (u32)p[0] | (u32)p[1] << 8;
-        p += 10 + l + rd64(p + 2 + l);
+        u64 len = rd64(p + 2 + l);
+        p += 10 + l + (len & HM_REF ? 8 : len);
     }
     return f->next = p;
 }
@@ -429,6 +563,11 @@ static const u8 *hm_file_at(const u8 *p, const char **path, u32 *path_len, const
     *path_len = (u32)p[0] | (u32)p[1] << 8;
     *path = (const char *)p + 2;
     *len = rd64(p + 2 + *path_len);
+    if (*len & HM_REF) {   /* (version 5: the same bytes as an earlier file's, at their place in the plain pack) */
+        *len &= ~HM_REF;
+        *data = hm.mem + rd64(p + 10 + *path_len);
+        return p + 18 + *path_len;
+    }
     *data = p + 10 + *path_len;
     return *data + *len;
 }
@@ -637,18 +776,11 @@ static int hm_cache_dir(char *out, size_t n) {
     snprintf(out, n, "%s/../../hostmods_cache", rt_data_dir ? rt_data_dir : ".");
     return 1;
 }
-/* The kept pack, when the lobby's (by its SUM) is the same one; NULL otherwise. */
-static u8 *cache_read(const char *dir, const char *id, const u8 *sum, u64 want, u64 *len) {
+/* The kept pack (want bytes) into memory; NULL when it can't be read. */
+static u8 *cache_read(const char *dir, const char *id, u64 want, u64 *len) {
     char path[1300];
-    u8 had[40];
-    snprintf(path, sizeof path, "%s/%s.sum", dir, id);
-    FILE *f = fopen(path, "rb");
-    int same = f && fread(had, 1, 40, f) == 40;
-    if (f) fclose(f);
-    u64 have = 0;
-    for (int k = 0; k < 8; k++) have = have << 8 | had[k];
-    if (!same || have != want || memcmp(had + 8, sum, 32)) return NULL;
     snprintf(path, sizeof path, "%s/%s.bin", dir, id);
+    FILE *f;
     if (path_size(path) != (i64)want || !(f = fopen(path, "rb"))) return NULL;
     u8 *buf = pack_alloc(want);
     u64 at = 0;
@@ -669,34 +801,49 @@ static void cache_drop(const char *dir, const char *id) {
     snprintf(path, sizeof path, "%s/%s.bin", dir, id);
     remove(path);
 }
-/* Keeps the pack as it came (before it's opened in place), and only it: other codes' packs go. */
-static void cache_write(const char *dir, const char *id, const u8 *pack, u64 len, const u8 *sum) {
-    if (!hm_make_dir(dir)) return;
+/* Fetches the pack into dir/<id>.bin as it comes (only it: other codes' packs go), with <id>.sum when the depot's
+ * SUM is the same after: 1, or 0 and why. */
+static int cache_fetch(const char *dir, const char *id, const u8 *sum, u64 sum_len, u64 *len, char *why, size_t why_len) {
+    if (!hm_make_dir(dir)) { snprintf(why, why_len, "cannot make %s", dir); return 0; }
     hm_each_entry(dir, hm_remove_entry, NULL);
     char path[1300], tmp[1300];
     snprintf(tmp, sizeof tmp, "%s/%s.bin.tmp", dir, id);
     FILE *f = fopen(tmp, "wb");
-    u64 at = 0;
-    while (f && at < len) {
-        size_t put = fwrite(pack + at, 1, (size_t)(len - at > (64u << 20) ? (64u << 20) : len - at), f);
-        if (!put) break;
-        at += put;
-    }
-    if (f && fclose(f)) at = 0;
+    if (!f) { snprintf(why, why_len, "cannot write %s", tmp); return 0; }
+    int ok = fetch_pack(id, len, NULL, f, why, why_len) != NULL;
+    if (fclose(f) && ok) { ok = 0; snprintf(why, why_len, "cannot write %s (a full disk?)", tmp); }
     snprintf(path, sizeof path, "%s/%s.bin", dir, id);
     remove(path);
-    if (!f || at != len || rename(tmp, path)) {
+    if (!ok || rename(tmp, path)) {
+        if (ok) snprintf(why, why_len, "cannot keep it in %s", dir);
         remove(tmp);
-        fprintf(stderr, "[hostmods] cannot keep the host's pack in %s: it is fetched again next time\n", dir);
-        return;
+        return 0;
     }
-    u8 head[40];
-    for (int k = 0; k < 8; k++) head[k] = (u8)(len >> (56 - 8 * k));
-    memcpy(head + 8, sum, 32);
+    u64 again_len = 0;
+    u8 again[32];
+    if (*len == sum_len && pack_sum(id, &again_len, again) && again_len == sum_len && !memcmp(again, sum, 32)) {
+        u8 head[40];   /* (the same pack before and after the fetch: kept for the next start) */
+        for (int k = 0; k < 8; k++) head[k] = (u8)(sum_len >> (56 - 8 * k));
+        memcpy(head + 8, sum, 32);
+        snprintf(path, sizeof path, "%s/%s.sum", dir, id);
+        if (!(f = fopen(path, "wb")) || fwrite(head, 1, 40, f) != 40) remove(path);
+        if (f) fclose(f);
+        fprintf(stderr, "[hostmods] the host's sealed pack is kept in %s for the next start\n", dir);
+    }
+    return 1;
+}
+/* Whether the kept pack is the lobby's (by its SUM). */
+static int cache_has(const char *dir, const char *id, const u8 *sum, u64 want) {
+    char path[1300];
+    u8 had[40];
     snprintf(path, sizeof path, "%s/%s.sum", dir, id);
-    if (!(f = fopen(path, "wb")) || fwrite(head, 1, 40, f) != 40) remove(path);
+    FILE *f = fopen(path, "rb");
+    int same = f && fread(had, 1, 40, f) == 40;
     if (f) fclose(f);
-    fprintf(stderr, "[hostmods] the host's sealed pack is kept in %s for the next start\n", dir);
+    u64 have = 0;
+    for (int k = 0; k < 8; k++) have = have << 8 | had[k];
+    snprintf(path, sizeof path, "%s/%s.bin", dir, id);
+    return same && have == want && !memcmp(had + 8, sum, 32) && path_size(path) == (i64)want;
 }
 
 static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
@@ -717,155 +864,194 @@ static BOOL CALLBACK hm_load(PINIT_ONCE o, PVOID a, PVOID *ctx) {
     for (int i = 0; i < 10; i++) snprintf(id + 2 * i, 3, "%02x", d[i]);
     u64 len = 0, sum_len = 0;
     u8 sum[32];
-    char cache[1100];
-    int cached = 0, keep = hm_cache_dir(cache, sizeof cache) && pack_sum(id, &sum_len, sum);
+    char *cache = hm.cache;
+    snprintf(hm.id, sizeof hm.id, "%s", id);
+    int cached = 0, keep = hm_cache_dir(cache, sizeof hm.cache) && pack_sum(id, &sum_len, sum);
     i64 plain = -1;
     for (int tries = 0; tries < 2; tries++) {   /* (a kept pack that doesn't open: fetched again, once) */
-        hm.mem = keep && !tries ? cache_read(cache, id, sum, sum_len, &len) : NULL;
-        cached = hm.mem != NULL;
-        if (cached) fprintf(stderr, "[hostmods] the host's pack is the one kept in %s: not fetched again\n", cache);
-        else {
-            hm.mem = fetch_pack(id, &len, pack_alloc, why, sizeof why);
+        hm.mem = NULL;
+        cached = keep && !tries && cache_has(cache, id, sum, sum_len);
+        if (cached) { len = sum_len; fprintf(stderr, "[hostmods] the host's pack is the one kept in %s: not fetched again\n", cache); }
+        else if (keep && !cache_fetch(cache, id, sum, sum_len, &len, why, sizeof why)) {
+            fprintf(stderr, "[hostmods] the host's pack can't be kept on disk (%s): it is fetched into memory\n", why);
+            keep = 0;
+        }
+        if (keep) {   /* the kept file: a sealed pack read from it as the game asks; an open one into memory */
+            char path[1300];
+            snprintf(path, sizeof path, "%s/%s.bin", cache, id);
+            if (pv_open_file(path, len, code, cl)) { plain = (i64)hm.plain; break; }
+            hm.mem = cache_read(cache, id, len, &len);
+            if (!hm.mem && !cached) rt_fatal("host mods (SSBU_HOST_MODS): cannot read the host's pack in %s", cache);
+        }
+        if (!hm.mem) {
+            hm.mem = fetch_pack(id, &len, pack_alloc, NULL, why, sizeof why);
             if (!hm.mem) rt_fatal("host mods (SSBU_HOST_MODS): cannot get the host's mods from the lobby: %s", why);
-            u64 again_len = 0;
-            u8 again[32];
-            if (keep && len == sum_len && pack_sum(id, &again_len, again) && again_len == sum_len && !memcmp(again, sum, 32))
-                cache_write(cache, id, hm.mem, len, sum);   /* (the same pack before and after the fetch) */
         }
         /* an open pack (hostmods.py serve --open) is the plain pack itself: nothing to unseal */
         hm.open = len >= 8 && !memcmp(hm.mem, "SSBUHMP1", 8);
         plain = hm.open ? (i64)len : hm_unseal(code, cl, hm.mem, len);
-        if (plain >= 0 || !cached) break;
+        if (plain >= 0 || !keep) break;
         fprintf(stderr, "[hostmods] the kept pack doesn't open: fetching it again\n");
         cache_drop(cache, id);
         pack_free(hm.mem, len);
+        hm.mem = NULL;
+        if (!cached) break;
     }
     memset(code, 0, sizeof code);
-    if (plain < 0) rt_fatal("host mods (SSBU_HOST_MODS): the host's pack doesn't open with that invite code");
+    if (plain < 0) {
+        if (keep) cache_drop(cache, id);
+        rt_fatal("host mods (SSBU_HOST_MODS): the host's pack doesn't open with that invite code");
+    }
+    hm.plain = (u64)plain;
 
-    const u8 *p = hm.mem, *end = hm.mem + plain;
-#define NEED(n) do { if ((u64)(end - p) < (u64)(n)) rt_fatal("host mods: the host's pack is cut short"); } while (0)
+    /* the plain pack, by its place (pv_read: in memory, or from the kept file) */
+    u64 p = 0, end = (u64)plain;
+#define NEED(n) do { if (end - p < (u64)(n)) rt_fatal("host mods: the host's pack is cut short"); } while (0)
     NEED(16);
-    u32 version = rd32(p + 8);
-    if (memcmp(p, "SSBUHMP1", 8) || version < 1 || version > 4) rt_fatal("host mods: the host's pack is of another version (update the game)");
-    hm.nmods = rd32(p + 12);
-    hm.arcropolis = version == 4;
+    u8 magic[8];
+    pv_read(0, magic, 8);
+    u32 version = pv32(8);
+    if (memcmp(magic, "SSBUHMP1", 8) || version < 1 || version > 5) rt_fatal("host mods: the host's pack is of another version (update the game)");
+    hm.nmods = pv32(12);
+    hm.arcropolis = version >= 4;
+    hm.refs = version >= 5;
     p += 16;
     if (hm.nmods > 4096) rt_fatal("host mods: %u mods in the host's pack", hm.nmods);
     hm.names = calloc(hm.nmods ? hm.nmods : 1, sizeof *hm.names);
     hm.hashes = calloc(hm.nmods ? hm.nmods : 1, sizeof *hm.hashes);
     for (u32 i = 0; i < hm.nmods; i++) {
         NEED(6);
-        u32 l = (u32)p[4] | (u32)p[5] << 8;
-        hm.hashes[i] = rd32(p);
+        u32 l = pv16(p + 4);
+        hm.hashes[i] = pv32(p);
         NEED(6 + l);
-        memcpy(hm.names[i], p + 6, l < 255 ? l : 255);
+        pv_read(p + 6, hm.names[i], l < 255 ? l : 255);
         p += 6 + l;
     }
     NEED(36);
-    hm.vanilla_sha = p;
-    hm.nsources = rd32(p + 32);
+    hm.vanilla_sha = pv_keep(p, 32);
+    hm.nsources = pv32(p + 32);
     p += 36;
+    if (hm.nsources > (1u << 20)) rt_fatal("host mods: %u sources in the host's pack", hm.nsources);
     NEED((u64)hm.nsources * 8 + 4);
-    hm.sizes = p;
+    hm.sizes = pv_keep(p, (u64)hm.nsources * 8);
     p += (u64)hm.nsources * 8;
-    hm.map_len = rd32(p);
+    hm.map_len = pv32(p);
     NEED(4 + hm.map_len + 8);
-    hm.map = p + 4;
+    hm.map = pv_keep(p + 4, hm.map_len);
     p += 4 + hm.map_len;
-    hm.overlay_len = rd64(p);
+    hm.overlay_len = pv64(p);
     p += 8;
     NEED(hm.overlay_len);
-    hm.overlay = p;
+    hm.overlay = pv_keep(p, hm.overlay_len);
     p += hm.overlay_len;
     if (version >= 2) {
         /* u32 length and the host's plugins.txt; u32 plugin count, then each plugin's u16 length and
          * module name, u8 system, u64 length and library, u64 length and image (<module>.reloc.bin) */
         NEED(4);
-        u32 ll = rd32(p);
+        u32 ll = pv32(p);
         NEED(4 + (u64)ll + 4);
         char *list = malloc((size_t)ll + 1);
         if (!list) rt_fatal("host mods: no memory");
-        memcpy(list, p + 4, ll);
+        pv_read(p + 4, list, ll);
         list[ll] = 0;
         hm.plugin_list = list;
         p += 4 + ll;
-        u32 n = rd32(p);
+        u32 n = pv32(p);
         p += 4;
         if (n > 64) rt_fatal("host mods: %u plugins in the host's pack", n);
         hm.plugins = calloc(n ? n : 1, sizeof *hm.plugins);
         for (u32 i = 0; i < n; i++) {
             NEED(2);
-            u32 l = (u32)p[0] | (u32)p[1] << 8;
+            u32 l = pv16(p);
             NEED(2 + (u64)l + 1 + 8);
             struct HmPlugin pl = {0};
-            memcpy(pl.name, p + 2, l < sizeof pl.name - 1 ? l : sizeof pl.name - 1);
-            u8 os = p[2 + l];
+            pv_read(p + 2, pl.name, l < sizeof pl.name - 1 ? l : sizeof pl.name - 1);
+            u8 os;
+            pv_read(p + 2 + l, &os, 1);
             p += 3 + l;
-            pl.lib_len = rd64(p);
+            pl.lib_len = pv64(p);
             NEED(8 + pl.lib_len + 8);
-            pl.lib = p + 8;
+            u64 lib_at = p + 8;
             p += 8 + pl.lib_len;
-            pl.image_len = rd64(p);
+            pl.image_len = pv64(p);
             NEED(8 + pl.image_len);
-            pl.image = p + 8;
+            u64 image_at = p + 8;
             p += 8 + pl.image_len;
-            if (os == HM_OS) hm.plugins[hm.nplugins++] = pl;
-            else hm.other_os_plugins++;
+            if (os == HM_OS) {   /* (only this system's are copied out of a pack on disk) */
+                pl.lib = pv_keep(lib_at, pl.lib_len);
+                pl.image = pv_keep(image_at, pl.image_len);
+                hm.plugins[hm.nplugins++] = pl;
+            } else hm.other_os_plugins++;
         }
     }
     if (version >= 3) {
         /* u32 folder count, then each turned-on mod's folder: u16 length and name, u32 file count, then each
-         * file's u16 length and path in the folder, u64 length and bytes (checked whole here: hm_folder_at) */
+         * file's u16 length and path in the folder, u64 length and bytes (checked whole here: hm_folder_at);
+         * version 5: a length with HM_REF set is followed by the u64 place of an earlier file's bytes instead */
         NEED(4);
-        hm.nfolders = rd32(p);
+        hm.nfolders = pv32(p);
         p += 4;
         if (hm.nfolders > 4096) rt_fatal("host mods: %u mod folders in the host's pack", hm.nfolders);
-        hm.folders = p;
+        hm.folders_at = p;
+        hm.folders = hm.file ? NULL : hm.mem + p;
         for (u32 i = 0; i < hm.nfolders; i++) {
             NEED(2);
-            u32 l = (u32)p[0] | (u32)p[1] << 8;
+            u32 l = pv16(p);
             NEED(2 + (u64)l + 4);
-            u32 nf = rd32(p + 2 + l);
+            u32 nf = pv32(p + 2 + l);
             p += 6 + l;
             for (u32 k = 0; k < nf; k++) {
                 NEED(2);
-                u32 pl = (u32)p[0] | (u32)p[1] << 8;
+                u32 pl = pv16(p);
                 NEED(2 + (u64)pl + 8);
-                u64 dl = rd64(p + 2 + pl);
-                p += 10 + pl;
-                NEED(dl);
-                p += dl;
+                u64 dl = pv64(p + 2 + pl);
+                u64 here = p + 10 + pl;
+                p = here;
+                if (dl & HM_REF) {
+                    NEED(8);
+                    u64 at = pv64(p);
+                    dl &= ~HM_REF;
+                    if (!hm.refs || at >= here || dl > here - at) rt_fatal("host mods: a file of the host's pack refers to bytes it hasn't");
+                    p += 8;
+                } else {
+                    NEED(dl);
+                    p += dl;
+                }
             }
         }
     }
-    if ((u64)(end - p) >= 12 && !memcmp(p, "SSBUHMI1", 8)) {
-        /* "SSBUHMI1", u32 count, then each file of the mods' one tree: u16 path length, u64 size, u32 length of
-         * the bytes carried (the whole file, or none for a big one), the UTF-8 path ('/' between folders), the bytes */
-        u32 n = rd32(p + 8);
-        p += 12;
-        if (n > (1u << 20)) rt_fatal("host mods: %u files in the host's mods:/", n);
-        hm.mods_files = calloc(n ? n : 1, sizeof *hm.mods_files);
-        if (!hm.mods_files) rt_fatal("host mods: no memory");
-        for (u32 i = 0; i < n; i++) {
-            NEED(14);
-            struct HmModsFile f = {0};
-            f.path_len = (u32)p[0] | (u32)p[1] << 8;
-            f.size = rd64(p + 2);
-            f.data_len = rd32(p + 10);
-            NEED(14 + (u64)f.path_len + f.data_len);
-            if (f.data_len && f.data_len != f.size) rt_fatal("host mods: a mods:/ file cut short in the host's pack");
-            f.path = (const char *)p + 14;
-            f.data = p + 14 + f.path_len;
-            p += 14 + (u64)f.path_len + f.data_len;
-            hm.mods_files[hm.nmods_files++] = f;
+    if (end - p >= 12) {
+        u8 im[8];
+        pv_read(p, im, 8);
+        if (!memcmp(im, "SSBUHMI1", 8)) {
+            /* "SSBUHMI1", u32 count, then each file of the mods' one tree: u16 path length, u64 size, u32 length of
+             * the bytes carried (the whole file, or none for a big one), the UTF-8 path ('/' between folders), the bytes */
+            u32 n = pv32(p + 8);
+            p += 12;
+            if (n > (1u << 20)) rt_fatal("host mods: %u files in the host's mods:/", n);
+            hm.mods_files = calloc(n ? n : 1, sizeof *hm.mods_files);
+            if (!hm.mods_files) rt_fatal("host mods: no memory");
+            for (u32 i = 0; i < n; i++) {
+                NEED(14);
+                struct HmModsFile f = {0};
+                f.path_len = pv16(p);
+                f.size = pv64(p + 2);
+                f.data_len = pv32(p + 10);
+                NEED(14 + (u64)f.path_len + f.data_len);
+                if (f.data_len && f.data_len != f.size) rt_fatal("host mods: a mods:/ file cut short in the host's pack");
+                f.path = (const char *)pv_keep(p + 14, f.path_len);
+                f.at = p + 14 + f.path_len;
+                p += 14 + (u64)f.path_len + f.data_len;
+                hm.mods_files[hm.nmods_files++] = f;
+            }
+            hm.mods_index = 1;
         }
-        hm.mods_index = 1;
     }
 #undef NEED
     if (hm.arcropolis) hm_build_sd();
     fprintf(stderr, "[hostmods] the host's %u mod(s) and %u plugin(s), %.1f MB, %s (pack %s)\n", hm.nmods,
-            hm.nplugins, (double)plain / 1048576.0, hm.open ? "an open pack (not sealed), played from memory" : "in memory only", id);
+            hm.nplugins, (double)plain / 1048576.0, hm.open ? "an open pack (not sealed), played from memory"
+            : hm.file ? "read from the kept sealed pack as the game needs it" : "in memory only", id);
     if (hm_download_wanted() && !hm.open)
         fprintf(stderr, "[hostmods] the host didn't allow downloads (a sealed pack): its mods aren't saved\n");
     else if (hm_download_wanted() && hm.nfolders)
@@ -912,9 +1098,9 @@ void hostmods_romfs(const char *vanilla_map, const char (*sources)[1024], u32 n,
 static int hm_path_eq(const char *a, u32 al, const char *b, size_t bl) {
     return al == bl && !_strnicmp(a, b, bl);
 }
-/* What `rest` is in the host's mods:/ (leading '/' left out): 0 nothing, 1 a file (*data NULL: its bytes
- * aren't in the pack - a big one), 2 a folder. */
-int hostmods_mods_entry(const char *rest, const u8 **data, u64 *size) {
+/* What `rest` is in the host's mods:/ (leading '/' left out): 0 nothing, 1 a file (*ref 0: its bytes aren't in
+ * the pack - a big one; else hostmods_read's), 2 a folder. */
+int hostmods_mods_entry(const char *rest, u64 *ref, u64 *size) {
     load();
     while (*rest == '/') rest++;
     size_t l = strlen(rest);
@@ -923,7 +1109,7 @@ int hostmods_mods_entry(const char *rest, const u8 **data, u64 *size) {
     for (u32 i = 0; i < hm.nmods_files; i++) {
         const struct HmModsFile *f = &hm.mods_files[i];
         if (hm_path_eq(f->path, f->path_len, rest, l)) {
-            *data = f->data_len || !f->size ? f->data : NULL;
+            *ref = f->data_len || !f->size ? f->at + 1 : 0;
             *size = f->size;
             return 1;
         }
@@ -977,41 +1163,50 @@ static int hm_sd_order(const void *x, const void *y) {
     const struct HmModsFile *a = x, *b = y;
     return hm_cmp_ci(a->path, a->path_len, b->path, b->path_len);
 }
-/* (sorted so: the files under any folder side by side, found by halving) */
+/* (sorted so: the files under any folder side by side, found by halving; read by their places: hm_load
+ * checked them) */
 static void hm_build_sd(void) {
-    u64 total = 0;
-    const u8 *p = hm.folders;
+    u64 total = 0, p = hm.folders_at;
     for (u32 i = 0; i < hm.nfolders; i++) {
-        HmFolder f;
-        p = hm_folder_at(p, &f);
-        total += f.nfiles;
+        u32 l = pv16(p), nf = pv32(p + 2 + l);
+        p += 6 + l;
+        total += nf;
+        for (u32 k = 0; k < nf; k++) {
+            u32 pl = pv16(p);
+            u64 len = pv64(p + 2 + pl);
+            p += 10 + pl + (len & HM_REF ? 8 : len);
+        }
     }
     if (total > (1u << 22)) rt_fatal("host mods: %llu files in the host's mod folders", (unsigned long long)total);
     hm.sd = calloc(total ? total : 1, sizeof *hm.sd);
     if (!hm.sd) rt_fatal("host mods: no memory");
-    p = hm.folders;
+    u64 shared = 0;
+    p = hm.folders_at;
     for (u32 i = 0; i < hm.nfolders; i++) {
-        HmFolder f;
-        p = hm_folder_at(p, &f);
-        if (!hm_safe_part(f.name, f.name_len)) rt_fatal("host mods: a mod folder named \"%.*s\" in the host's pack", (int)(f.name_len > 200 ? 200 : f.name_len), f.name);
-        const u8 *q = f.files;
-        for (u32 k = 0; k < f.nfiles; k++) {
-            const char *rel;
-            u32 rl;
-            const u8 *data;
-            u64 len;
-            q = hm_file_at(q, &rel, &rl, &data, &len);
-            if (!hm_safe_path(rel, rl)) continue;
-            char *path = malloc((size_t)f.name_len + 1 + rl);
+        char name[256];
+        u32 nl = pv16(p), nf = pv32(p + 2 + nl);
+        if (nl > 255) nl = 0;   /* (not a safe name: refused below) */
+        pv_read(p + 2, name, nl);
+        p += 6 + pv16(p);
+        if (!hm_safe_part(name, nl)) rt_fatal("host mods: a mod folder named \"%.*s\" in the host's pack", (int)(nl > 200 ? 200 : nl), name);
+        for (u32 k = 0; k < nf; k++) {
+            u32 rl = pv16(p);
+            u64 len = pv64(p + 2 + rl), at = p + 10 + rl;
+            char *path = malloc((size_t)nl + 1 + rl);
             if (!path) rt_fatal("host mods: no memory");
-            memcpy(path, f.name, f.name_len);
-            path[f.name_len] = '/';
-            memcpy(path + f.name_len + 1, rel, rl);
-            hm.sd[hm.nsd++] = (struct HmModsFile){path, f.name_len + 1 + rl, len, data, 0};
+            memcpy(path, name, nl);
+            path[nl] = '/';
+            pv_read(p + 2, path + nl + 1, rl);
+            if (len & HM_REF) { len &= ~HM_REF; at = pv64(at); p += 18 + rl; shared += len; }
+            else p += 10 + rl + len;
+            if (!hm_safe_path(path + nl + 1, rl)) { free(path); continue; }
+            hm.sd[hm.nsd++] = (struct HmModsFile){path, nl + 1 + rl, len, at, 0};
         }
     }
     qsort(hm.sd, hm.nsd, sizeof *hm.sd, hm_sd_order);
-    fprintf(stderr, "[hostmods] an ARCropolis pack: %u mod folder(s), %u file(s) on the SD card's ultimate/mods\n", hm.nfolders, hm.nsd);
+    fprintf(stderr, "[hostmods] an ARCropolis pack: %u mod folder(s), %u file(s) on the SD card's ultimate/mods", hm.nfolders, hm.nsd);
+    if (shared) fprintf(stderr, " (%.0f MB of them the same as others: sent once)", (double)shared / 1048576.0);
+    fprintf(stderr, "\n");
 }
 /* The first file at or after (path, l) in that order. */
 static u32 hm_sd_at(const char *path, u32 l) {
@@ -1032,7 +1227,7 @@ int hostmods_arcropolis(void) {
     return hm.arcropolis;
 }
 /* What `rest` (under ultimate/mods/) is on the SD card of a version 4 pack: 0 nothing, 1 a file, 2 a folder. */
-int hostmods_sd_entry(const char *rest, const u8 **data, u64 *size) {
+int hostmods_sd_entry(const char *rest, u64 *ref, u64 *size) {
     load();
     while (*rest == '/') rest++;
     size_t l = strlen(rest);
@@ -1043,7 +1238,7 @@ int hostmods_sd_entry(const char *rest, const u8 **data, u64 *size) {
     memcpy(dir, rest, l);
     u32 i = hm_sd_at(dir, (u32)l);
     if (i < hm.nsd && hm_path_eq(hm.sd[i].path, hm.sd[i].path_len, dir, l)) {
-        *data = hm.sd[i].data;
+        *ref = hm.sd[i].at + 1;
         *size = hm.sd[i].size;
         return 1;
     }
@@ -1076,6 +1271,14 @@ int hostmods_sd_list(const char *rest, void (*add)(void *, const char *, size_t,
         add(ctx, name, nl, slash != NULL, slash ? 0 : hm.sd[i].size);
     }
     return found;
+}
+
+/* n bytes at off of a file of the host's (ref: hostmods_mods_entry's or hostmods_sd_entry's, its size checked
+ * by the caller) into buf: from memory, or opened from the kept pack. 1 (a damaged pack stops the game). */
+int hostmods_read(u64 ref, u64 off, void *buf, u64 n) {
+    if (!ref || ref - 1 > hm.plain || off > hm.plain - (ref - 1) || n > hm.plain - (ref - 1) - off) return 0;
+    pv_read(ref - 1 + off, buf, n);
+    return 1;
 }
 
 /* The pack's mods, for the online mod set (net_relay.c mod_set_make): names and the hashes the host's

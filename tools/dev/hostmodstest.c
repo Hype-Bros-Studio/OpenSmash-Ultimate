@@ -94,13 +94,47 @@ int main(int argc, char **argv) {
         char path[1024];
         size_t l = strcspn(sd, ";");
         snprintf(path, sizeof path, "%.*s", (int)l, sd);
-        const u8 *data = NULL;
-        u64 size = 0;
-        int e = hostmods_sd_entry(path, &data, &size);
-        printf("sd %s %d %llu %.*s\n", path, e, (unsigned long long)size, e == 1 && size < 64 ? (int)size : 0, data ? (const char *)data : "");
+        u64 ref = 0, size = 0;
+        char data[64] = "";
+        int e = hostmods_sd_entry(path, &ref, &size);
+        if (e == 1 && size < 64 && !hostmods_read(ref, 0, data, size)) printf("sd %s: hostmods_read failed\n", path);
+        printf("sd %s %d %llu %.*s\n", path, e, (unsigned long long)size, e == 1 && size < 64 ? (int)size : 0, data);
         if (e == 2) hostmods_sd_list(path, sd_print, NULL);
         if (!sd[l]) break;
         sd += l + 1;
+    }
+    /* HOSTMODSTEST_READ="a;b": each file under ultimate/mods read whole in one read and in 7777-byte pieces
+     * ("read <path> <size> <sha256 of the one read> <sha256 of the pieces>") */
+    const char *rd = getenv("HOSTMODSTEST_READ");
+    while (rd && hostmods_on()) {
+        char path[1024];
+        size_t l = strcspn(rd, ";");
+        snprintf(path, sizeof path, "%.*s", (int)l, rd);
+        u64 ref = 0, size = 0;
+        if (hostmods_sd_entry(path, &ref, &size) == 1) {
+            u8 *all = malloc(size ? size : 1), d1[32], d2[32];
+            HmSha256 s1, s2;
+            int ok = hostmods_read(ref, 0, all, size);
+            hm_sha256_init(&s1);
+            hm_sha256_update(&s1, all, size);
+            hm_sha256_final(&s1, d1);
+            hm_sha256_init(&s2);
+            for (u64 at = 0; at < size; at += 7777) {
+                u64 n = size - at < 7777 ? size - at : 7777;
+                ok &= hostmods_read(ref, at, all, n);
+                hm_sha256_update(&s2, all, n);
+            }
+            hm_sha256_final(&s2, d2);
+            ok &= !hostmods_read(ref, size, all, 1) || ref - 1 + size < hm.plain;   /* (past the pack: refused) */
+            printf("read %s %llu ", path, (unsigned long long)size);
+            for (int i = 0; i < 32; i++) printf("%02x", d1[i]);
+            printf(" ");
+            for (int i = 0; i < 32; i++) printf("%02x", d2[i]);
+            printf(" %s\n", ok ? "ok" : "failed");
+            free(all);
+        } else printf("read %s none\n", path);
+        if (!rd[l]) break;
+        rd += l + 1;
     }
     if (hostmods_on()) printf("arcropolis %d\n", hostmods_arcropolis());
     return 0;

@@ -41,7 +41,8 @@ The formats (runtime/hle_hostmods.c reads them):
                 (dump/modules/<module>.reloc.bin); then (version 3) u32 folder count, then each
                 turned-on mod's folder: u16 length and UTF-8 name (mods/<name>), u32 file count,
                 then each file's u16 length and UTF-8 path in the folder ('/' between folders),
-                u64 length and its bytes. A name or path that could leave mods/<name> (.., '\\', ':',
+                u64 length and its bytes - or (version 5) for a file the same as an earlier one, its length
+                with bit 63 set and the u64 place of the earlier file's bytes in the plain pack. A name or path that could leave mods/<name> (.., '\\', ':',
                 an absolute path, ...: safe_name, safe_path) makes the pack refused.
 All numbers little-endian but the lobby's (tools/hostmods_depot.py)."""
 import argparse
@@ -60,7 +61,9 @@ PLAIN_MAGIC = b"SSBUHMP1"
 LAYER_MAGIC = b"SSBUROM1"
 VERSION = 3            # (an open pack's; a sealed one stays SEALED_VERSION, without the mods' folders)
 SEALED_VERSION = 2
-ARC_VERSION = 4        # (the mods run through ARCropolis: no overlay, the mods' folders as the SD card's ultimate/mods)
+ARC_VERSION = 5        # (the mods run through ARCropolis: no overlay, the mods' folders as the SD card's ultimate/mods;
+                       # 5: a file the same as an earlier one is sent once - 4 is still read)
+REF = 1 << 63          # (version 5: a file's length with this set is followed by the u64 place of its bytes, not them)
 MODS_INDEX_MAGIC = b"SSBUHMI1"   # (the pack's last section, when there: the mods' files as mods:/ sees them)
 MODS_INDEX_DATA_MAX = 4 << 10    # (the bytes of files this small are in it: plugins' marker files)
 PLUGIN_OS = {".dll": 1, ".so": 2, ".dylib": 3}   # (runtime/hle_hostmods.c HM_OS: Windows x64, Linux x64, macOS arm64)
@@ -181,6 +184,7 @@ def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin
         out.append(struct.pack("<Q", len(lib)) + lib)
         out.append(struct.pack("<Q", len(image)) + image)
     if folders is not None:
+        seen = {}   # (version 5: sha256 of a file's bytes -> their place in the pack)
         out.append(struct.pack("<I", len(folders)))
         for name, files in folders:
             b = name.encode("utf-8")
@@ -190,7 +194,13 @@ def build_plain(mods, vanilla_map_sha, source_sizes, modded_map, overlay, plugin
                     with open(data, "rb") as f:
                         data = f.read()
                 pb = path.encode("utf-8")
+                key = hashlib.sha256(data).digest() if version >= 5 and len(data) >= 64 else None
+                if key in seen:
+                    out.append(struct.pack("<H", len(pb)) + pb + struct.pack("<QQ", len(data) | REF, seen[key]))
+                    continue
                 out.append(struct.pack("<H", len(pb)) + pb + struct.pack("<Q", len(data)))
+                if key:
+                    seen[key] = len(out.buf)
                 out.append(data)
     if mods_index is not None:
         out.append(MODS_INDEX_MAGIC + struct.pack("<I", len(mods_index)))
@@ -247,7 +257,7 @@ def _parse_plain(p):
     if p[:8] != PLAIN_MAGIC:
         raise Error("not a mod pack")
     version, n = struct.unpack_from("<II", p, 8)
-    if version not in (1, 2, VERSION, ARC_VERSION):
+    if version not in (1, 2, VERSION, 4, ARC_VERSION):
         raise Error(f"a mod pack of version {version}")
     at, mods = 16, []
     for _ in range(n):
@@ -304,6 +314,14 @@ def _parse_plain(p):
                 at += 10 + pl
                 if not safe_path(path):
                     raise Error(f"a file at {path!r} in the pack's {name}")
+                if dl & REF:   # (version 5: an earlier file's bytes)
+                    dl &= ~REF
+                    there = struct.unpack_from("<Q", p, at)[0]
+                    if version < 5 or there >= at or dl > at - there:
+                        raise Error(f"a file at {path!r} in the pack's {name} refers to bytes it hasn't")
+                    files.append((path, p[there:there + dl]))
+                    at += 8
+                    continue
                 if at + dl > len(p):
                     raise Error("a mod pack of the wrong size")
                 files.append((path, p[at:at + dl]))

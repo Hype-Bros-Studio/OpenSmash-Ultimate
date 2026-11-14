@@ -576,6 +576,43 @@ class RuntimeRomfs(unittest.TestCase):
             finally:
                 host.close()
 
+    def test_sealed_pack_read_from_disk_as_needed(self):
+        """A kept sealed pack isn't opened into memory: a file's bytes are its chunks, opened when read (any piece of
+        it, across chunks), a file the same as another is sent once, and a damaged chunk stops the game and drops it."""
+        with tempfile.TemporaryDirectory() as d:
+            data, image, vmap, sources = self.game(d)
+            big = os.urandom(50000)
+            folders = [("A", [("big.bin", big), ("small.txt", b"one")]), ("B", [("copy.bin", big)])]
+            plain = self.arc_pack(data, vmap, sources, folders)
+            self.assertLess(len(plain), 2 * len(big))   # (the copy is a reference)
+            self.assertEqual(hm.parse_plain(plain)["folders"], folders)
+            code = hm.new_code()
+            sealed = hm.seal(code, plain, chunk=4096)
+            kept = os.path.join(d, "hostmods_cache")
+            pid = hm.pack_id(code)
+            want = hashlib.sha256(big).hexdigest()
+            host = hm.put(self.addr, pid, sealed)
+            try:
+                for _ in range(2):   # (fetched to disk, then the kept one)
+                    r, _ = self.run_game(data, code, SSBU_HOST_MODS_CACHE="1", HOSTMODSTEST_READ="A/big.bin;B/copy.bin;A/small.txt")
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn("read from the kept sealed pack as the game needs it", r.stderr)
+                    self.assertIn(f"read A/big.bin 50000 {want} {want} ok", r.stdout)
+                    self.assertIn(f"read B/copy.bin 50000 {want} {want} ok", r.stdout)
+                    small = hashlib.sha256(b"one").hexdigest()
+                    self.assertIn(f"read A/small.txt 3 {small} {small} ok", r.stdout)
+                self.assertIn("not fetched again", r.stderr)
+                # a chunk in the middle damaged: the start still opens it, the read stops the game
+                with open(os.path.join(kept, pid + ".bin"), "r+b") as f:
+                    f.seek(len(sealed) // 2)
+                    f.write(b"XXXXX")
+                r, _ = self.run_game(data, code, SSBU_HOST_MODS_CACHE="1", HOSTMODSTEST_READ="A/big.bin;B/copy.bin")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("is damaged", r.stderr)
+                self.assertEqual(os.listdir(kept), [])
+            finally:
+                host.close()
+
     def test_pack_kept_between_starts(self):
         with tempfile.TemporaryDirectory() as d:
             data, image, vmap, sources = self.game(d)
